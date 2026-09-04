@@ -189,3 +189,45 @@ Angka 1 GB pasca-optimasi (i5-10400, 2x lari): literal 0,93–1,06 dtk
 scan-dominated di 250rb hit; win membesar dengan kepadatan hit.
 **Arbiter sesungguhnya: ulangi `DELETE FROM` di `coba.txt`** (dulu
 42,45 dtk penuh) — ekspektasi satu digit.
+
+## 7. Hasil uji ulang 12 GB pasca-P0 (2026-09-04 malam)
+
+Harness v2 (sementara, sudah dihapus): API pure streaming langsung di
+atas mmap, case-sensitive, cap 200.000 seperti aplikasi. File, mesin,
+dan kondisi dingin sama dengan §5.
+
+| Metrik | Sebelum (§5) | Sesudah | Verdict |
+|---|---|---|---|
+| Indeks 12 GB | 24,05 dtk | **25,89 dtk** | sama (jalur tak tersentuh, noise disk) |
+| Literal `TRANSACTION` (cap 200rb) | 26,14 dtk | **0,53 dtk (49x)** | ✅ jauh melampaui |
+| Literal `DELETE FROM` (cap 200rb) | 42,45 dtk | **38,98 dtk** | ❌ ekspektasi satu digit GAGAL |
+| Regex `DELETE\|INSERT` | 24,74 dtk | **0,14 dtk (176x)** | ✅ jauh melampaui |
+| Regex `BEGIN TRANSACTION-\d+` | 26,23 dtk | **0,52 dtk (50x)** | ✅ jauh melampaui |
+| Seek 2000 baris acak | 0,219 dtk | **0,184 dtk** | sama |
+| Peak private bytes (heap) | tak diukur | **47,8 MB** | ✅ klaim <250 MB TERBUKTI di file nyata |
+| Peak working set (mmap) | 11,2 GB | 9,7 GB | halaman discardable, bukan alokasi |
+
+Mengapa `DELETE FROM` tidak satu digit (penjelasan jujur, bukan alasan):
+
+- Waktu = f(bytes dipindai s.d. cap 200rb), bukan f(kecepatan CPU).
+  Hit ke-200rb `TRANSACTION` ada di 5% file (±0,6 GB → 0,53 dtk);
+  hit ke-200rb `DELETE FROM` ada di **57% file (±7,4 GB → 39 dtk)**.
+- Throughput mentah pindai dingin SSD ini ±190–480 MB/s (termasuk
+  indeks 481 MB/s). Batas bawah fisik kasus ini ≈ 15–25 dtk bahkan
+  dengan CPU nol — ekspektasi satu digit salah sasaran secara fisika.
+- Perbandingan lama-vs-baru untuk `DELETE FROM` juga tidak murni:
+  harness lama (§5) memindai SELURUH file tanpa early-break di loop
+  chunk (bug harness, bukan engine), harness baru berhenti di cap.
+  Jadi 42→39 dtk meremehkan perbaikan; angka yang adil: throughput
+  per-byte kini setara kecepatan disk, overhead CPU praktis hilang.
+- Kemenangan P0 yang riil: (a) terminasi dini kini efektif — kasus
+  umum (hit padat di awal, pola regex ringan) 50–176x; (b) footgun
+  RAM padat 2,5 GB tertutup — private 47,8 MB di 338 jt baris;
+  (c) duplikat batas-chunk hilang (oracle test).
+
+Klaim resmi diperbarui: **"indeks tercepat di kelasnya pada file ini
+(26 vs ±40 dtk klogg); pencarian secepat disk mengizinkan; hasil
+pertama <0,5 dtk via streaming; heap <50 MB di 12 GB / 338 jt baris."**
+Tanpa embel-embel satu digit untuk full-scan dingin — itu janji yang
+tidak bisa ditepati siapa pun di SSD ini (bahkan `findstr` 20 dtk
+untuk pola yang sama tanpa nomor baris).
