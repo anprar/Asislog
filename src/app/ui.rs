@@ -49,6 +49,27 @@ impl eframe::App for AsisLogApp {
         self.render_dialogs_main(ctx, cur_idx);
         self.render_highlight(ctx);
         self.render_misc(ctx, cur_idx);
-        ctx.request_repaint_after(Duration::from_millis(120));
+        // Repaint hanya saat ada yang bergerak: indeks/search/filter/marker
+        // latar, debounce tertunda, follow aktif, unduhan, atau catatan
+        // follow yang harus kedaluwarsa. Idle = tanpa repaint paksa
+        // (egui tetap repaint saat ada input); jaring pengaman 2 dtk agar
+        // tak ada indikator yang macet bila satu kasus terlewat.
+        let busy = self.dl_rx.is_some()
+            || self.tabs.iter().any(|t| {
+                !t.doc.index.complete
+                    || t.doc.search_in_progress
+                    || t.debounce_at.is_some()
+                    || t.doc.follow
+                    || t.index_rx.is_some()
+                    || t.search_rx.is_some()
+                    || t.filter_rx.is_some()
+                    || t.marker_rx.is_some()
+                    || t.follow_note.is_some()
+            });
+        if busy {
+            ctx.request_repaint_after(Duration::from_millis(120));
+        } else {
+            ctx.request_repaint_after(Duration::from_secs(2));
+        }
     }
 }

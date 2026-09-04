@@ -359,14 +359,18 @@ impl Doc {
     pub fn get_lines(&mut self, start: u64, count: usize) -> Vec<LineView> {
         let mut out = Vec::new();
         if self.filter_active {
-            let rows = self.filter_map.clone();
+            // Indeks langsung ke filter_map (terurut) tanpa clone vec.
             let s = (start.saturating_sub(1)) as usize;
-            for (i, ln) in rows.iter().skip(s).take(count).enumerate() {
-                let text = self.get_line_text(*ln).unwrap_or_default();
-                let byte = self.line_byte_range(*ln).map(|(b, _)| b).unwrap_or(0);
-                let _ = i;
+            let n = self.filter_map.len();
+            for k in s..n {
+                if out.len() >= count {
+                    break;
+                }
+                let ln = self.filter_map[k];
+                let text = self.get_line_text(ln).unwrap_or_default();
+                let byte = self.line_byte_range(ln).map(|(b, _)| b).unwrap_or(0);
                 out.push(LineView {
-                    line_no: *ln,
+                    line_no: ln,
                     byte_offset: byte,
                     text,
                 });

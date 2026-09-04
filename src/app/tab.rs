@@ -2,6 +2,7 @@
 #![allow(unused_imports)]
 // English comments: AsisLog egui app (tabs, shortcuts, background jobs).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
@@ -118,6 +119,10 @@ pub(crate) struct TabState {
     pub(crate) last_follow_poll: Instant,
     /// Sidik head terakhir untuk follow (None = belum diketahui).
     pub(crate) follow_fp: Option<String>,
+    /// Cache teks tampil per baris (ringkasan JSON dkk): line -> String.
+    /// Isi baris lama tak berubah saat append, jadi cache hanya gugur saat
+    /// rotasi/reopen atau ganti encoding (lihat bawah).
+    pub(crate) disp_cache: HashMap<u64, String>,
 }
 
 impl TabState {
@@ -184,7 +189,25 @@ impl TabState {
             search_cancel: Arc::new(AtomicBool::new(false)),
             last_follow_poll: Instant::now(),
             follow_fp: None,
+            disp_cache: HashMap::new(),
         }
+    }
+
+    /// Teks tampil untuk satu baris (ringkasan JSON dkk), di-cache per nomor
+    /// baris agar frame ulang tak mengulang parse. Penelepon memberi teks
+    /// terdecode; kunci nomor-baris aman karena isi lama tak berubah
+    /// (rotasi mengosongkan cache, encoding mengosongkan cache).
+    pub(crate) fn display_cached(&mut self, line: u64, text: &str) -> String {
+        if let Some(s) = self.disp_cache.get(&line) {
+            return s.clone();
+        }
+        let disp = crate::engine::jsonlog::display_text(text);
+        // Batas longgar tanpa LRU: viewport hanya menyentuh ~ribuan baris.
+        if self.disp_cache.len() > 8192 {
+            self.disp_cache.clear();
+        }
+        self.disp_cache.insert(line, disp.clone());
+        disp
     }
 
     pub(crate) fn total_view_rows(&self) -> u64 {
@@ -671,6 +694,8 @@ impl TabState {
                 } else {
                     // Revisi file berubah -> cache pencarian gugur.
                     self.search_cache.clear();
+                    // Isi baris berubah -> cache teks tampil ikut gugur.
+                    self.disp_cache.clear();
                     // Sidik baru diadopsi; peta marker dibangun ulang.
                     self.follow_fp = load_identity(&self.doc.path)
                         .ok()

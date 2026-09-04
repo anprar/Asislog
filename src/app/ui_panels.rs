@@ -261,7 +261,10 @@ impl AsisLogApp {
                         let t = &mut self.tabs[cur_idx];
                         let mut out = String::new();
                         let mut over = false;
-                        for h in t.doc.hits.clone() {
+                        // Salin per indeks (satu Hit 24 B per iterasi),
+                        // bukan clone seluruh vec hasil.
+                        for i in 0..t.doc.hits.len() {
+                            let h = t.doc.hits[i].clone();
                             let txt = t.doc.get_line_text(h.line).unwrap_or_default();
                             let row = format!("{}: {}\n", h.line, txt);
                             if out.len() + row.len() > crate::engine::COPY_CAP_BYTES {
@@ -287,31 +290,30 @@ impl AsisLogApp {
                         self.tabs[cur_idx].export_open = true;
                     }
                 });
-            let hits = self.tabs[cur_idx].doc.hits.clone();
-            if hits.is_empty() {
+            let total = self.tabs[cur_idx].doc.hits.len();
+            if total == 0 {
                 ui.label("Belum ada hasil. Ketik kata kunci di kolom Cari.");
             } else {
                 let row_h = self.row_h();
-                let total = hits.len();
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, true])
                     .show_rows(ui, row_h, total, |ui, range| {
                         // Satu baris hasil = satu baris visual (potong, jangan wrap).
                         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
-                        // Decode preview per row (cached in Doc).
+                        // Decode preview per row (cached in Doc); Hit disalin
+                        // per baris terlihat saja (24 B), bukan seluruh vec.
                         for i in range {
-                            let Some(h) = hits.get(i) else { continue };
+                            let Some(h) = self.tabs[cur_idx].doc.hits.get(i).cloned() else {
+                                continue;
+                            };
                             // Ambil teks baris via Doc (pinjam mut singkat per baris).
                             let text = self.tabs[cur_idx]
                                 .doc
                                 .get_line_text(h.line)
                                 .unwrap_or_default();
+                            let disp = self.tabs[cur_idx].display_cached(h.line, &text);
                             let sel = self.tabs[cur_idx].current_hit == Some(i);
-                            let label = result_row(
-                                i,
-                                h.line,
-                                &crate::engine::jsonlog::display_text(&text),
-                            );
+                            let label = result_row(i, h.line, &disp);
                             if ui.selectable_label(sel, label).clicked() {
                                 self.tabs[cur_idx].jump_to_hit(i);
                             }

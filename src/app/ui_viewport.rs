@@ -161,9 +161,9 @@ impl AsisLogApp {
                                             let mut hover_new = None;
                                             for (_r, ln, txt) in &rows {
                                                 let ln = *ln;
-                                                // Baris JSON diringkas inline (asli tetap untuk salin).
-                                                let disp =
-                                                    crate::engine::jsonlog::display_text(txt);
+                                                // Baris JSON diringkas inline (asli tetap untuk salin);
+                                                // hasil ringkasan di-cache per baris (lihat display_cached).
+                                                let disp = tab.display_cached(ln, txt);
                                                 let kind = viewer::classify(&disp);
                                                 // SELALU bungkus Frame (isi beda, ukuran sama)
                                                 // agar hover tak menggeser layout (anti-flicker).

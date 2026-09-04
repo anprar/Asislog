@@ -62,6 +62,7 @@ impl AsisLogApp {
                         {
                             tab.doc.set_encoding_override(None);
                             tab.search_cache.clear();
+                            tab.disp_cache.clear();
                             sess_touch = true;
                         }
                         for e in Encoding::all() {
@@ -71,6 +72,7 @@ impl AsisLogApp {
                             {
                                 tab.doc.set_encoding_override(Some(*e));
                                 tab.search_cache.clear();
+                                tab.disp_cache.clear();
                                 sess_touch = true;
                             }
                         }
