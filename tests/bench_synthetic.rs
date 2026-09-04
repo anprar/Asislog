@@ -23,7 +23,7 @@ fn gen_log(path: &std::path::Path, bytes: u64) {
                 "2026-09-04 10:00:{:02} ERROR OrderService - NullPointerException id={}\n\tat com.erp.OrderService.get({}).try(Unknown Source)\nCaused by: java.sql.SQLException: timeout id={}\n",
                 i % 60, i, i, i
             )
-        } else if i % 50 == 0 {
+        } else if i.is_multiple_of(50) {
             format!(
                 "2026-09-04 10:00:{:02} ERROR OrderService - timeout on request id={} after 30000ms\n",
                 i % 60, i

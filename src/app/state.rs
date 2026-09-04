@@ -229,12 +229,6 @@ impl AsisLogApp {
         self.cfg_dirty = false;
     }
 
-    /// Set aktif (mutable) untuk jendela sorotan.
-    pub(crate) fn active_set_mut(&mut self) -> Option<&mut HighlightSet> {
-        let name = self.active_set.clone()?;
-        self.sets.iter_mut().find(|s| s.name == name)
-    }
-
     /// Aturan efektif = aturan enabled milik set aktif.
     pub(crate) fn active_rules(&self) -> Vec<HighlightRule> {
         self.active_set
@@ -272,7 +266,7 @@ impl AsisLogApp {
     }
 
     /// Simpan workspace produk: tab + filter/range tab aktif + set sorotan aktif.
-    pub(crate) fn save_workspace_to(&mut self, path: &PathBuf) {
+    pub(crate) fn save_workspace_to(&mut self, path: &std::path::Path) {
         use crate::store::{Workspace, WorkspaceFile};
         if self.tabs.is_empty() {
             self.global_status = String::from("Tidak ada tab untuk disimpan.");

@@ -52,11 +52,9 @@ pub fn fingerprint(path: &Path, size: u64) -> Option<String> {
     let mut buf = vec![0u8; FINGER_BYTES];
     let n = f.read(&mut buf).ok()?;
     mix(&buf[..n]);
-    if size > FINGER_BYTES as u64 {
-        if f.seek(SeekFrom::End(-(FINGER_BYTES as i64))).is_ok() {
-            let n = f.read(&mut buf).unwrap_or(0);
-            mix(&buf[..n]);
-        }
+    if size > FINGER_BYTES as u64 && f.seek(SeekFrom::End(-(FINGER_BYTES as i64))).is_ok() {
+        let n = f.read(&mut buf).unwrap_or(0);
+        mix(&buf[..n]);
     }
     Some(format!("{:016x}", h))
 }

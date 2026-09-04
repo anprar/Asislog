@@ -77,7 +77,7 @@ pub fn first_match_span(line: &str, terms: &[&str], case_sensitive: bool) -> (u3
         } else {
             let h = line.as_bytes().to_ascii_lowercase();
             let n = t.as_bytes().to_ascii_lowercase();
-            memchr::memmem::Finder::new(&n).find(&h).map(|m| m)
+            memchr::memmem::Finder::new(&n).find(&h)
         };
         if let Some(m) = pos {
             let span = (m, m + t.len());
@@ -150,7 +150,7 @@ fn tokenize(q: &str) -> Result<Vec<Tok>, String> {
                 chars.next(); // opening quote
                 let mut s = String::new();
                 let mut closed = false;
-                while let Some(c) = chars.next() {
+                for c in chars.by_ref() {
                     if c == '"' {
                         closed = true;
                         break;
@@ -366,7 +366,7 @@ pub fn top_spans(q: &str) -> Option<Vec<(String, usize, usize)>> {
             i += 1;
         }
         let word = &q[start..i];
-        if word.to_ascii_uppercase() == "AND" || word.to_ascii_uppercase() == "NOT" {
+        if word.eq_ignore_ascii_case("AND") || word.eq_ignore_ascii_case("NOT") {
             continue;
         }
         out.push((word.to_string(), start, i));

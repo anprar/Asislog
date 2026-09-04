@@ -46,7 +46,7 @@ impl AsisLogApp {
                 if a != 0.0 { a } else { b }
             });
             if delta_y != 0.0 {
-                let step = ((delta_y.abs() / 20.0).ceil() as u64).max(1).min(50);
+                let step = ((delta_y.abs() / 20.0).ceil() as u64).clamp(1, 50);
                 if delta_y < 0.0 {
                     tab.top_row = (tab.top_row + step).min(total_rows.saturating_sub(1));
                     // di dekat bawah -> kunci bawah bila Ikuti

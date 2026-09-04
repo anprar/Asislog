@@ -316,7 +316,7 @@ pub fn render_log_line(
             all.push((s.max(ts), e, 1 + ri as u32, r.color(dark)));
         }
     }
-    all.sort_by(|a, b| (a.0, a.2).cmp(&(b.0, b.2)));
+    all.sort_by_key(|a| (a.0, a.2));
     let mut kept: Vec<(usize, usize, u32, egui::Color32)> = Vec::new();
     for (s, e, p, c) in all {
         if let Some(last) = kept.last() {

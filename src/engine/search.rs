@@ -37,8 +37,8 @@ fn count_nl(bytes: &[u8]) -> u64 {
 fn split_lines(buf: &[u8]) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     let mut s = 0usize;
-    for i in 0..buf.len() {
-        if buf[i] == b'\n' {
+    for (i, &b) in buf.iter().enumerate() {
+        if b == b'\n' {
             out.push((s, i));
             s = i + 1;
         }
@@ -256,11 +256,7 @@ where
             let global = offset + m;
             // Determine line: count newlines before m within chunk + base.
             let nl_before = count_nl(&chunk[..m.min(chunk.len())]);
-            let line = if starts_mid_line {
-                base_line + nl_before
-            } else {
-                base_line + nl_before
-            };
+            let line = base_line + nl_before;
             // Column: distance to previous \n within combined view.
             let mut ls_rel = 0usize;
             // find greatest rel_start <= m, else line start is before chunk.
@@ -466,6 +462,11 @@ impl SearchCache {
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.map.len()
+    }
+
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
     }
 }
 

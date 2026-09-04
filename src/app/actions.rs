@@ -65,17 +65,15 @@ impl AsisLogApp {
             ctx.memory_mut(|m| m.request_focus(egui::Id::new("cari")));
         }
         // F3 / Shift+F3
-        if ctx.input(|i| i.key_pressed(egui::Key::F3)) {
-            if !tab.doc.hits.is_empty() {
-                let n = tab.doc.hits.len();
-                let cur = tab.current_hit.unwrap_or(0);
-                let nxt = if shift {
-                    cur.saturating_sub(1).min(n - 1)
-                } else {
-                    (cur + 1).min(n - 1)
-                };
-                tab.jump_to_hit(nxt);
-            }
+        if ctx.input(|i| i.key_pressed(egui::Key::F3)) && !tab.doc.hits.is_empty() {
+            let n = tab.doc.hits.len();
+            let cur = tab.current_hit.unwrap_or(0);
+            let nxt = if shift {
+                cur.saturating_sub(1).min(n - 1)
+            } else {
+                (cur + 1).min(n - 1)
+            };
+            tab.jump_to_hit(nxt);
         }
         // Ctrl+G
         if ctrl && ctx.input(|i| i.key_pressed(egui::Key::G)) {
@@ -103,26 +101,18 @@ impl AsisLogApp {
         }
         // Alt+Left / Alt+Right: history navigasi
         let alt = ctx.input(|i| i.modifiers.alt);
-        if alt && ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
-            if !tab.go_hist(true) {
-                tab.doc.status = String::from("Tidak ada lokasi sebelumnya.");
-            }
+        if alt && ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) && !tab.go_hist(true) {
+            tab.doc.status = String::from("Tidak ada lokasi sebelumnya.");
         }
-        if alt && ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
-            if !tab.go_hist(false) {
-                tab.doc.status = String::from("Tidak ada lokasi berikutnya.");
-            }
+        if alt && ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) && !tab.go_hist(false) {
+            tab.doc.status = String::from("Tidak ada lokasi berikutnya.");
         }
         // Alt+Up / Alt+Down: penanda sebelumnya/berikutnya
-        if alt && ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
-            if !tab.go_mark(true) {
-                tab.doc.status = String::from("Belum ada penanda.");
-            }
+        if alt && ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) && !tab.go_mark(true) {
+            tab.doc.status = String::from("Belum ada penanda.");
         }
-        if alt && ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
-            if !tab.go_mark(false) {
-                tab.doc.status = String::from("Belum ada penanda.");
-            }
+        if alt && ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) && !tab.go_mark(false) {
+            tab.doc.status = String::from("Belum ada penanda.");
         }
         // Esc batal pencarian
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -139,7 +129,7 @@ impl AsisLogApp {
             tab.export_open = false;
             tab.scope_open = false;
         }
-        drop(tab);
+        // `tab` borrow ends here (last use above); continue with `self`.
         if sess_touch {
             self.session_dirty = true;
         }
@@ -315,12 +305,8 @@ impl AsisLogApp {
 
 /// Timestamp jump: binary search bila monotonik, else linear dengan timeout.
 pub(crate) fn goto_timestamp(tab: &mut TabState, ts: &str) -> Result<u64, String> {
-    // Parse target as unix seconds; if input is not full prefix, try to find
-    // comparable by scanning? We require parseable prefix.
-    let target = Doc::parse_timestamp_prefix(ts).or_else(|| {
-        // Coba tempel tanggal? minimal: "13:41:02" tidak cukup -> tolak.
-        None
-    });
+    // Parse target as unix seconds; unparseable prefix falls back to linear.
+    let target = Doc::parse_timestamp_prefix(ts);
     let target = match target {
         Some(t) => t,
         None => {

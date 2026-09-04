@@ -104,18 +104,17 @@ fn decode_utf16(bytes: &[u8], little_endian: bool) -> String {
         return String::new();
     }
     let mut units: Vec<u16> = Vec::with_capacity(bytes.len() / 2 + 1);
-    let mut chunks = bytes.chunks_exact(2);
-    for c in &mut chunks {
-        let v = if little_endian {
-            u16::from_le_bytes([c[0], c[1]])
+    for c in bytes.chunks(2) {
+        if c.len() == 2 {
+            units.push(if little_endian {
+                u16::from_le_bytes([c[0], c[1]])
+            } else {
+                u16::from_be_bytes([c[0], c[1]])
+            });
         } else {
-            u16::from_be_bytes([c[0], c[1]])
-        };
-        units.push(v);
-    }
-    // Odd trailing byte -> replacement char, never panic.
-    if !chunks.remainder().is_empty() {
-        units.push(0xFFFD);
+            // Odd trailing byte -> replacement char, never panic.
+            units.push(0xFFFD);
+        }
     }
     String::from_utf16_lossy(&units)
 }

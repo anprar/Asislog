@@ -86,17 +86,15 @@ impl AsisLogApp {
                 }
                 if icon_button(ui, Icon::ChevronLeft, "Kembali ke lokasi sebelumnya (Alt+Left)")
                     .clicked()
+                    && !tab.go_hist(true)
                 {
-                    if !tab.go_hist(true) {
-                        tab.doc.status = String::from("Tidak ada lokasi sebelumnya.");
-                    }
+                    tab.doc.status = String::from("Tidak ada lokasi sebelumnya.");
                 }
                 if icon_button(ui, Icon::ChevronRight, "Maju ke lokasi berikutnya (Alt+Right)")
                     .clicked()
+                    && !tab.go_hist(false)
                 {
-                    if !tab.go_hist(false) {
-                        tab.doc.status = String::from("Tidak ada lokasi berikutnya.");
-                    }
+                    tab.doc.status = String::from("Tidak ada lokasi berikutnya.");
                 }
                 if ui.button("Penanda").clicked() {
                     tab.show_bookmarks = !tab.show_bookmarks;

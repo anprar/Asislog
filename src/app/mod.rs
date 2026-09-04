@@ -54,6 +54,9 @@ pub(crate) enum DlMsg {
     Failed(String),
 }
 
+/// Payload peta marker latar: (bucket_bits, file_size, time_hist).
+pub(crate) type MarkerUpdate = (Vec<u8>, u64, Option<TimeHist>);
+
 // Compatibility re-exports (paths used before the split).
 pub use jobs_index::{build_time_hist, TimeHist, MARKER_BUCKETS};
 pub use state::AsisLogApp;

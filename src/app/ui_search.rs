@@ -197,23 +197,21 @@ impl AsisLogApp {
                     .button("‹ Sebelumnya")
                     .on_hover_text("Hasil sebelumnya (Shift+F3)")
                     .clicked()
+                    && !tab.doc.hits.is_empty()
                 {
-                    if !tab.doc.hits.is_empty() {
-                        let n = tab.doc.hits.len();
-                        let c = tab.current_hit.unwrap_or(0);
-                        tab.jump_to_hit(c.saturating_sub(1).min(n - 1));
-                    }
+                    let n = tab.doc.hits.len();
+                    let c = tab.current_hit.unwrap_or(0);
+                    tab.jump_to_hit(c.saturating_sub(1).min(n - 1));
                 }
                 if ui
                     .button("Berikutnya ›")
                     .on_hover_text("Hasil berikutnya (F3)")
                     .clicked()
+                    && !tab.doc.hits.is_empty()
                 {
-                    if !tab.doc.hits.is_empty() {
-                        let n = tab.doc.hits.len();
-                        let c = tab.current_hit.unwrap_or(0);
-                        tab.jump_to_hit((c + 1).min(n - 1));
-                    }
+                    let n = tab.doc.hits.len();
+                    let c = tab.current_hit.unwrap_or(0);
+                    tab.jump_to_hit((c + 1).min(n - 1));
                 }
                 // Info hasil / progress / 0-hasil yang menjelaskan.
                 if tab.doc.search_in_progress {

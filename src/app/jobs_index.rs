@@ -245,8 +245,10 @@ pub fn build_time_hist(samples: &[(i64, u64)], max_bins: usize) -> Option<TimeHi
     }
     let span = (max - min + 1) as usize;
     let nb = span.min(max_bins.max(1));
-    let step = ((span + nb - 1) / nb).max(1) as i64;
-    let n = ((span as i64 + step - 1) / step) as usize;
+    let step = span.div_ceil(nb).max(1) as i64;
+    // `step` >= 1, so the cast back is safe; unsigned div_ceil avoids
+    // the (here unstable) signed-int rounding API with identical result.
+    let n = span.div_ceil(step as usize);
     let mut counts = vec![0u32; n];
     let mut first = vec![u64::MAX; n];
     for (m, ln) in samples {
@@ -267,7 +269,7 @@ pub fn build_time_hist(samples: &[(i64, u64)], max_bins: usize) -> Option<TimeHi
 pub(crate) fn spawn_marker_scan(
     path: PathBuf,
     total: u64,
-    tx: mpsc::Sender<(Vec<u8>, u64, Option<TimeHist>)>,
+    tx: mpsc::Sender<MarkerUpdate>,
 ) {
     std::thread::spawn(move || {
         use std::io::{BufRead, Read};
@@ -302,16 +304,12 @@ pub(crate) fn spawn_marker_scan(
             let has_err = err_fs.iter().any(|f| f.find(chunk).is_some());
             let has_warn = warn_f.find(chunk).is_some();
             if has_err || has_warn {
+                let mask = u8::from(has_err) | (u8::from(has_warn) << 1);
                 let b0 = ((offset * MARKER_BUCKETS as u64) / total.max(1)) as usize;
                 let b1 =
                     (((offset + n as u64) * MARKER_BUCKETS as u64) / total.max(1)) as usize;
-                for b in b0..=b1.min(MARKER_BUCKETS - 1) {
-                    if has_err {
-                        bits[b] |= 0x01;
-                    }
-                    if has_warn {
-                        bits[b] |= 0x02;
-                    }
+                for slot in &mut bits[b0..=b1.min(MARKER_BUCKETS - 1)] {
+                    *slot |= mask;
                 }
             }
             offset += n as u64;

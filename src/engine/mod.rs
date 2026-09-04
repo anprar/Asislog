@@ -305,7 +305,7 @@ impl Doc {
         }
         // No progress yet: rough byte-based estimate.
         let usable = self.size.saturating_sub(self.bom_len as u64);
-        (usable / 120).max(1).min(100_000_000)
+        usable.div_ceil(120).clamp(1, 100_000_000)
     }
 
     pub fn view_row_to_line(&self, row: u64) -> Option<u64> {
@@ -576,10 +576,10 @@ impl Doc {
     }
 
     /// Find the SQL-dump block containing `line`: [start, end] (inclusive).
-    /// Rules (light delimiter parser, no full SQL parsing):
-    /// - backward (max 5000 lines): first `--INSERT-…` / `INSERT INTO…` wins;
-    ///   a `go` line on the way means the previous block ended → start after it.
-    /// - forward (max 5000 lines): first trimmed `go` (case-insensitive) wins.
+    /// Rules (light delimiter parser, no full SQL parsing): backward
+    /// (max 5000 lines) the first `--INSERT-…` / `INSERT INTO…` wins; a `go`
+    /// line on the way means the previous block ended, so start after it.
+    /// Forward (max 5000 lines) the first trimmed `go` (case-insensitive) wins.
     /// Returns Indonesian error when no block is found (caller shows it).
     pub fn sql_block_range(&mut self, line: u64) -> Result<(u64, u64), String> {
         const WINDOW: u64 = 5000;
@@ -995,10 +995,6 @@ impl Doc {
         }
         Some(days_to_unix(y, mo, d) + (hh as i64) * 3600 + (mm as i64) * 60 + ss as i64)
     }
-}
-
-fn is_leap(y: i32) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
 fn days_to_unix(y: i32, m: i32, d: i32) -> i64 {

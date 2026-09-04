@@ -180,15 +180,14 @@ pub fn open_maybe_archive(path: &Path) -> Result<OpenedFile, String> {
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| String::from("isi.log"));
             let out = dir.join(sanitize(&leaf));
-            let mut found = false;
-            if kind == ArchiveKind::TarGz {
+            let found = if kind == ArchiveKind::TarGz {
                 let dec = flate2::read::GzDecoder::new(f2);
                 let mut ar = tar::Archive::new(dec);
-                found = extract_tar(&mut ar, &pick, &out)?;
+                extract_tar(&mut ar, &pick, &out)?
             } else {
                 let mut ar = tar::Archive::new(f2);
-                found = extract_tar(&mut ar, &pick, &out)?;
-            }
+                extract_tar(&mut ar, &pick, &out)?
+            };
             if !found {
                 return Err(String::from("Entri tar tidak ditemukan."));
             }

@@ -24,19 +24,30 @@ use crate::ui::{
 };
 use super::*;
 
+/// Shared plumbing for background search workers (keeps spawn_* signatures small).
+pub(crate) struct SearchJobParams {
+    pub path: PathBuf,
+    pub gen: u64,
+    pub gen_shared: Arc<AtomicU64>,
+    pub tx: mpsc::Sender<SearchBatchMsg>,
+    pub cancel: Arc<AtomicBool>,
+}
+
+/// True when the job must abort: superseded query (gen) or tab closed (cancel).
+fn job_stale(gen_shared: &Arc<AtomicU64>, gen: u64, cancel: &Arc<AtomicBool>) -> bool {
+    cancel.load(Ordering::Relaxed) || gen_shared.load(Ordering::Relaxed) != gen
+}
+
 pub(crate) fn spawn_search(
-    path: PathBuf,
+    params: SearchJobParams,
     query: String,
     regex_on: bool,
     case_sensitive: bool,
     scope: Option<(u64, u64)>,
-    gen: u64,
-    gen_shared: Arc<AtomicU64>,
-    tx: mpsc::Sender<SearchBatchMsg>,
-    _cancel: Arc<AtomicBool>,
 ) {
     std::thread::spawn(move || {
         use std::io::Read;
+        let SearchJobParams { path, gen, gen_shared, tx, cancel } = params;
         if query.trim().is_empty() {
             let _ = tx.send(SearchBatchMsg {
                 gen,
@@ -103,7 +114,6 @@ pub(crate) fn spawn_search(
         let total_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         let mut reader = std::io::BufReader::with_capacity(4 * 1024 * 1024, file);
         let chunk_size = search::SEARCH_CHUNK;
-        let mut buf = vec![0u8; chunk_size + 16 * 1024];
         let mut carry: Vec<u8> = Vec::new(); // overlap tail
         let mut global_offset: u64 = 0;
         let mut line_no: u64 = 1;
@@ -123,7 +133,7 @@ pub(crate) fn spawn_search(
             8 * 1024
         };
         loop {
-            if gen_shared.load(Ordering::Relaxed) != gen {
+            if job_stale(&gen_shared, gen, &cancel) {
                 return; // dibatalkan (search_gen)
             }
             // Build combined buffer: carry + new bytes
@@ -159,7 +169,7 @@ pub(crate) fn spawn_search(
             // advancing line_no past them? We set carry from tail AFTER counting, so
             // line_no currently points past carry. So start_line = line_no - nl(carry).
             let carry_nl = memchr::memchr_iter(b'\n', &combined).count() as u64;
-            let mut cur_line = line_no.saturating_sub(carry_nl);
+            let cur_line = line_no.saturating_sub(carry_nl);
             let carry_len = combined.len();
             combined.extend_from_slice(&tmp);
             let is_last = n < chunk_size;
@@ -196,7 +206,7 @@ pub(crate) fn spawn_search(
                     // already correct (continuation). Find first newline to set starts.
                     // Iterate matches:
                     for m in f.find_iter(&hay_owned) {
-                        if gen_shared.load(Ordering::Relaxed) != gen {
+                        if job_stale(&gen_shared, gen, &cancel) {
                             return;
                         }
                         if m < carry_len.saturating_sub(overlap) && global_offset != 0 {
@@ -238,7 +248,7 @@ pub(crate) fn spawn_search(
                 }
                 let f = finder.as_ref().unwrap();
                 for m in f.find_iter(hay) {
-                    if gen_shared.load(Ordering::Relaxed) != gen {
+                    if job_stale(&gen_shared, gen, &cancel) {
                         return;
                     }
                     if global_offset != 0 && m < carry_len.saturating_sub(overlap) {
@@ -304,13 +314,9 @@ pub(crate) fn spawn_search(
                         }
                     };
                     let ls = rel_starts[li];
-                    let gline = cur_line + li as u64 - if cont { 0 } else { 0 };
-                    // When cont, rel_starts[0] is second line; li indexes accordingly.
-                    // cur_line is line number of combined[0]'s line. If cont, combined[0]
-                    // belongs to cur_line, but rel_starts[0] starts at cur_line+1.
-                    // Adjust:
+                    // When cont, rel_starts[0] is the second line; gline2 adjusts.
+                    // cur_line is the line number of combined[0]'s line.
                     let gline2 = if cont { cur_line + li as u64 + 1 } else { cur_line + li as u64 };
-                    let _ = gline;
                     let hit = Hit {
                         line: gline2,
                         byte: combined_base + ls as u64,
@@ -388,7 +394,7 @@ pub(crate) fn spawn_search(
                     }
                 }
                 for m in re.find_iter(&combined) {
-                    if gen_shared.load(Ordering::Relaxed) != gen {
+                    if job_stale(&gen_shared, gen, &cancel) {
                         return;
                     }
                     let (s, e) = (m.start(), m.end());
@@ -479,7 +485,7 @@ pub(crate) fn spawn_search(
                 }
             }
         }
-        if gen_shared.load(Ordering::Relaxed) != gen {
+        if job_stale(&gen_shared, gen, &cancel) {
             return;
         }
         let _ = tx.send(SearchBatchMsg {
@@ -497,19 +503,16 @@ pub(crate) fn spawn_search(
 /// Worker pencarian boolean: evaluasi AST per baris terdecode.
 /// Batch 500 hit + progres byte, hormati `search_gen` seperti worker literal.
 pub(crate) fn spawn_bool_search(
-    path: PathBuf,
+    params: SearchJobParams,
     ast: crate::engine::query::Query,
     encoding: Encoding,
     bom_len: usize,
     case_sensitive: bool,
     scope_lines: Option<(u64, u64)>,
-    gen: u64,
-    gen_shared: Arc<AtomicU64>,
-    tx: mpsc::Sender<SearchBatchMsg>,
-    _cancel: Arc<AtomicBool>,
 ) {
     std::thread::spawn(move || {
         use std::io::BufRead;
+        let SearchJobParams { path, gen, gen_shared, tx, cancel } = params;
         if encoding.is_wide() {
             let _ = tx.send(SearchBatchMsg {
                 gen,
@@ -557,7 +560,7 @@ pub(crate) fn spawn_bool_search(
         // Lewati BOM pada baris pertama.
         let mut first = true;
         loop {
-            if gen_shared.load(Ordering::Relaxed) != gen {
+            if job_stale(&gen_shared, gen, &cancel) {
                 return;
             }
             buf.clear();
@@ -631,7 +634,7 @@ pub(crate) fn spawn_bool_search(
             }
             line_no += 1;
         }
-        if gen_shared.load(Ordering::Relaxed) != gen {
+        if job_stale(&gen_shared, gen, &cancel) {
             return;
         }
         let _ = tx.send(SearchBatchMsg {

@@ -98,7 +98,7 @@ pub(crate) struct TabState {
     /// Peta bucket ERROR/WARN (512 byte) + ukuran file saat dipindai.
     pub(crate) marker_bits: Option<Vec<u8>>,
     pub(crate) marker_size: u64,
-    pub(crate) marker_rx: Option<mpsc::Receiver<(Vec<u8>, u64, Option<TimeHist>)>>,
+    pub(crate) marker_rx: Option<mpsc::Receiver<MarkerUpdate>>,
     /// Histogram ERROR per menit (shading strip).
     pub(crate) time_hist: Option<TimeHist>,
     /// Catatan follow segar, mis. `+128 baris baru` (+ waktu).
@@ -118,7 +118,6 @@ pub(crate) struct TabState {
     pub(crate) last_follow_poll: Instant,
     /// Sidik head terakhir untuk follow (None = belum diketahui).
     pub(crate) follow_fp: Option<String>,
-    pub(crate) pending_search_error: Option<String>,
 }
 
 impl TabState {
@@ -185,7 +184,6 @@ impl TabState {
             search_cancel: Arc::new(AtomicBool::new(false)),
             last_follow_poll: Instant::now(),
             follow_fp: None,
-            pending_search_error: None,
         }
     }
 
@@ -303,16 +301,18 @@ impl TabState {
         if bool_mode {
             match query::parse_query(&q) {
                 Ok(ast) => spawn_bool_search(
-                    self.doc.path.clone(),
+                    SearchJobParams {
+                        path: self.doc.path.clone(),
+                        gen,
+                        gen_shared: self.gen_shared.clone(),
+                        tx,
+                        cancel,
+                    },
                     ast,
                     self.doc.encoding(),
                     self.doc.bom_len,
                     self.case_sensitive,
                     self.scope,
-                    gen,
-                    self.gen_shared.clone(),
-                    tx,
-                    cancel,
                 ),
                 Err(e) => {
                     self.doc.search_error = Some(e);
@@ -322,15 +322,17 @@ impl TabState {
             return;
         }
         spawn_search(
-            self.doc.path.clone(),
+            SearchJobParams {
+                path: self.doc.path.clone(),
+                gen,
+                gen_shared: self.gen_shared.clone(),
+                tx,
+                cancel,
+            },
             q,
             self.regex_on,
             self.case_sensitive,
             scope_bytes,
-            gen,
-            self.gen_shared.clone(),
-            tx,
-            cancel,
         );
     }
 
