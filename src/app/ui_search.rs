@@ -99,16 +99,10 @@ impl AsisLogApp {
                 }
                 if ui
                     .add_sized(egui::vec2(clear_w, 0.0), egui::Button::new("×"))
-                    .on_hover_text("Bersihkan pencarian (Esc)")
+                    .on_hover_text("Bersihkan pencarian dan hentikan worker (Esc)")
                     .clicked()
                 {
-                    tab.search_text.clear();
-                    tab.last_searched.clear();
-                    tab.doc.hits.clear();
-                    tab.doc.search_error = None;
-                    tab.doc.search_in_progress = false;
-                    tab.current_hit = None;
-                    tab.results_collapsed = true;
+                    tab.clear_search();
                 }
             });
             // Baris chip boolean: tampil bila query butuh logika AND/OR/NOT.
@@ -183,6 +177,10 @@ impl AsisLogApp {
                     .clicked()
                 {
                     tab.case_sensitive = !cs;
+                    // Flag berubah = pencarian kedaluwarsa: ulangi bila ada query.
+                    if !tab.search_text.trim().is_empty() {
+                        tab.debounce_at = Some(Instant::now() + Duration::from_millis(150));
+                    }
                 }
                 let rx = tab.regex_on;
                 if ui
@@ -191,6 +189,9 @@ impl AsisLogApp {
                     .clicked()
                 {
                     tab.regex_on = !rx;
+                    if !tab.search_text.trim().is_empty() {
+                        tab.debounce_at = Some(Instant::now() + Duration::from_millis(150));
+                    }
                 }
                 ui.separator();
                 if ui

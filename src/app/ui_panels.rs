@@ -210,17 +210,10 @@ impl AsisLogApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
                             .small_button("×")
-                            .on_hover_text("Bersihkan pencarian")
+                            .on_hover_text("Bersihkan pencarian dan hentikan worker")
                             .clicked()
                         {
-                            let t = &mut self.tabs[cur_idx];
-                            t.search_text.clear();
-                            t.last_searched.clear();
-                            t.doc.hits.clear();
-                            t.doc.search_error = None;
-                            t.doc.search_in_progress = false;
-                            t.current_hit = None;
-                            t.results_collapsed = true;
+                            self.tabs[cur_idx].clear_search();
                         }
                         let t = &mut self.tabs[cur_idx];
                         let (icon, tip) = if t.results_collapsed {

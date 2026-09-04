@@ -26,6 +26,9 @@ use super::*;
 
 impl AsisLogApp {
     pub(crate) fn render_viewport(&mut self, ctx: &egui::Context, cur_idx: usize) {
+        // Status fokus dihitung SEBELUM pinjam tab (navigasi keyboard di
+        // bawah butuh tahu apakah caret sedang di kolom teks).
+        let (field_focused, dialog_open) = self.focus_state(ctx);
         // ---- viewport utama: memakai seluruh sisa tinggi CentralPanel ----
         egui::CentralPanel::default().show(ctx, |ui| {
             let rh = self.row_h();
@@ -60,18 +63,22 @@ impl AsisLogApp {
                     tab.doc.stick_bottom = false; // gulir ke atas melepas kunci
                 }
             }
-            // Keyboard atas/bawah PgUp/PgDn
-            if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
-                tab.top_row = (tab.top_row + 1).min(total_rows.saturating_sub(1));
-            }
-            if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
-                tab.top_row = tab.top_row.saturating_sub(1);
-            }
-            if ctx.input(|i| i.key_pressed(egui::Key::PageDown)) {
-                tab.top_row = (tab.top_row + visible).min(total_rows.saturating_sub(1));
-            }
-            if ctx.input(|i| i.key_pressed(egui::Key::PageUp)) {
-                tab.top_row = tab.top_row.saturating_sub(visible);
+            // Keyboard atas/bawah PgUp/PgDn — hanya bila fokus TIDAK di kolom
+            // teks (caret butuh tombol ini) dan tak ada dialog terbuka.
+            // (field_focused/dialog_open dihitung di atas, sebelum pinjam tab.)
+            if !field_focused && !dialog_open {
+                if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+                    tab.top_row = (tab.top_row + 1).min(total_rows.saturating_sub(1));
+                }
+                if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+                    tab.top_row = tab.top_row.saturating_sub(1);
+                }
+                if ctx.input(|i| i.key_pressed(egui::Key::PageDown)) {
+                    tab.top_row = (tab.top_row + visible).min(total_rows.saturating_sub(1));
+                }
+                if ctx.input(|i| i.key_pressed(egui::Key::PageUp)) {
+                    tab.top_row = tab.top_row.saturating_sub(visible);
+                }
             }
             // Stick-to-bottom bila follow
             if tab.doc.follow && tab.doc.stick_bottom {

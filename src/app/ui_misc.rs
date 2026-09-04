@@ -287,7 +287,7 @@ impl AsisLogApp {
                         ("Ctrl+G", "Ke baris / persen / akhir / waktu"),
                         ("Ctrl+E", "Ekspor hasil pencarian"),
                         ("Ctrl+Home / Ctrl+End", "Awal / akhir file"),
-                        ("Ctrl+Tab / Ctrl+Shift+Tab", "Pindah tab"),
+                        ("Ctrl+Tab / Ctrl+Shift+Tab", "Pindah tab (berlaku juga saat mengetik)"),
                         ("Ctrl+Shift+F", "Ikuti akhir file (LIVE)"),
                         ("Ctrl+B", "Tandai baris aktif"),
                         ("Ctrl+Shift+B", "Panel penanda"),
@@ -295,8 +295,8 @@ impl AsisLogApp {
                         ("Alt+Left / Alt+Right", "History mundur / maju"),
                         ("Alt+Atas / Alt+Bawah", "Penanda sebelumnya / berikutnya"),
                         ("Ctrl+= / Ctrl+- / Ctrl+0", "Zoom UI"),
-                        ("PgUp / PgDn, Panah", "Gulir viewport"),
-                        ("Esc", "Batal & tutup dialog"),
+                        ("PgUp / PgDn, Panah", "Gulir viewport (di luar kolom ketik)"),
+                        ("Esc", "Tutup dialog teratas; lalu batalkan pencarian"),
                     ] {
                         ui.horizontal(|ui| {
                             ui.strong(keys);

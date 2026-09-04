@@ -228,6 +228,30 @@ impl TabState {
         FileRev { size: self.doc.size, mtime_s: s, mtime_n: n }
     }
 
+    /// Cancel a running search worker for real: bump the generation (late
+    /// batches are dropped in poll_channels) and raise the cancel flag so
+    /// the thread exits at the next chunk boundary. Query/results untouched.
+    pub(crate) fn cancel_search_worker(&mut self) {
+        self.doc.search_gen += 1;
+        self.gen_shared.store(self.doc.search_gen, Ordering::Relaxed);
+        self.search_cancel.store(true, Ordering::Relaxed);
+        self.doc.search_in_progress = false;
+        self.debounce_at = None;
+    }
+
+    /// Full search reset for the × buttons: real worker cancel (above) plus
+    /// clearing query, results, and selection state.
+    pub(crate) fn clear_search(&mut self) {
+        self.cancel_search_worker();
+        self.search_text.clear();
+        self.last_searched.clear();
+        self.doc.hits.clear();
+        self.doc.search_error = None;
+        self.current_hit = None;
+        self.results_collapsed = true;
+        self.refresh_mode_map();
+    }
+
     pub(crate) fn start_search(&mut self, history: &mut Vec<HistEntry>) {
         use crate::engine::query;
         let q = self.search_text.clone();
