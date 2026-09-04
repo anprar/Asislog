@@ -71,6 +71,7 @@ impl AsisLogApp {
             let mut do_export: Option<usize> = None;
             let mut do_ticket: Option<usize> = None;
             let mut do_close = false;
+            let mut do_cancel = false;
             egui::Window::new("Simpan hasil ke file…")
                 .collapsible(false)
                 .show(ctx, |ui| {
@@ -80,6 +81,17 @@ impl AsisLogApp {
                         ui.label("Konteks (baris sekitar):");
                         ui.add(egui::DragValue::new(&mut tab.export_context).range(0..=100));
                     });
+                    if tab.export_rx.is_some() {
+                        ui.label(
+                            tab.doc
+                                .status
+                                .clone(),
+                        );
+                        ui.label("Ekspor berjalan di latar; dialog boleh ditutup.");
+                        if ui.button("Batalkan ekspor").clicked() {
+                            do_cancel = true;
+                        }
+                    }
                     ui.horizontal(|ui| {
                         if ui.button("Hanya hasil").clicked() {
                             do_export = Some(0);
@@ -106,15 +118,7 @@ impl AsisLogApp {
                     .set_file_name("asislog-ekspor.txt")
                     .save_file();
                 if let Some(p) = out {
-                    let tab = &mut self.tabs[cur_idx];
-                    match tab.doc.export_hits_to_file(&p, cx) {
-                        Ok(n) => {
-                            tab.doc.status =
-                                format!("Diekspor {} baris ke {}.", n, p.display());
-                            tab.export_open = false;
-                        }
-                        Err(e) => tab.doc.status = e,
-                    }
+                    self.tabs[cur_idx].start_export(p, cx, false, String::new());
                 }
             }
             if let Some(cx) = do_ticket {
@@ -122,20 +126,16 @@ impl AsisLogApp {
                     .set_file_name("asislog-tiket.md")
                     .save_file();
                 if let Some(p) = out {
-                    let tab = &mut self.tabs[cur_idx];
-                    let q = tab.search_text.clone();
-                    match tab.doc.export_ticket_to_file(&p, &q, cx) {
-                        Ok(n) => {
-                            tab.doc.status = format!(
-                                "Tiket ({} baris konteks) disimpan ke {}.",
-                                n,
-                                p.display()
-                            );
-                            tab.export_open = false;
-                        }
-                        Err(e) => tab.doc.status = e,
-                    }
+                    let q = self.tabs[cur_idx].search_text.clone();
+                    self.tabs[cur_idx].start_export(p, cx, true, q);
                 }
+            }
+            if do_cancel {
+                let t = &mut self.tabs[cur_idx];
+                t.export_cancel.store(true, Ordering::Relaxed);
+                t.export_rx = None;
+                t.doc.status = String::from("Ekspor dibatalkan.");
+                t.export_open = false;
             }
             if do_close {
                 self.tabs[cur_idx].export_open = false;

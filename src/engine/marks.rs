@@ -36,10 +36,15 @@ pub fn sidecar_path(log_path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// FNV-1a 64 over head 64 KiB + tail 64 KiB + size.
-/// Cheap fingerprint: append-only growth keeps the head identical.
+/// FNV-1a 64 over the first `head_len` bytes (head prefix only).
+/// Callers pass min(64 KiB, size-at-save), so plain appends preserve the
+/// saved prefix and verify cleanly; replacement/truncation changes it and
+/// warns. Size is deliberately NOT mixed in (it changes on every benign
+/// append), and the tail is not read (it changes on every append too).
+/// NOTE: sidecars written before this change hashed size+head+tail, so they
+/// warn once ("mungkin tidak valid") and then self-heal on the next save.
 pub fn fingerprint(path: &Path, size: u64) -> Option<String> {
-    use std::io::{Read, Seek, SeekFrom};
+    use std::io::Read;
     let mut f = std::fs::File::open(path).ok()?;
     let mut h: u64 = 0xcbf29ce484222325;
     let mut mix = |b: &[u8]| {
@@ -48,13 +53,23 @@ pub fn fingerprint(path: &Path, size: u64) -> Option<String> {
             h = h.wrapping_mul(0x100000001b3);
         }
     };
-    mix(&size.to_le_bytes());
-    let mut buf = vec![0u8; FINGER_BYTES];
-    let n = f.read(&mut buf).ok()?;
-    mix(&buf[..n]);
-    if size > FINGER_BYTES as u64 && f.seek(SeekFrom::End(-(FINGER_BYTES as i64))).is_ok() {
-        let n = f.read(&mut buf).unwrap_or(0);
-        mix(&buf[..n]);
+    let want = (size.min(FINGER_BYTES as u64)) as usize;
+    let mut buf = vec![0u8; want.max(1)];
+    let mut got = 0usize;
+    while got < want {
+        match f.read(&mut buf[got..want]) {
+            Ok(0) => break,
+            Ok(n) => {
+                mix(&buf[got..got + n]);
+                got += n;
+            }
+            Err(_) => return None,
+        }
+    }
+    if got != want {
+        // File shorter than the saved prefix: truncated or replaced.
+        // Hash what exists (differs from saved) so callers warn.
+        return Some(format!("{:016x}:short", h));
     }
     Some(format!("{:016x}", h))
 }
@@ -123,7 +138,9 @@ pub fn load(path: &Path) -> (Vec<Bookmark>, Option<String>) {
         );
     }
     let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    let fp = fingerprint(path, size).unwrap_or_default();
+    // Prefix check uses the SAVED size (not current): plain appends preserve
+    // the saved prefix and verify cleanly.
+    let fp = fingerprint(path, sc.size).unwrap_or_default();
     let mut warn = None;
     if !sc.fingerprint.is_empty() && sc.fingerprint != fp {
         warn = Some(String::from(
@@ -174,10 +191,15 @@ mod tests {
             let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
             writeln!(f, "line3").unwrap();
         }
-        let (loaded, _warn) = load(&p);
+        let (loaded, warn) = load(&p);
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].label, "dua");
         assert_eq!(loaded[0].color, BookmarkColor::Red);
+        // Plain append preserves the saved prefix: no "mungkin tidak valid".
+        assert_ne!(
+            warn.as_deref(),
+            Some("File sumber berubah; nomor baris penanda mungkin tidak valid."),
+        );
         let _ = std::fs::remove_file(&p);
         let _ = std::fs::remove_file(sidecar_path(&p));
     }

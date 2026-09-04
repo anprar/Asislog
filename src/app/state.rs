@@ -93,6 +93,39 @@ pub struct AsisLogApp {
     pub(crate) paste_text: String,
     /// Goto dialog: terapkan ke semua tab.
     pub(crate) goto_all: bool,
+    /// Konfirmasi hapus tertunda (modal): eksekusi hanya bila pengguna
+    /// menekan "Ya".
+    pub(crate) confirm: Option<ConfirmAction>,
+}
+
+/// Aksi destruktif yang menunggu konfirmasi modal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ConfirmAction {
+    /// Hapus penanda di baris ini (tab kini).
+    DeleteMark(u64),
+    /// Kosongkan seluruh riwayat file.
+    ClearRecent,
+}
+
+impl ConfirmAction {
+    pub(crate) fn title(&self) -> &'static str {
+        match self {
+            ConfirmAction::DeleteMark(_) => "Hapus penanda?",
+            ConfirmAction::ClearRecent => "Bersihkan riwayat?",
+        }
+    }
+
+    pub(crate) fn message(&self) -> String {
+        match self {
+            ConfirmAction::DeleteMark(ln) => format!(
+                "Penanda baris {} akan dihapus permanen (tak bisa dibatalkan).",
+                crate::engine::format_count(*ln)
+            ),
+            ConfirmAction::ClearRecent => {
+                String::from("Seluruh riwayat file dibuka akan dikosongkan.")
+            }
+        }
+    }
 }
 
 impl AsisLogApp {
@@ -159,6 +192,7 @@ impl AsisLogApp {
             paste_open: false,
             paste_text: String::new(),
             goto_all: false,
+            confirm: None,
         };
         app.rebuild_highlights();
         app.restore_session();
@@ -245,7 +279,13 @@ impl AsisLogApp {
             .tabs
             .iter()
             .map(|t| SessionTab {
-                path: t.doc.path.display().to_string(),
+                // Tab arsip: simpan arsip asal (temp sudah dihapus saat tutup).
+                path: t
+                    .archive_src
+                    .as_ref()
+                    .unwrap_or(&t.doc.path)
+                    .display()
+                    .to_string(),
                 top_line: t.row_to_line(t.top_row).unwrap_or(1),
                 selected_line: t.selected_line,
                 search_text: t.search_text.clone(),
@@ -255,6 +295,9 @@ impl AsisLogApp {
                 follow: t.doc.follow,
                 encoding: t.doc.encoding_override.map(|e| e.key().to_string()),
                 scope: t.scope,
+                view_mode: Some(t.view_mode.nama().to_string()),
+                range: t.range_applied.clone(),
+                archive: t.archive_src.as_ref().map(|p| p.display().to_string()),
             })
             .collect();
         let s = Session { tabs, current: self.current, tema: Some(self.tema.key().to_string()) };
@@ -284,9 +327,16 @@ impl AsisLogApp {
                 .tabs
                 .iter()
                 .map(|t| WorkspaceFile {
-                    path: t.doc.path.display().to_string(),
+                    // Tab arsip: simpan arsip asal agar bisa dibuka ulang.
+                    path: t
+                        .archive_src
+                        .as_ref()
+                        .unwrap_or(&t.doc.path)
+                        .display()
+                        .to_string(),
                     top_line: t.row_to_line(t.top_row).unwrap_or(1),
                     selected_line: t.selected_line,
+                    view_mode: Some(t.view_mode.nama().to_string()),
                 })
                 .collect(),
             filter: cur.filter_text.clone(),
@@ -318,7 +368,14 @@ impl AsisLogApp {
                 missing += 1;
                 continue;
             }
-            match Doc::open(p.clone()) {
+            let (doc_path, temp, archive, note) = match resolve_log_path(&p) {
+                Ok(o) => o,
+                Err(_) => {
+                    missing += 1;
+                    continue;
+                }
+            };
+            match Doc::open(doc_path) {
                 Ok(mut doc) => {
                     let (marks, warn) = crate::engine::marks::load(&doc.path);
                     if !marks.is_empty() {
@@ -327,10 +384,19 @@ impl AsisLogApp {
                     if let Some(w) = warn {
                         doc.status = w;
                     }
+                    if !note.is_empty() {
+                        doc.status = note;
+                    }
                     let mut tab = TabState::new(doc);
+                    tab.temp_path = temp;
+                    tab.archive_src = archive;
                     tab.selected_line = f.selected_line.max(1);
                     tab.top_row = f.top_line.saturating_sub(1);
                     tab.saved_top = tab.top_row;
+                    if let Some(m) = f.view_mode.as_deref() {
+                        tab.view_mode = ViewMode::from_nama(m);
+                        tab.refresh_mode_map();
+                    }
                     self.tabs.push(tab);
                     crate::store::push_recent(
                         &mut self.recent,
@@ -397,7 +463,15 @@ impl AsisLogApp {
                 missing += 1;
                 continue;
             }
-            match Doc::open(p) {
+            // Arsip dibuka ulang via ekstraksi (path tersimpan = arsip asal).
+            let (doc_path, temp, archive, note) = match resolve_log_path(&p) {
+                Ok(o) => o,
+                Err(_) => {
+                    missing += 1;
+                    continue;
+                }
+            };
+            match Doc::open(doc_path) {
                 Ok(mut doc) => {
                     let (marks, warn) = crate::engine::marks::load(&doc.path);
                     if !marks.is_empty() {
@@ -406,12 +480,17 @@ impl AsisLogApp {
                     if let Some(w) = warn {
                         doc.status = w;
                     }
+                    if !note.is_empty() {
+                        doc.status = note;
+                    }
                     if let Some(key) = st.encoding.as_deref() {
                         if let Some(enc) = Encoding::from_key(key) {
                             doc.set_encoding_override(Some(enc));
                         }
                     }
                     let mut tab = TabState::new(doc);
+                    tab.temp_path = temp;
+                    tab.archive_src = archive;
                     tab.search_text = st.search_text;
                     tab.regex_on = st.regex_on;
                     tab.case_sensitive = st.case_sensitive;
@@ -426,10 +505,24 @@ impl AsisLogApp {
                         tab.scope_a = a.to_string();
                         tab.scope_b = b.to_string();
                     }
+                    if let Some(m) = st.view_mode.as_deref() {
+                        tab.view_mode = ViewMode::from_nama(m);
+                        tab.refresh_mode_map();
+                    }
                     if !tab.search_text.trim().is_empty() {
                         tab.debounce_at = Some(Instant::now() + Duration::from_millis(400));
                     }
-                    if !st.filter_text.trim().is_empty() {
+                    // Rentang waktu menang atas teks filter (seperti workspace).
+                    if let Some((a, b)) = st.range.clone() {
+                        match apply_time_range(&mut tab, &a, &b) {
+                            Ok(msg) => {
+                                tab.doc.status = msg;
+                                tab.range_applied = Some((a, b));
+                                tab.filter_text.clear();
+                            }
+                            Err(e) => tab.doc.status = e,
+                        }
+                    } else if !st.filter_text.trim().is_empty() {
                         let q = st.filter_text.clone();
                         tab.start_filter(q);
                     }
@@ -545,16 +638,14 @@ impl AsisLogApp {
 
     pub(crate) fn open_file(&mut self, path: PathBuf) {
         // Arsip (zip/tar/gz): ekstrak entri teks terbaik ke temp dulu.
-        let opened = match crate::engine::archive::open_maybe_archive(&path) {
+        let (doc_path, temp, archive, note) = match resolve_log_path(&path) {
             Ok(o) => o,
             Err(e) => {
                 self.global_error = Some(e);
                 return;
             }
         };
-        let note = opened.note.clone();
-        let temp = opened.temp.clone();
-        match Doc::open(opened.path) {
+        match Doc::open(doc_path) {
             Ok(mut doc) => {
                 // Muat penanda persisten (sidecar JSON + validasi sidik).
                 let (marks, warn) = crate::engine::marks::load(&path);
@@ -569,6 +660,7 @@ impl AsisLogApp {
                 }
                 let mut tab = TabState::new(doc);
                 tab.temp_path = temp;
+                tab.archive_src = archive;
                 self.tabs.push(tab);
                 self.current = self.tabs.len() - 1;
                 self.global_status = format!("Membuka {}.", path.display());
@@ -597,4 +689,22 @@ impl AsisLogApp {
     pub(crate) fn current_tab_mut(&mut self) -> Option<&mut TabState> {
         self.tabs.get_mut(self.current)
     }
+}
+
+/// Hasil resolusi satu path log: arsip diekstrak dulu, file biasa langsung.
+/// Mengembalikan (doc_path, temp_ekstrak, arsip_asal, catatan, galat).
+/// Dipakai open_file + restore_session + open_workspace agar ketiganya
+/// memperlakukan zip/tar/gz identik.
+pub(crate) fn resolve_log_path(
+    path: &std::path::Path,
+) -> Result<(PathBuf, Option<PathBuf>, Option<PathBuf>, String), String> {
+    let opened = crate::engine::archive::open_maybe_archive(path)?;
+    let note = opened.note.clone();
+    let temp = opened.temp.clone();
+    let archive = if temp.is_some() {
+        Some(path.to_path_buf())
+    } else {
+        None
+    };
+    Ok((opened.path, temp, archive, note))
 }

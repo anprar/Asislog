@@ -72,12 +72,20 @@ impl AsisLogApp {
                 }
                 if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
                     tab.top_row = tab.top_row.saturating_sub(1);
+                    tab.doc.stick_bottom = false; // seperti gulir roda ke atas
                 }
                 if ctx.input(|i| i.key_pressed(egui::Key::PageDown)) {
                     tab.top_row = (tab.top_row + visible).min(total_rows.saturating_sub(1));
                 }
                 if ctx.input(|i| i.key_pressed(egui::Key::PageUp)) {
                     tab.top_row = tab.top_row.saturating_sub(visible);
+                    tab.doc.stick_bottom = false;
+                }
+                // Turun hingga dasar mengunci lagi bila Ikuti (cermin roda mouse).
+                if tab.doc.follow
+                    && tab.top_row + visible >= total_rows.saturating_sub(2)
+                {
+                    tab.doc.stick_bottom = true;
                 }
             }
             // Stick-to-bottom bila follow
@@ -114,24 +122,31 @@ impl AsisLogApp {
             // Disampling maks ~1200 titik agar murah tiap frame.
             let mut markers: Vec<(f32, egui::Color32)> = Vec::new();
             if total_lines > 0 {
+                // Fraksi dalam f64 (baris bisa ratusan juta; f32 hanya
+                // presisi ~16 juta bilangan bulat); ke f32 hanya untuk
+                // koordinat piksel.
+                let total_f = total_lines as f64;
+                let frac = |line: u64| {
+                    ((line as f64 / total_f).clamp(0.0, 1.0)) as f32
+                };
                 let stride = (tab.doc.hits.len() / 1200).max(1);
                 for (i, h) in tab.doc.hits.iter().enumerate() {
                     if i % stride != 0 {
                         continue;
                     }
                     markers.push((
-                        h.line as f32 / total_lines as f32,
+                        frac(h.line),
                         egui::Color32::from_rgb(70, 210, 200),
                     ));
                 }
                 for b in &tab.doc.bookmarks {
                     markers.push((
-                        b.line as f32 / total_lines as f32,
+                        frac(b.line),
                         egui::Color32::from_rgb(90, 160, 255),
                     ));
                 }
                 if let Some(c) = tab.current_hit.and_then(|c| tab.doc.hits.get(c)) {
-                    markers.push((c.line as f32 / total_lines as f32, egui::Color32::GREEN));
+                    markers.push((frac(c.line), egui::Color32::GREEN));
                 }
             }
             // Lebar gutter dinamis mengikuti digit jumlah baris.
@@ -167,10 +182,15 @@ impl AsisLogApp {
                                                 let kind = viewer::classify(&disp);
                                                 // SELALU bungkus Frame (isi beda, ukuran sama)
                                                 // agar hover tak menggeser layout (anti-flicker).
-                                                let bg = if Some(ln) == cur_hit_line {
+                                                // Seleksi memakai visuals() tema aktif agar konsisten
+                                                // di semua tema (mis. Kontras Tinggi: hitam di kuning).
+                                                let is_current = Some(ln) == cur_hit_line;
+                                                let is_sel =
+                                                    !is_current && ln == tab.selected_line;
+                                                let bg = if is_current {
                                                     viewer::bg_for_current_match_theme(dark)
-                                                } else if ln == tab.selected_line {
-                                                    viewer::bg_for_selection(dark)
+                                                } else if is_sel {
+                                                    ui.visuals().selection.bg_fill
                                                 } else if Some(ln) == tab.hover_line {
                                                     viewer::bg_for_hover(dark)
                                                 } else {
@@ -213,6 +233,7 @@ impl AsisLogApp {
                                                             ui.separator();
                                                             let t = viewer::render_log_line(
                                                                 ui, &disp, kind, dark, rules,
+                                                                is_sel,
                                                             );
                                                             RowResp { g, t }
                                                         })
@@ -323,24 +344,31 @@ impl AsisLogApp {
                                         }
                                     }
                                 }
-                                // Garis posisi viewport kini.
+                                // Garis posisi viewport kini (f64: presisi di ratusan jt baris;
+                                // warna sadar-tema: putih tak terlihat di strip terang).
                                 if total_rows > 0 {
-                                    let f = tab.top_row as f32 / total_rows as f32;
-                                    let y = rect.top() + f.clamp(0.0, 1.0) * rect.height();
+                                    let f = tab.top_row as f64 / total_rows as f64;
+                                    let y = rect.top()
+                                        + (f.clamp(0.0, 1.0) as f32) * rect.height();
                                     painter.rect_filled(
                                         egui::Rect::from_min_size(
                                             egui::pos2(rect.left(), y - 1.0),
                                             egui::vec2(rect.width(), 2.0),
                                         ),
                                         0.0,
-                                        egui::Color32::WHITE,
+                                        if dark {
+                                            egui::Color32::WHITE
+                                        } else {
+                                            egui::Color32::BLACK
+                                        },
                                     );
                                 }
                                 if resp.clicked() {
                                     if let Some(p) = resp.interact_pointer_pos() {
                                         let f = ((p.y - rect.top()) / rect.height())
-                                            .clamp(0.0, 1.0);
-                                        tab.top_row = ((f * total_rows as f32) as u64)
+                                            .clamp(0.0, 1.0)
+                                            as f64;
+                                        tab.top_row = ((f * total_rows as f64) as u64)
                                             .min(total_rows.saturating_sub(1));
                                         tab.doc.stick_bottom = false;
                                         if let Some(ln) =
@@ -376,7 +404,9 @@ impl AsisLogApp {
                             egui::vec2(bar_w, log_h),
                             egui::Layout::top_down(egui::Align::Center),
                             |ui| {
-                                let track_h = (log_h - 28.0).max(40.0);
+                                // Ruang untuk tombol "Akhir" di bawah track (ikut zoom).
+                                let track_h =
+                                    (log_h - 28.0 * self.zoom).max(40.0);
                                 let (rect, resp) = ui.allocate_exact_size(
                                     egui::vec2(bar_w, track_h),
                                     egui::Sense::click_and_drag(),
@@ -391,15 +421,17 @@ impl AsisLogApp {
                                         egui::Color32::from_gray(208)
                                     },
                                 );
-                                let total_f = total_rows.max(1) as f32;
-                                let th = ((visible as f32 / total_f) * rect.height())
-                                    .clamp(10.0, rect.height());
+                                let total_f = total_rows.max(1) as f64;
+                                let th = ((visible as f64 / total_f) * rect.height() as f64)
+                                    .clamp(10.0, rect.height() as f64)
+                                    as f32;
                                 let top_f = if total_rows > 1 {
-                                    tab.top_row as f32 / (total_rows - 1) as f32
+                                    tab.top_row as f64 / (total_rows - 1) as f64
                                 } else {
                                     0.0
                                 };
-                                let y0 = rect.top() + top_f * (rect.height() - th);
+                                let y0 = rect.top()
+                                    + (top_f as f32) * (rect.height() - th);
                                 painter.rect_filled(
                                     egui::Rect::from_min_size(
                                         egui::pos2(rect.left() + 2.0, y0),
@@ -414,10 +446,11 @@ impl AsisLogApp {
                                 );
                                 if resp.clicked() || resp.dragged() {
                                     if let Some(p) = resp.interact_pointer_pos() {
-                                        let f = ((p.y - th / 2.0 - rect.top())
-                                            / (rect.height() - th).max(1.0))
-                                            .clamp(0.0, 1.0);
-                                        tab.top_row = ((f * total_rows.saturating_sub(1) as f32)
+                                        let h = rect.height() as f64;
+                                        let f = ((p.y - th / 2.0 - rect.top()) as f64
+                                            / (h - th as f64).max(1.0))
+                                        .clamp(0.0, 1.0);
+                                        tab.top_row = ((f * total_rows.saturating_sub(1) as f64)
                                             as u64)
                                             .min(total_rows.saturating_sub(1));
                                         tab.doc.stick_bottom = false;

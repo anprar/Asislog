@@ -173,7 +173,7 @@ impl AsisLogApp {
                 let cs = tab.case_sensitive;
                 if ui
                     .add(egui::Button::selectable(cs, "Aa"))
-                    .on_hover_text("Peka huruf besar/kecil (case sensitive)")
+                    .on_hover_text("Peka huruf besar/kecil")
                     .clicked()
                 {
                     tab.case_sensitive = !cs;

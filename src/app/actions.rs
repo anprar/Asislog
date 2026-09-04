@@ -41,6 +41,7 @@ impl AsisLogApp {
             || self.url_open
             || self.paste_open
             || self.scratch_open
+            || self.confirm.is_some()
             || self.global_error.is_some()
             || self
                 .tabs
@@ -95,16 +96,21 @@ impl AsisLogApp {
         if !typing && ctrl && ctx.input(|i| i.key_pressed(egui::Key::Home)) {
             tab.top_row = 0;
             tab.selected_line = tab.row_to_line(0).unwrap_or(1);
+            tab.doc.stick_bottom = false; // pergi dari ekor = jeda LIVE
         }
         if !typing && ctrl && ctx.input(|i| i.key_pressed(egui::Key::End)) {
             let total = tab.total_view_rows();
-            tab.top_row = total.saturating_sub(60);
+            tab.top_row = total.saturating_sub(tab.last_visible.max(10));
             tab.doc.stick_bottom = true;
         }
-        // Ctrl+Shift+F toggle ikuti
+        // Ctrl+Shift+F: cermin tombol LIVE (aktif / jeda-lanjut / mati).
         if !typing && ctrl && shift && ctx.input(|i| i.key_pressed(egui::Key::F)) {
-            tab.doc.follow = !tab.doc.follow;
-            tab.doc.stick_bottom = tab.doc.follow;
+            if tab.doc.follow && !tab.doc.stick_bottom {
+                tab.doc.stick_bottom = true;
+            } else {
+                tab.doc.follow = !tab.doc.follow;
+                tab.doc.stick_bottom = tab.doc.follow;
+            }
             sess_touch = true;
         }
         // Alt+Left / Alt+Right: history navigasi (bukan saat mengetik).
@@ -142,7 +148,10 @@ impl AsisLogApp {
                 }
             };
             if !tab_handled {
-                if self.global_error.is_some() {
+                // Modal konfirmasi paling atas; Esc = Batal.
+                if self.confirm.is_some() {
+                    self.confirm = None;
+                } else if self.global_error.is_some() {
                     self.global_error = None;
                 } else if self.shortcuts_open {
                     self.shortcuts_open = false;
@@ -586,13 +595,44 @@ pub(crate) fn spawn_download(url: String, tx: mpsc::Sender<DlMsg>) {
 
 /// Warna dot penanda, sadar-tema.
 pub(crate) fn mark_color(c: BookmarkColor, dark: bool) -> egui::Color32 {
+    // Varian terang digelapkan agar terbaca di latar terang.
     match c {
         BookmarkColor::Default => viewer::gutter_color(dark),
-        BookmarkColor::Blue => egui::Color32::from_rgb(90, 160, 255),
-        BookmarkColor::Green => egui::Color32::from_rgb(90, 220, 120),
-        BookmarkColor::Yellow => egui::Color32::from_rgb(255, 200, 60),
-        BookmarkColor::Red => egui::Color32::from_rgb(255, 110, 110),
-        BookmarkColor::Purple => egui::Color32::from_rgb(200, 150, 255),
+        BookmarkColor::Blue => {
+            if dark {
+                egui::Color32::from_rgb(90, 160, 255)
+            } else {
+                egui::Color32::from_rgb(30, 90, 180)
+            }
+        }
+        BookmarkColor::Green => {
+            if dark {
+                egui::Color32::from_rgb(90, 220, 120)
+            } else {
+                egui::Color32::from_rgb(20, 130, 40)
+            }
+        }
+        BookmarkColor::Yellow => {
+            if dark {
+                egui::Color32::from_rgb(255, 200, 60)
+            } else {
+                egui::Color32::from_rgb(150, 110, 0)
+            }
+        }
+        BookmarkColor::Red => {
+            if dark {
+                egui::Color32::from_rgb(255, 110, 110)
+            } else {
+                egui::Color32::from_rgb(180, 30, 30)
+            }
+        }
+        BookmarkColor::Purple => {
+            if dark {
+                egui::Color32::from_rgb(200, 150, 255)
+            } else {
+                egui::Color32::from_rgb(110, 60, 170)
+            }
+        }
     }
 }
 

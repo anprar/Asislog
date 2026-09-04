@@ -195,8 +195,8 @@ impl AsisLogApp {
                     }
                     ui.separator();
                     if ui.button("Bersihkan riwayat").clicked() {
-                        self.recent.clear();
-                        self.save_config();
+                        // Via modal konfirmasi (tak langsung).
+                        self.confirm = Some(ConfirmAction::ClearRecent);
                         ui.close();
                     }
                     if let Some(p) = open {

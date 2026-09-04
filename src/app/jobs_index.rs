@@ -165,14 +165,19 @@ pub(crate) fn spawn_indexer(
 
 
 
-pub(crate) fn spawn_filter(    path: PathBuf,
+pub(crate) fn spawn_filter(
+    path: PathBuf,
     encoding: Encoding,
     _bom_len: usize,
     f: ParsedFilter,
     tx: mpsc::Sender<(Vec<u64>, bool)>,
+    // Tail refresh: mulai dari (byte, nomor baris 1-based) alih-alih 0.
+    // Penelepon menjamin byte adalah awal baris; semua nomor yang
+    // dihasilkan >= nomor awal sehingga penggabungan tetap terurut.
+    tail_from: Option<(u64, u64)>,
 ) {
     std::thread::spawn(move || {
-        use std::io::BufRead;
+        use std::io::{BufRead, Seek, SeekFrom};
         let file = match std::fs::File::open(&path) {
             Ok(x) => x,
             Err(_) => {
@@ -181,8 +186,14 @@ pub(crate) fn spawn_filter(    path: PathBuf,
             }
         };
         let mut reader = std::io::BufReader::with_capacity(1024 * 1024, file);
-        let mut map: Vec<u64> = Vec::new();
         let mut line_no: u64 = 1;
+        if let Some((sb, sl)) = tail_from {
+            // Gagal seek = pindai penuh (benar, lebih lambat).
+            if reader.seek(SeekFrom::Start(sb)).is_ok() {
+                line_no = sl.max(1);
+            }
+        }
+        let mut map: Vec<u64> = Vec::new();
         let mut buf: Vec<u8> = Vec::new();
         let cap = 5_000_000usize;
         let mut truncated = false;
@@ -355,4 +366,299 @@ pub(crate) fn time_hist_pass(path: &PathBuf) -> Option<TimeHist> {
     let mut h = build_time_hist(&samples, 1024)?;
     h.partial = samples.len() >= 200_000;
     Some(h)
+}
+
+/// Satu pekerjaan ekspor: snapshot input agar worker latar tak meminjam Doc.
+/// Cermin logika gabung-konteks `Doc::export_hits_to_file` /
+/// `export_ticket_to_file` (sengaja diduplikasi agar versi sinkron tetap
+/// sederhana; bila mengubah satu, ubah keduanya).
+pub(crate) struct ExportJob {
+    pub src: PathBuf,
+    pub out: PathBuf,
+    pub hits: Vec<Hit>,
+    pub context: usize,
+    pub query: String,
+    pub file_name: String,
+    pub checkpoints: Vec<(u64, u64)>,
+    pub total_lines: u64,
+    pub encoding: Encoding,
+    pub bom_len: usize,
+    pub ticket: bool,
+}
+
+/// Kemajuan ekspor untuk status bar.
+pub(crate) struct ExportMsg {
+    pub written: u64,
+    pub total_hits: usize,
+    pub out: PathBuf,
+    pub ticket: bool,
+    pub context: usize,
+    pub error: Option<String>,
+    pub done: bool,
+}
+
+fn export_decode(
+    data: &[u8],
+    cps: &[(u64, u64)],
+    line: u64,
+    encoding: Encoding,
+    bom: usize,
+) -> Option<String> {
+    let (s, e) = index::line_byte_range(data, cps, line, encoding, bom)?;
+    let mut b = &data[s as usize..e as usize];
+    if !b.is_empty() && b[b.len() - 1] == b'\r' && !encoding.is_wide() {
+        b = &b[..b.len() - 1];
+    }
+    let t = crate::engine::decode::decode_bytes(b, encoding);
+    Some(crate::engine::decode::strip_cr(t))
+}
+
+pub(crate) fn spawn_export(
+    job: ExportJob,
+    tx: mpsc::Sender<ExportMsg>,
+    cancel: Arc<AtomicBool>,
+) {
+    std::thread::spawn(move || {
+        use std::io::Write;
+        let progress = |written: u64, done: bool, error: Option<String>| {
+            let _ = tx.send(ExportMsg {
+                written,
+                total_hits: job.hits.len(),
+                out: job.out.clone(),
+                ticket: job.ticket,
+                context: job.context,
+                error,
+                done,
+            });
+        };
+        let data = match crate::engine::mmap::open_mmap(&job.src) {
+            Ok(m) => m,
+            Err(e) => {
+                progress(0, true, Some(format!("Gagal membuka sumber ekspor: {}", e)));
+                return;
+            }
+        };
+        let bytes: &[u8] = &data;
+        let mut f = match std::fs::File::create(&job.out) {
+            Ok(f) => f,
+            Err(e) => {
+                progress(0, true, Some(format!("Gagal membuat file ekspor: {}", e)));
+                return;
+            }
+        };
+        if job.ticket {
+            let _ = writeln!(f, "# Laporan AsisLog");
+            let _ = writeln!(f);
+            let _ = writeln!(f, "- File: `{}`", job.file_name);
+            let _ = writeln!(f, "- Query: `{}`", job.query.replace('`', "'"));
+            let _ = writeln!(f, "- Hasil: {}", crate::engine::format_count(job.hits.len() as u64));
+            let _ = writeln!(f, "- Konteks: +-{} baris", job.context);
+            let _ = writeln!(f);
+        }
+        let mut written: u64 = 0;
+        let mut next_skip_until: u64 = 0;
+        let mut since_progress: usize = 0;
+        for h in &job.hits {
+            if cancel.load(Ordering::Relaxed) {
+                progress(written, true, Some(String::from("Ekspor dibatalkan.")));
+                return;
+            }
+            let lo = h.line.saturating_sub(job.context as u64).max(1);
+            let hi = (h.line + job.context as u64).min(job.total_lines.max(h.line));
+            if job.ticket {
+                let anchor =
+                    export_decode(bytes, &job.checkpoints, h.line, job.encoding, job.bom_len)
+                        .unwrap_or_default();
+                if writeln!(
+                    f,
+                    "## Baris {} {{#{}}}",
+                    crate::engine::format_count(h.line),
+                    crate::engine::Doc::short_hash(&anchor)
+                )
+                .is_err()
+                {
+                    progress(written, true, Some(String::from("Gagal menulis ekspor.")));
+                    return;
+                }
+                let _ = writeln!(f, "```");
+            }
+            for ln in lo..=hi {
+                if ln <= next_skip_until {
+                    continue;
+                }
+                if let Some(t) = export_decode(bytes, &job.checkpoints, ln, job.encoding, job.bom_len)
+                {
+                    let ok = if job.ticket {
+                        if ln == h.line {
+                            writeln!(f, ">>> {}", t)
+                        } else {
+                            writeln!(f, "    {}", t)
+                        }
+                    } else {
+                        writeln!(f, "{}: {}", ln, t)
+                    };
+                    if ok.is_err() {
+                        progress(written, true, Some(String::from("Gagal menulis ekspor.")));
+                        return;
+                    }
+                    written += 1;
+                }
+            }
+            if job.ticket {
+                let _ = writeln!(f, "```");
+                let _ = writeln!(f);
+            }
+            next_skip_until = next_skip_until.max(hi);
+            since_progress += 1;
+            if since_progress >= 256 {
+                since_progress = 0;
+                progress(written, false, None);
+            }
+        }
+        progress(written, true, None);
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::search::Hit;
+
+    fn sample_doc(dir: &std::path::Path) -> (PathBuf, Vec<Hit>, Vec<(u64, u64)>, u64) {
+        let src = dir.join("e.log");
+        let mut data = Vec::new();
+        for i in 1..=200u64 {
+            let line = if i % 10 == 0 {
+                format!("2026-09-04 ERROR id={}\n", i)
+            } else {
+                format!("2026-09-04 INFO id={} pad\n", i)
+            };
+            data.extend_from_slice(line.as_bytes());
+        }
+        std::fs::write(&src, &data).unwrap();
+        let idx = index::build_full(&data, Encoding::Utf8, 0);
+        let hits: Vec<Hit> = (1..=200u64)
+            .filter(|i| i % 10 == 0)
+            .map(|i| {
+                let off = index::byte_offset_of_line(&data, &idx.checkpoints, i, Encoding::Utf8, 0)
+                    .unwrap();
+                let col = memchr::memmem::Finder::new(b"ERROR")
+                    .find(&data[off as usize..])
+                    .unwrap();
+                Hit { line: i, byte: off, col_start: col as u32, col_end: (col + 5) as u32 }
+            })
+            .collect();
+        (src, hits, idx.checkpoints.clone(), idx.total_lines)
+    }
+
+    fn run_export(job: ExportJob) -> (Vec<ExportMsg>, PathBuf) {
+        let out = job.out.clone();
+        let (tx, rx) = mpsc::channel();
+        spawn_export(job, tx, Arc::new(AtomicBool::new(false)));
+        let mut msgs = Vec::new();
+        for m in rx {
+            let done = m.done;
+            msgs.push(m);
+            if done {
+                break;
+            }
+        }
+        (msgs, out)
+    }
+
+    #[test]
+    fn export_worker_matches_sync_plain() {
+        let dir = tempfile::tempdir().unwrap();
+        let (src, hits, cps, total) = sample_doc(dir.path());
+        let out = dir.path().join("out.txt");
+        let job = ExportJob {
+            src: src.clone(),
+            out: out.clone(),
+            hits: hits.clone(),
+            context: 2,
+            query: String::new(),
+            file_name: String::from("e.log"),
+            checkpoints: cps,
+            total_lines: total,
+            encoding: Encoding::Utf8,
+            bom_len: 0,
+            ticket: false,
+        };
+        let (msgs, _) = run_export(job);
+        assert!(msgs.iter().any(|m| m.done && m.error.is_none()));
+        // Oracle sinkron: Doc::export_hits_to_file harus byte-identik.
+        let mut doc = Doc::open(src).unwrap();
+        doc.hits = hits;
+        // Lengkapi indeks agar export sinkron memakai jalur sama.
+        let data = std::fs::read(doc.path.clone()).unwrap();
+        doc.index = index::build_full(&data, Encoding::Utf8, 0);
+        let out2 = dir.path().join("out-sync.txt");
+        let n = doc.export_hits_to_file(&out2, 2).unwrap();
+        assert!(n > 0);
+        assert_eq!(
+            std::fs::read(&out).unwrap(),
+            std::fs::read(&out2).unwrap()
+        );
+    }
+
+    #[test]
+    fn export_worker_ticket_and_cancel() {
+        let dir = tempfile::tempdir().unwrap();
+        let (src, hits, cps, total) = sample_doc(dir.path());
+        // Tiket: samakan dengan sinkron.
+        let out = dir.path().join("t.md");
+        let job = ExportJob {
+            src: src.clone(),
+            out: out.clone(),
+            hits: hits.clone(),
+            context: 1,
+            query: String::from("ERROR"),
+            file_name: String::from("e.log"),
+            checkpoints: cps.clone(),
+            total_lines: total,
+            encoding: Encoding::Utf8,
+            bom_len: 0,
+            ticket: true,
+        };
+        let (msgs, _) = run_export(job);
+        assert!(msgs.iter().any(|m| m.done && m.error.is_none()));
+        let mut doc = Doc::open(src.clone()).unwrap();
+        doc.hits = hits.clone();
+        let data = std::fs::read(doc.path.clone()).unwrap();
+        doc.index = index::build_full(&data, Encoding::Utf8, 0);
+        let out2 = dir.path().join("t-sync.md");
+        doc.export_ticket_to_file(&out2, "ERROR", 1).unwrap();
+        assert_eq!(
+            std::fs::read(&out).unwrap(),
+            std::fs::read(&out2).unwrap()
+        );
+        // Cancel: worker berhenti dengan pesan galat-batal.
+        let out3 = dir.path().join("c.txt");
+        let cancel = Arc::new(AtomicBool::new(true)); // batal sejak awal
+        let job3 = ExportJob {
+            src,
+            out: out3,
+            hits,
+            context: 0,
+            query: String::new(),
+            file_name: String::from("e.log"),
+            checkpoints: cps,
+            total_lines: total,
+            encoding: Encoding::Utf8,
+            bom_len: 0,
+            ticket: false,
+        };
+        let (tx, rx) = mpsc::channel();
+        spawn_export(job3, tx, cancel);
+        let mut saw_cancel = false;
+        for m in rx {
+            if m.error.as_deref() == Some("Ekspor dibatalkan.") {
+                saw_cancel = true;
+            }
+            if m.done {
+                break;
+            }
+        }
+        assert!(saw_cancel);
+    }
 }

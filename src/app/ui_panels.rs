@@ -102,18 +102,16 @@ impl AsisLogApp {
                         self.rename_open = true;
                     }
                     if let Some(ln) = delete {
-                        let t = &mut self.tabs[cur_idx];
-                        t.doc.bookmarks.retain(|b| b.line != ln);
-                        t.marks_dirty = true;
-                        t.refresh_mode_map();
-                        t.doc.status = format!("Penanda baris {} dihapus.", ln);
+                        // Hapus via modal konfirmasi (tak langsung).
+                        self.confirm = Some(ConfirmAction::DeleteMark(ln));
                     }
                 });
         }
 
         // ---- status bawah: grup ringkas, gulir mendatar bila sempit ----
+        // Tinggi mengikuti zoom agar proporsional dengan teks.
         egui::TopBottomPanel::bottom("status")
-            .exact_height(26.0)
+            .exact_height((26.0 * self.zoom).round().clamp(22.0, 40.0))
             .show(ctx, |ui| {
                 let tab = &self.tabs[cur_idx];
                 egui::ScrollArea::horizontal()
@@ -136,9 +134,11 @@ impl AsisLogApp {
                             } else if tab.doc.follow {
                                 ui.label("LIVE dijeda - kembali ke akhir untuk melanjutkan");
                             } else if !tab.doc.index.complete {
+                                // floor (bukan round): 100% hanya tepat saat selesai.
+                                let pct = (tab.doc.index.progress * 100.0).floor() as u32;
                                 ui.label(format!(
                                     "Mengindeks {}% - {} baris terdeteksi",
-                                    (tab.doc.index.progress * 100.0).round() as u32,
+                                    pct.min(100),
                                     format_count(tab.doc.index.total_lines),
                                 ));
                             } else {
@@ -171,17 +171,24 @@ impl AsisLogApp {
                             });
                             ui.separator();
                             let total_rows = tab.total_view_rows();
-                            let pos = if total_rows > 0 {
-                                (tab.top_row as f64 / total_rows as f64 * 100.0).clamp(0.0, 100.0)
+                            // Jujur: 100% tepat saat viewport mencapai akhir;
+                            // "~" saat total masih estimasi (indeks berjalan).
+                            let at_end = total_rows > 0
+                                && tab.top_row + tab.last_visible.max(1) >= total_rows;
+                            let pos = if at_end {
+                                100.0
+                            } else if total_rows > 0 {
+                                tab.top_row as f64 / total_rows as f64 * 100.0
                             } else {
                                 0.0
                             };
                             ui.label(format!(
-                                "Pos: baris {} ({:.0}%)",
+                                "Pos: baris {} ({}{:.0}%)",
                                 format_count(
                                     tab.row_to_line(tab.top_row).unwrap_or(1)
                                 ),
-                                pos,
+                                if tab.doc.index.complete { "" } else { "~" },
+                                pos.clamp(0.0, 100.0),
                             ));
                             if !tab.doc.status.is_empty() {
                                 ui.separator();
@@ -192,13 +199,24 @@ impl AsisLogApp {
             });
 
         // ---- hasil pencarian: header ramping, collapsible ----
-        // Tertutup (header ±28px) saat belum ada query/hasil agar viewport log lega.
-        egui::TopBottomPanel::bottom("hasil")
-            .resizable(true)
-            .default_height(180.0)
-            .min_height(30.0)
-            .max_height(460.0)
-            .show(ctx, |ui| {
+        // Tertutup = tepat 28px (header saja) agar viewport log lega;
+        // terbuka = resizable 30..460 (bawaan 180).
+        let show_body = {
+            let t = &self.tabs[cur_idx];
+            !t.results_collapsed
+                && (!t.search_text.trim().is_empty()
+                    || !t.doc.hits.is_empty()
+                    || t.doc.search_in_progress
+                    || t.doc.search_error.is_some())
+        };
+        let mut panel = egui::TopBottomPanel::bottom("hasil").max_height(460.0);
+        if show_body {
+            panel = panel.resizable(true).default_height(180.0).min_height(30.0);
+        } else {
+            // Header saja; tinggi ikut zoom agar teks tak terpotong.
+            panel = panel.exact_height((28.0 * self.zoom).round().clamp(24.0, 44.0));
+        }
+        panel.show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     let n = self.tabs[cur_idx].doc.hits.len();
                     ui.strong(format!("Hasil ({})", format_count(n as u64)));
@@ -226,15 +244,7 @@ impl AsisLogApp {
                         }
                     });
                 });
-                // Isi hanya bila dibuka dan relevan (ada query / hasil / progres / galat).
-                let show_body = {
-                    let t = &self.tabs[cur_idx];
-                    !t.results_collapsed
-                        && (!t.search_text.trim().is_empty()
-                            || !t.doc.hits.is_empty()
-                            || t.doc.search_in_progress
-                            || t.doc.search_error.is_some())
-                };
+                // Isi hanya bila dibuka dan relevan (show_body dihitung di atas).
                 if !show_body {
                     return;
                 }

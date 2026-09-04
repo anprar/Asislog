@@ -122,19 +122,32 @@ impl AsisLogApp {
                 {
                     self.scratch_open = true;
                 }
-                // Toggle LIVE (mode) di kanan baris navigasi.
+                // Toggle LIVE: tiga status selaras dengan bilah status
+                // (LIVE aktif / LIVE dijeda / mati). Klik saat jeda = lanjut.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let live = tab.doc.follow;
+                    let stuck = tab.doc.follow && tab.doc.stick_bottom;
+                    let paused = tab.doc.follow && !tab.doc.stick_bottom;
+                    let (label, tip) = if stuck {
+                        ("LIVE", "Mengikuti ekor file (klik untuk berhenti)")
+                    } else if paused {
+                        (
+                            "LIVE jeda",
+                            "Terjeda karena menggulir ke atas (klik untuk kembali ke ekor)",
+                        )
+                    } else {
+                        ("Ikuti akhir file", "Pantau akhir file / tail (Ctrl+Shift+F)")
+                    };
                     if ui
-                        .add(egui::Button::selectable(
-                            live,
-                            if live { "LIVE" } else { "Ikuti akhir file" },
-                        ))
-                        .on_hover_text("Pantau akhir file / tail (Ctrl+Shift+F)")
+                        .add(egui::Button::selectable(stuck, label))
+                        .on_hover_text(tip)
                         .clicked()
                     {
-                        tab.doc.follow = !live;
-                        tab.doc.stick_bottom = tab.doc.follow;
+                        if paused {
+                            tab.doc.stick_bottom = true;
+                        } else {
+                            tab.doc.follow = !tab.doc.follow;
+                            tab.doc.stick_bottom = tab.doc.follow;
+                        }
                         tab.last_follow_poll = Instant::now();
                         sess_touch = true;
                     }

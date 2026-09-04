@@ -44,6 +44,9 @@ pub(crate) fn spawn_search(
     regex_on: bool,
     case_sensitive: bool,
     scope: Option<(u64, u64)>,
+    // Tail refresh: start scanning at (byte, 1-based line) instead of 0,
+    // so follow-append re-scans only new bytes. None = full scan.
+    seek_to: Option<(u64, u64)>,
 ) {
     std::thread::spawn(move || {
         use std::io::Read;
@@ -117,6 +120,14 @@ pub(crate) fn spawn_search(
         let mut carry: Vec<u8> = Vec::new(); // overlap tail
         let mut global_offset: u64 = 0;
         let mut line_no: u64 = 1;
+        if let Some((sb, sl)) = seek_to {
+            // Gagal seek = pindai penuh (benar, lebih lambat). Praktis tak terjadi.
+            use std::io::Seek;
+            if reader.seek(std::io::SeekFrom::Start(sb)).is_ok() {
+                global_offset = sb;
+                line_no = sl.max(1);
+            }
+        }
         let mut pending: Vec<Hit> = Vec::with_capacity(search::SEARCH_BATCH);
         let mut total_found: usize = 0;
         let mut truncated = false;
@@ -417,6 +428,8 @@ pub(crate) fn spawn_bool_search(
     bom_len: usize,
     case_sensitive: bool,
     scope_lines: Option<(u64, u64)>,
+    // Tail refresh: start at (byte, 1-based line). None = full scan.
+    seek_to: Option<(u64, u64)>,
 ) {
     std::thread::spawn(move || {
         use std::io::BufRead;
@@ -479,8 +492,17 @@ pub(crate) fn spawn_bool_search(
         let mut total_found: usize = 0;
         let mut truncated = false;
         let mut buf: Vec<u8> = Vec::new();
-        // Lewati BOM pada baris pertama.
+        // Lewati BOM pada baris pertama (kecuali seek melewatinya).
         let mut first = true;
+        if let Some((sb, sl)) = seek_to {
+            use std::io::Seek;
+            if reader.seek(std::io::SeekFrom::Start(sb)).is_ok() {
+                byte_off = sb;
+                scanned = sb;
+                line_no = sl.max(1);
+                first = sb == 0;
+            }
+        }
         loop {
             if job_stale(&gen_shared, gen, &cancel) {
                 return;
@@ -606,6 +628,7 @@ mod tests {
             regex_on,
             case_sensitive,
             scope,
+            None,
         );
         let mut out = Vec::new();
         for msg in rx {
@@ -782,6 +805,7 @@ mod tests {
             Encoding::Utf8,
             0,
             case_sensitive,
+            None,
             None,
         );
         let mut out = Vec::new();

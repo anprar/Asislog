@@ -47,6 +47,15 @@ impl ViewMode {
     pub fn semua() -> &'static [ViewMode] {
         &[ViewMode::All, ViewMode::Hits, ViewMode::Marks]
     }
+
+    /// Parse nama Indonesia kembali (untuk sesi/workspace); tak dikenal = Semua.
+    pub fn from_nama(s: &str) -> ViewMode {
+        match s {
+            "Hasil" => ViewMode::Hits,
+            "Penanda" => ViewMode::Marks,
+            _ => ViewMode::All,
+        }
+    }
 }
 
 // ---------- one tab ----------
@@ -72,6 +81,9 @@ pub(crate) struct TabState {
     pub(crate) hover_line: Option<u64>,
     /// File temp hasil ekstrak arsip (dihapus saat tab ditutup).
     pub(crate) temp_path: Option<PathBuf>,
+    /// Arsip asal bila tab diekstrak dari zip/tar/gz (untuk sesi/workspace;
+    /// doc.path menunjuk temp yang akan dihapus).
+    pub(crate) archive_src: Option<PathBuf>,
     /// Mode tampil viewport + peta barisnya.
     pub(crate) view_mode: ViewMode,
     pub(crate) mode_lines: Vec<u64>,
@@ -123,6 +135,16 @@ pub(crate) struct TabState {
     /// Isi baris lama tak berubah saat append, jadi cache hanya gugur saat
     /// rotasi/reopen atau ganti encoding (lihat bawah).
     pub(crate) disp_cache: HashMap<u64, String>,
+    /// True saat batch search yang masuk adalah gabungan ekor follow
+    /// (tanpa lompat ke hasil pertama / buka panel / tulis cache).
+    pub(crate) search_merge_quiet: bool,
+    /// True saat hasil filter yang masuk adalah tambahan ekor (extend,
+    /// bukan ganti; top_row dipertahankan).
+    pub(crate) filter_append: bool,
+    /// Hasil ekspor latar yang masuk (progres + selesai).
+    pub(crate) export_rx: Option<mpsc::Receiver<ExportMsg>>,
+    /// Batalkan ekspor latar yang berjalan (tombol Batal / rotasi).
+    pub(crate) export_cancel: Arc<AtomicBool>,
 }
 
 impl TabState {
@@ -155,6 +177,7 @@ impl TabState {
             selected_line: 1,
             hover_line: None,
             temp_path: None,
+            archive_src: None,
             view_mode: ViewMode::All,
             mode_lines: Vec::new(),
             scope: None,
@@ -190,6 +213,10 @@ impl TabState {
             last_follow_poll: Instant::now(),
             follow_fp: None,
             disp_cache: HashMap::new(),
+            search_merge_quiet: false,
+            filter_append: false,
+            export_rx: None,
+            export_cancel: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -360,6 +387,7 @@ impl TabState {
                     self.doc.bom_len,
                     self.case_sensitive,
                     self.scope,
+                    None,
                 ),
                 Err(e) => {
                     self.doc.search_error = Some(e);
@@ -380,6 +408,7 @@ impl TabState {
             self.regex_on,
             self.case_sensitive,
             scope_bytes,
+            None,
         );
     }
 
@@ -404,8 +433,184 @@ impl TabState {
             self.doc.bom_len,
             f,
             tx,
+            None,
         );
         self.top_row = 0;
+    }
+
+    /// Jangkar pindai ekor follow: (byte_mulai, nomor_baris_mulai).
+    /// old_bytes = ukuran sebelum append, old_lines = jumlah baris lama
+    /// (butuh indeks komplet). Byte mulai = awal baris yang mengandung
+    /// old_bytes (mundur ke \n sebelumnya, maks 64 KiB) agar match yang
+    /// melintasi titik append tetap ketemu; nomornya = baris itu.
+    /// None bila tak bisa dijangkar aman (indeks belum komplet / baris
+    /// pembuka > 64 KiB) — penelepon memakai fallback.
+    fn tail_anchor(&self, old_bytes: u64, old_lines: u64) -> Option<(u64, u64)> {
+        if !self.doc.index.complete || old_lines < 1 {
+            return None;
+        }
+        if old_bytes == 0 {
+            return Some((0, 1));
+        }
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = std::fs::File::open(&self.doc.path).ok()?;
+        // Apakah file lama diakhiri newline? Baca 1 byte di old_bytes-1.
+        let ends_nl = if old_bytes > 0 {
+            f.seek(SeekFrom::Start(old_bytes - 1)).is_ok()
+                && {
+                    let mut b = [0u8; 1];
+                    f.read_exact(&mut b).is_ok() && b[0] == b'\n'
+                }
+        } else {
+            true
+        };
+        if ends_nl {
+            return Some((old_bytes, old_lines + 1));
+        }
+        // Lanjutkan baris lama yang terpotong: mundur ke awal barisnya.
+        let back = old_bytes.min(64 * 1024);
+        let mut buf = vec![0u8; back as usize];
+        f.seek(SeekFrom::Start(old_bytes - back)).ok()?;
+        f.read_exact(&mut buf).ok()?;
+        // Baris pembuka raksasa (>64 KiB tanpa newline): serahkan ke fallback.
+        buf.iter()
+            .rposition(|&b| b == b'\n')
+            .map(|i| (old_bytes - back + i as u64 + 1, old_lines))
+    }
+
+    /// Pindai ulang HANYA ekor yang baru di-append (follow): seek worker ke
+    /// jangkar, gen SAMA sehingga batch bergabung ke hasil lama (tetap
+    /// terurut: nomor baris ekor selalu terbesar). Tanpa riwayat, tanpa
+    /// lompat, tanpa tulis cache. Hit pada baris jangkar yang terpotong
+    /// ditulis ulang (dihapus dulu) agar tak dobel.
+    pub(crate) fn refresh_search_tail(&mut self, old_bytes: u64, old_lines: u64) {
+        if self.search_text.trim().is_empty() || self.doc.search_in_progress {
+            return;
+        }
+        if self.doc.hits.len() >= search::MAX_STORED_HITS {
+            self.doc.search_truncated = true;
+            return;
+        }
+        let Some((sb, sl)) = self.tail_anchor(old_bytes, old_lines) else {
+            return;
+        };
+        // Tulis ulang baris jangkar (kasus ekor lanjutan tanpa \n).
+        self.doc.hits.retain(|h| h.line != sl);
+        self.current_hit = None;
+        let (tx, rx) = mpsc::channel();
+        self.search_rx = Some(rx);
+        self.search_merge_quiet = true;
+        self.doc.search_in_progress = true;
+        let gen = self.doc.search_gen; // gen sama: batch bergabung
+        let cancel = self.search_cancel.clone();
+        let params = SearchJobParams {
+            path: self.doc.path.clone(),
+            gen,
+            gen_shared: self.gen_shared.clone(),
+            tx,
+            cancel,
+        };
+        let q = self.search_text.clone();
+        let seek = Some((sb, sl));
+        // Catatan: cakupan (scope) pencarian pengguna diabaikan untuk ekor:
+        // append selalu di luar cakupan lama, dan hasil lama di luar
+        // cakupan tetap dipertahankan.
+        if !self.regex_on && crate::engine::query::is_boolean_query(&q) {
+            match crate::engine::query::parse_query(&q) {
+                Ok(ast) => spawn_bool_search(
+                    params,
+                    ast,
+                    self.doc.encoding(),
+                    self.doc.bom_len,
+                    self.case_sensitive,
+                    None,
+                    seek,
+                ),
+                Err(e) => {
+                    self.doc.search_error = Some(e);
+                    self.doc.search_in_progress = false;
+                    self.search_merge_quiet = false;
+                }
+            }
+            return;
+        }
+        spawn_search(
+            params,
+            q,
+            self.regex_on,
+            self.case_sensitive,
+            None,
+            seek,
+        );
+    }
+
+    /// Pindai ulang filter HANYA untuk ekor (gabung ke filter_map lama yang
+    /// tetap terurut). Prasyarat sama seperti search ekor.
+    pub(crate) fn refresh_filter_tail(&mut self, old_bytes: u64, old_lines: u64) {
+        if self.doc.filter.is_empty() || self.filter_rx.is_some() {
+            return;
+        }
+        let Some((sb, sl)) = self.tail_anchor(old_bytes, old_lines) else {
+            return;
+        };
+        self.doc.filter_map.retain(|&l| l != sl);
+        let (tx, rx) = mpsc::channel();
+        self.filter_rx = Some(rx);
+        self.filter_append = true;
+        self.doc.status = String::from("Filter: memindai baris baru…");
+        spawn_filter(
+            self.doc.path.clone(),
+            self.doc.encoding(),
+            self.doc.bom_len,
+            self.doc.filter.clone(),
+            tx,
+            Some((sb, sl)),
+        );
+    }
+
+    /// Mulai ekspor hasil ke thread latar (UI tak beku): snapshot input,
+    /// progres mengalir ke status bar, selesai menutup dialog. Menolak bila
+    /// ekspor lain masih berjalan di tab ini.
+    pub(crate) fn start_export(
+        &mut self,
+        out: PathBuf,
+        context: usize,
+        ticket: bool,
+        query: String,
+    ) {
+        if self.export_rx.is_some() {
+            self.doc.status =
+                String::from("Ekspor masih berjalan; tunggu selesai atau Batalkan.");
+            return;
+        }
+        if self.doc.hits.is_empty() {
+            self.doc.status = String::from("Tidak ada hasil untuk diekspor.");
+            return;
+        }
+        let total_lines = if self.doc.index.complete {
+            self.doc.index.total_lines
+        } else {
+            self.doc.line_count_estimate()
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.export_cancel = cancel.clone();
+        let job = ExportJob {
+            src: self.doc.path.clone(),
+            out,
+            hits: self.doc.hits.clone(),
+            context,
+            query,
+            file_name: self.doc.file_name.clone(),
+            checkpoints: self.doc.index.checkpoints.clone(),
+            total_lines,
+            encoding: self.doc.encoding(),
+            bom_len: self.doc.bom_len,
+            ticket,
+        };
+        let (tx, rx) = mpsc::channel();
+        self.export_rx = Some(rx);
+        spawn_export(job, tx, cancel);
+        self.doc.status = String::from("Mengekspor di latar…");
     }
 
     pub(crate) fn poll_channels(&mut self) {
@@ -464,7 +669,10 @@ impl TabState {
                     self.pending_key = None;
                 }
                 self.refresh_mode_map();
-                if self.doc.search_error.is_none() && !self.doc.hits.is_empty() {
+                // Gabungan ekor follow: diam-diam (tanpa lompat/panel/cache).
+                if self.search_merge_quiet {
+                    self.search_merge_quiet = false;
+                } else if self.doc.search_error.is_none() && !self.doc.hits.is_empty() {
                     self.current_hit = Some(0);
                     // Ada hasil: buka panel hasil otomatis.
                     self.results_collapsed = false;
@@ -478,14 +686,61 @@ impl TabState {
         // Filter result
         if let Some(rx) = &self.filter_rx {
             if let Ok((map, _trunc)) = rx.try_recv() {
-                self.doc.filter_map = map;
-                self.doc.filter_active = true;
-                self.top_row = 0;
-                self.doc.status = format!(
-                    "Filter aktif: {} baris cocok.",
-                    format_count(self.doc.filter_map.len() as u64)
-                );
+                if self.filter_append {
+                    // Gabungan ekor: filter_map lama tetap terurut, ekor
+                    // bernomor lebih besar -> extend + posisi dipertahankan.
+                    self.filter_append = false;
+                    let added = map.len();
+                    self.doc.filter_map.extend(map);
+                    self.doc.filter_active = true;
+                    self.doc.status = format!(
+                        "Filter: {} baris cocok (+{} baru).",
+                        format_count(self.doc.filter_map.len() as u64),
+                        format_count(added as u64),
+                    );
+                } else {
+                    self.doc.filter_map = map;
+                    self.doc.filter_active = true;
+                    self.top_row = 0;
+                    self.doc.status = format!(
+                        "Filter aktif: {} baris cocok.",
+                        format_count(self.doc.filter_map.len() as u64)
+                    );
+                }
                 self.filter_rx = None;
+            }
+        }
+        // Export latar: progres + selesai/gagal.
+        if let Some(rx) = &self.export_rx {
+            while let Ok(m) = rx.try_recv() {
+                if let Some(e) = m.error {
+                    self.doc.status = e;
+                    self.export_rx = None;
+                    break;
+                }
+                if m.done {
+                    self.doc.status = if m.ticket {
+                        format!(
+                            "Tiket ({} baris konteks) disimpan ke {}.",
+                            m.context,
+                            m.out.display()
+                        )
+                    } else {
+                        format!(
+                            "Diekspor {} baris ke {}.",
+                            format_count(m.written),
+                            m.out.display()
+                        )
+                    };
+                    self.export_open = false;
+                    self.export_rx = None;
+                    break;
+                }
+                self.doc.status = format!(
+                    "Mengekspor {} / {} hasil…",
+                    format_count(m.written),
+                    format_count(m.total_hits as u64),
+                );
             }
         }
         // Marker ERROR/WARN + histogram selesai.
@@ -682,13 +937,37 @@ impl TabState {
                         self.doc.mtime = cur.mtime;
                         self.follow_fp = cur.head.clone();
                         if self.doc.stick_bottom {
-                            self.top_row = self.total_view_rows().saturating_sub(60);
+                            let vis = self.last_visible.max(10);
+                            self.top_row = self.total_view_rows().saturating_sub(vis);
+                        }
+                        // Hasil/filter aktif ikut memanjang: pindai ulang
+                        // HANYA ekor (seek), gabung diam-diam. Dilewati bila
+                        // indeks belum komplet (nomor baris tak pasti) atau
+                        // pencarian/filter sedang berjalan.
+                        if self.doc.index.complete && old_lines > 0 {
+                            self.refresh_search_tail(old_bytes, old_lines);
+                            if self.doc.filter_active {
+                                self.refresh_filter_tail(old_bytes, old_lines);
+                            }
                         }
                     }
                     Err(e) => self.doc.status = e,
                 }
             }
             FollowEvent::TruncatedOrRotated => {
+                // Hasil/filter Hits mengacu byte lama: batalkan worker-nya
+                // DULU agar batch basi tak bergabung setelah buka ulang.
+                self.doc.search_gen += 1;
+                self.gen_shared.store(self.doc.search_gen, Ordering::Relaxed);
+                self.search_cancel.store(true, Ordering::Relaxed);
+                self.search_rx = None;
+                self.filter_rx = None;
+                self.search_merge_quiet = false;
+                self.filter_append = false;
+                self.pending_key = None;
+                // Ekspor latar membaca file lama: hentikan juga.
+                self.export_cancel.store(true, Ordering::Relaxed);
+                self.export_rx = None;
                 if let Err(e) = self.doc.reopen_after_rotate() {
                     self.doc.status = e;
                 } else {
@@ -696,6 +975,16 @@ impl TabState {
                     self.search_cache.clear();
                     // Isi baris berubah -> cache teks tampil ikut gugur.
                     self.disp_cache.clear();
+                    // Hasil & filter lama tak valid lagi di file baru.
+                    self.doc.hits.clear();
+                    self.current_hit = None;
+                    self.doc.search_in_progress = false;
+                    self.doc.search_error = None;
+                    self.doc.search_truncated = false;
+                    self.doc.filter_map.clear();
+                    self.doc.filter_active = false;
+                    self.refresh_mode_map();
+                    self.selected_line = 1;
                     // Sidik baru diadopsi; peta marker dibangun ulang.
                     self.follow_fp = load_identity(&self.doc.path)
                         .ok()
@@ -717,8 +1006,161 @@ impl TabState {
                     );
                     self.index_rx = Some(rx);
                     self.top_row = 0;
+                    // Beri tahu eksplisit: jangan lompat diam-diam.
+                    self.doc.status = String::from(
+                        "File dipotong/dirotasi: dibuka ulang dari awal; hasil & filter dikosongkan.",
+                    );
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_lines(n: u64, every: u64) -> Vec<u8> {
+        let mut v = Vec::new();
+        for i in 0..n {
+            if i.is_multiple_of(every) {
+                v.extend_from_slice(format!("2026-09-04 ERROR id={}\n", i).as_bytes());
+            } else {
+                v.extend_from_slice(format!("2026-09-04 INFO id={} pad\n", i).as_bytes());
+            }
+        }
+        v
+    }
+
+    fn wait_index(tab: &mut TabState) {
+        for _ in 0..500 {
+            tab.poll_channels();
+            if tab.doc.index.complete {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("indexer did not finish");
+    }
+
+    fn drain_search(tab: &mut TabState) {
+        for _ in 0..500 {
+            tab.poll_channels();
+            if !tab.doc.search_in_progress && tab.search_rx.is_none() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("search did not finish");
+    }
+
+    fn drain_filter(tab: &mut TabState) {
+        for _ in 0..500 {
+            tab.poll_channels();
+            if tab.filter_rx.is_none() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("filter did not finish");
+    }
+
+    fn open_tab(path: &std::path::Path) -> TabState {
+        let doc = Doc::open(path.to_path_buf()).unwrap();
+        let mut tab = TabState::new(doc);
+        tab.doc.follow = true;
+        wait_index(&mut tab);
+        tab
+    }
+
+    #[test]
+    fn follow_append_merges_search_hits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.log");
+        std::fs::write(&path, test_lines(3000, 100)).unwrap();
+        let mut tab = open_tab(&path);
+        tab.search_text = String::from("ERROR");
+        tab.case_sensitive = true;
+        tab.start_search(&mut Vec::new());
+        drain_search(&mut tab);
+        assert_eq!(tab.doc.hits.len(), 30);
+
+        // Append 500 lines (5 new ERRORs); throttle follow 400 ms.
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(&test_lines(500, 100)).unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(450));
+        tab.poll_follow();
+        drain_search(&mut tab);
+        // 30 old + 5 new, ascending, no duplicates.
+        assert_eq!(tab.doc.hits.len(), 35);
+        let lines: Vec<u64> = tab.doc.hits.iter().map(|h| h.line).collect();
+        let mut sorted = lines.clone();
+        sorted.sort_unstable();
+        assert_eq!(lines, sorted);
+        assert_eq!(lines[30], 3001);
+        assert!(!tab.doc.status.contains("dirotasi"));
+    }
+
+    #[test]
+    fn follow_append_merges_filter_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("g.log");
+        std::fs::write(&path, test_lines(3000, 100)).unwrap();
+        let mut tab = open_tab(&path);
+        tab.case_sensitive = true;
+        tab.filter_text = String::from("ERROR");
+        tab.start_filter(String::from("ERROR"));
+        drain_filter(&mut tab);
+        assert_eq!(tab.doc.filter_map.len(), 30);
+
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(&test_lines(500, 100)).unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(450));
+        tab.poll_follow();
+        drain_filter(&mut tab);
+        assert_eq!(tab.doc.filter_map.len(), 35);
+        assert!(tab.doc.filter_active);
+        let mut sorted = tab.doc.filter_map.clone();
+        sorted.sort_unstable();
+        assert_eq!(tab.doc.filter_map, sorted);
+    }
+
+    #[test]
+    fn follow_rotation_clears_and_notifies() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("h.log");
+        std::fs::write(&path, test_lines(3000, 100)).unwrap();
+        let mut tab = open_tab(&path);
+        tab.search_text = String::from("ERROR");
+        tab.case_sensitive = true;
+        tab.start_search(&mut Vec::new());
+        drain_search(&mut tab);
+        assert_eq!(tab.doc.hits.len(), 30);
+        tab.filter_text = String::from("ERROR");
+        tab.start_filter(String::from("ERROR"));
+        drain_filter(&mut tab);
+        assert!(tab.doc.filter_active);
+
+        // Truncate = rotation. Di Windows file yang di-mmap tak bisa
+        // di-truncate langsung (OS menolak); rotasi nyata = rename + baru.
+        let rotated = path.with_extension("log.1");
+        std::fs::rename(&path, &rotated).unwrap();
+        std::fs::write(&path, test_lines(100, 10)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(450));
+        tab.poll_follow();
+        assert!(tab.doc.hits.is_empty());
+        assert!(!tab.doc.filter_active);
+        assert!(tab.doc.filter_map.is_empty());
+        assert!(
+            tab.doc.status.contains("dirotasi"),
+            "status: {}",
+            tab.doc.status
+        );
     }
 }

@@ -110,6 +110,9 @@ pub struct WorkspaceFile {
     pub top_line: u64,
     #[serde(default)]
     pub selected_line: u64,
+    /// Viewport mode name ("Semua"/"Hasil"/"Penanda"), None = Semua.
+    #[serde(default)]
+    pub view_mode: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -232,6 +235,16 @@ pub struct SessionTab {
     /// Search scope lines (lo, hi).
     #[serde(default)]
     pub scope: Option<(u64, u64)>,
+    /// Viewport mode name ("Semua"/"Hasil"/"Penanda"), None = Semua.
+    #[serde(default)]
+    pub view_mode: Option<String>,
+    /// Applied time range (start, end) — wins over filter_text like workspace.
+    #[serde(default)]
+    pub range: Option<(String, String)>,
+    /// Original archive path when the tab was extracted from zip/tar/gz
+    /// (the saved `path` would point at a deleted temp file otherwise).
+    #[serde(default)]
+    pub archive: Option<String>,
 }
 
 /// Full workspace session (tabs + theme + active tab).
@@ -464,6 +477,9 @@ mod tests {
             follow: true,
             encoding: Some("utf8".into()),
             scope: None,
+            view_mode: Some("Hasil".into()),
+            range: None,
+            archive: Some("c:/a.zip".into()),
             }],
             current: 0,
             tema: Some("dark".into()),
@@ -501,6 +517,7 @@ mod tests {
             path: "logs/a.log".to_string(),
             top_line: 100,
             selected_line: 120,
+            view_mode: Some("Hasil".into()),
         });
         ws.filter = "ERROR -DEBUG".to_string();
         ws.range = Some(("2026-08-24 13:00:00".to_string(), "2026-08-24 14:00:00".to_string()));
@@ -519,5 +536,23 @@ mod tests {
         let text = serde_json::to_string(&ws).unwrap();
         let back: Workspace = serde_json::from_str(&text).unwrap();
         assert_eq!(back, ws);
+    }
+
+    #[test]
+    fn old_session_and_workspace_still_load() {
+        // JSON era sebelum view_mode/range/archive: default terisi.
+        let old = r#"{"tabs": [{"path": "c:/a.log", "top_line": 1,
+            "selected_line": 1, "search_text": "", "regex_on": false,
+            "case_sensitive": false, "filter_text": "", "follow": false}],
+            "current": 0}"#;
+        let s: Session = serde_json::from_str(old).unwrap();
+        assert_eq!(s.tabs.len(), 1);
+        assert!(s.tabs[0].view_mode.is_none());
+        assert!(s.tabs[0].range.is_none());
+        assert!(s.tabs[0].archive.is_none());
+        let old_ws = r#"{"version": 1, "name": "x",
+            "files": [{"path": "a.log", "top_line": 5, "selected_line": 6}]}"#;
+        let ws: Workspace = serde_json::from_str(old_ws).unwrap();
+        assert!(ws.files[0].view_mode.is_none());
     }
 }

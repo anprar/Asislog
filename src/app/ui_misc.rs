@@ -309,6 +309,50 @@ impl AsisLogApp {
                 });
         }
 
+        // Modal konfirmasi hapus (di atas segalanya kecuali galat).
+        if let Some(action) = self.confirm.clone() {
+            let mut done = false;
+            let mut confirmed = false;
+            egui::Window::new(action.title())
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(action.message());
+                    ui.horizontal(|ui| {
+                        if ui.button("Ya, hapus").clicked() {
+                            confirmed = true;
+                            done = true;
+                        }
+                        if ui.button("Batal").clicked() {
+                            done = true;
+                        }
+                    });
+                });
+            if done {
+                self.confirm = None;
+            }
+            if confirmed {
+                match action {
+                    ConfirmAction::DeleteMark(ln) => {
+                        if let Some(t) = self.tabs.get_mut(cur_idx) {
+                            t.doc.bookmarks.retain(|b| b.line != ln);
+                            t.marks_dirty = true;
+                            t.refresh_mode_map();
+                            t.doc.status =
+                                format!("Penanda baris {} dihapus.", ln);
+                        }
+                    }
+                    ConfirmAction::ClearRecent => {
+                        self.recent.clear();
+                        self.save_config();
+                        self.global_status =
+                            String::from("Riwayat file dikosongkan.");
+                    }
+                }
+            }
+        }
+
         // Global error modal
         if self.global_error.is_some() {
             egui::Window::new("Galat")

@@ -268,6 +268,9 @@ impl CompiledRule {
 /// Render one log line with token highlights (visible rows only).
 /// Single visual line, no wrap: long lines extend for the horizontal scrollbar.
 /// `rules` are user highlight rules (whole-line rules win first).
+/// When `selected`, base text follows the active theme selection color so
+/// every theme (incl. Kontras Tinggi: black on yellow) stays readable;
+/// accent spans keep their kind colors.
 /// Returns the combined click/hover response of all segments.
 pub fn render_log_line(
     ui: &mut egui::Ui,
@@ -275,8 +278,13 @@ pub fn render_log_line(
     kind: LineKind,
     dark: bool,
     rules: &[CompiledRule],
+    selected: bool,
 ) -> egui::Response {
-    let base = color_for_theme(kind, dark);
+    let base = if selected {
+        ui.visuals().selection.stroke.color
+    } else {
+        color_for_theme(kind, dark)
+    };
     if text.is_empty() {
         return ui.label(" ");
     }
@@ -284,7 +292,11 @@ pub fn render_log_line(
         return ui.label(
             egui::RichText::new(text.to_owned())
                 .monospace()
-                .color(dim_color(dark)),
+                .color(if selected {
+                    ui.visuals().selection.stroke.color
+                } else {
+                    dim_color(dark)
+                }),
         );
     }
     let ts = ts_prefix_len(text);
