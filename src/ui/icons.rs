@@ -79,6 +79,71 @@ pub fn icon_button(ui: &mut egui::Ui, icon: Icon, tooltip: &str) -> egui::Respon
     resp
 }
 
+/// App logo (assets/asislog-32.png, baked into the binary).
+/// `None` when the bytes fail to decode: callers must paint
+/// `paint_logo_fallback` instead (vector A, still no fonts/symbols).
+pub const LOGO_PNG: &[u8] = include_bytes!("../../assets/asislog-32.png");
+
+/// Decoded logo image for the header, or None (use the vector fallback).
+pub fn logo_image() -> Option<egui::Image<'static>> {
+    if image::load_from_memory(LOGO_PNG).is_ok() {
+        Some(egui::Image::from_bytes(
+            "bytes://asislog-logo-32.png",
+            LOGO_PNG,
+        ))
+    } else {
+        None
+    }
+}
+
+/// Segmen garis 2D: pasangan titik [x, y] relatif terhadap pusat logo.
+pub type LogoSegments = Vec<[[f32; 2]; 2]>;
+
+/// Logo geometry in a `size`×`size` box, fractions of size:
+/// (leg segments, teal bar segments). Pure: unit-tested.
+pub fn logo_shapes(size: f32) -> (LogoSegments, LogoSegments) {
+    let p = |x: f32, y: f32| [x * size, y * size];
+    // Bold A legs (mirror the SVG master proportions).
+    let legs = vec![
+        [p(0.297, 0.805), p(0.484, 0.227)],
+        [p(0.703, 0.805), p(0.516, 0.227)],
+    ];
+    // Teal crossbar + two tapering flow lines.
+    let bars = vec![
+        [p(0.336, 0.453), p(0.664, 0.453)],
+        [p(0.172, 0.555), p(0.828, 0.555)],
+        [p(0.234, 0.672), p(0.766, 0.672)],
+    ];
+    (legs, bars)
+}
+
+/// Vector fallback logo: dark rounded tile + white A + teal bars.
+/// Used only when the baked PNG cannot be decoded.
+pub fn paint_logo_fallback(ui: &mut egui::Ui, size: f32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(
+        rect,
+        size * 0.227, // rx 58/256 like the master
+        egui::Color32::from_rgb(0x0D, 0x16, 0x22),
+    );
+    let origin = rect.min;
+    let at = |p: [f32; 2]| egui::pos2(origin.x + p[0], origin.y + p[1]);
+    let (legs, bars) = logo_shapes(size);
+    for [a, b] in legs {
+        painter.line_segment(
+            [at(a), at(b)],
+            egui::Stroke::new((size * 0.121).max(2.0), egui::Color32::from_rgb(0xF4, 0xF7, 0xFA)),
+        );
+    }
+    for [a, b] in bars {
+        painter.line_segment(
+            [at(a), at(b)],
+            egui::Stroke::new((size * 0.062).max(1.5), egui::Color32::from_rgb(0x2F, 0xD4, 0xB4)),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,6 +165,26 @@ mod tests {
                 for v in [x1, y1, x2, y2] {
                     assert!(v.abs() <= 5.0 + f32::EPSILON);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn logo_png_decodes_32px() {
+        let img = image::load_from_memory(LOGO_PNG).expect("baked logo must decode");
+        assert_eq!((img.width(), img.height()), (32, 32));
+        assert!(logo_image().is_some());
+    }
+
+    #[test]
+    fn logo_fallback_geometry_in_bounds() {
+        let (legs, bars) = logo_shapes(32.0);
+        assert_eq!(legs.len(), 2);
+        assert_eq!(bars.len(), 3);
+        for [a, b] in legs.into_iter().chain(bars) {
+            for [x, y] in [a, b] {
+                assert!((0.0..=32.0).contains(&x), "x={}", x);
+                assert!((0.0..=32.0).contains(&y), "y={}", y);
             }
         }
     }

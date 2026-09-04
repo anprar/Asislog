@@ -22,6 +22,7 @@ use crate::ui::{
     theme::Tema,
     viewer::{self, CompiledRule},
 };
+use crate::ui::icons as logo_icons;
 use super::*;
 
 impl AsisLogApp {
@@ -110,6 +111,14 @@ impl AsisLogApp {
         // ---- bar bilah atas: sesi file ----
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
+                // Logo + nama di kiri (PNG baked; fallback vektor anti-tofu).
+                if let Some(img) = logo_icons::logo_image() {
+                    ui.add(img.fit_to_exact_size(egui::vec2(26.0, 26.0)));
+                } else {
+                    logo_icons::paint_logo_fallback(ui, 26.0);
+                }
+                ui.strong("AsisLog");
+                ui.separator();
                 if ui.button("Buka").clicked() {
                     self.open_dialog();
                 }

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- AsisLog master logo, 256px grid.
+     Bold letter A (log viewer) + 3 tapering teal flow lines (log streams).
+     Flat shapes only (no fonts): legible down to 16px. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- dark base -->
+  <rect x="8" y="8" width="240" height="240" rx="58" fill="#0D1622"/>
+  <!-- log flow lines behind the A: tapering length + opacity -->
+  <g stroke="#2FD4B4" stroke-width="15" stroke-linecap="round" fill="none">
+    <line x1="44" y1="142" x2="212" y2="142" opacity="1"/>
+    <line x1="60" y1="172" x2="196" y2="172" opacity="0.62"/>
+    <line x1="76" y1="202" x2="180" y2="202" opacity="0.35"/>
+  </g>
+  <!-- bold A legs -->
+  <g stroke="#F4F7FA" stroke-width="31" stroke-linecap="round" fill="none">
+    <line x1="76" y1="206" x2="124" y2="58"/>
+    <line x1="180" y1="206" x2="132" y2="58"/>
+  </g>
+  <!-- teal crossbar (above the flow lines) -->
+  <line x1="86" y1="116" x2="170" y2="116" stroke="#2FD4B4" stroke-width="18" stroke-linecap="round"/>
+</svg>

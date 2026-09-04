@@ -74,12 +74,16 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         shell: bash
         run: zip -j "${{ matrix.zip }}" "${{ matrix.out }}"
+      - name: Write SHA-256 (Defender/AV verification)
+        shell: bash
+        run: sha256sum "${{ matrix.out }}" "${{ matrix.zip }}" > SHA256SUMS.txt
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.out }}
           path: |
             ${{ matrix.out }}
             ${{ matrix.zip }}
+            SHA256SUMS.txt
           if-no-files-found: error
 
   # Attach binaries to the GitHub Release when triggered by a v* tag.

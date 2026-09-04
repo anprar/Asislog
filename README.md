@@ -34,9 +34,11 @@ Pengguna tidak perlu menginstal Rust untuk **menjalankan** biner.
 ## Rilis portable (maintainer)
 
 Biner rilis tanpa jendela console, sudah dioptimasi ukuran (`opt-level=z`,
-LTO, strip ≈ 7 MB), lalu dikompresi UPX `--lzma` (≈ 2,5 MB) dan di-ZIP.
+LTO, strip ≈ 7 MB), berikon + metadata versi (via `build.rs` +
+`assets/asislog.ico`), lalu dikompresi UPX `--lzma` (≈ 2,5 MB) dan di-ZIP.
 CI (`release.yml`, picu tag `v*`) mengerjakan semuanya otomatis: tes →
-build Windows+Linux → smoke test `--version` → UPX → ZIP → GitHub Release.
+build Windows+Linux → smoke test `--version` → UPX → ZIP → SHA-256 →
+GitHub Release.
 
 Lokal (Windows):
 
@@ -46,6 +48,18 @@ cargo build --release
 winget install -e --id UPX.UPX          # sekali saja
 upx --lzma --best .\target\release\asislog.exe
 Compress-Archive .\target\release\asislog.exe asislog-windows.zip -Force
+```
+
+Verifikasi keaslian unduhan (penting bila antivirus bertanya):
+
+```powershell
+# Windows: cocokkan dengan SHA256SUMS.txt di halaman Rilis
+CertUtil -hashfile asislog-windows.exe SHA256
+```
+
+```sh
+# Linux
+sha256sum -c SHA256SUMS.txt
 ```
 
 CLI: `asislog [FILE]...` membuka file langsung sebagai tab;
