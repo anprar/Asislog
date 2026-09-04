@@ -316,11 +316,20 @@ impl AsisLogApp {
                             let Some(h) = self.tabs[cur_idx].doc.hits.get(i).cloned() else {
                                 continue;
                             };
-                            // Ambil teks baris via Doc (pinjam mut singkat per baris).
-                            let text = self.tabs[cur_idx]
+                            // Kepala 16 KiB (baris raksasa tak dirender penuh).
+                            let (text, total_b, trunc) = self.tabs[cur_idx]
                                 .doc
-                                .get_line_text(h.line)
+                                .get_line_head(h.line, crate::engine::HEAD_BYTES)
                                 .unwrap_or_default();
+                            let mut text = text;
+                            if trunc {
+                                text.push_str(&format!(
+                                    " …(+{} B)",
+                                    crate::engine::format_count(
+                                        total_b.saturating_sub(text.len() as u64)
+                                    )
+                                ));
+                            }
                             let disp = self.tabs[cur_idx].display_cached(h.line, &text);
                             let sel = self.tabs[cur_idx].current_hit == Some(i);
                             let label = result_row(i, h.line, &disp);

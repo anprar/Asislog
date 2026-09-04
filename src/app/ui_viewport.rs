@@ -95,17 +95,28 @@ impl AsisLogApp {
             tab.top_row = tab.top_row.min(total_rows.saturating_sub(1));
             let dark = self.tema_state.1;
 
-            // Ambil baris viewport (decode hanya yang terlihat).
+            // Ambil baris viewport (decode kepala 16 KiB saja; baris
+            // 100 MB tak pernah dirender penuh — anti-freeze C-C6).
             let start_row = tab.top_row;
             let mut rows: Vec<(u64, u64, String)> = Vec::new();
             for r in start_row..(start_row + visible).min(total_rows) {
                 let Some(ln) = tab.row_to_line(r) else { continue };
                 // `None` = baris belum terpetakan (indeks berjalan): tampilkan
                 // placeholder agar area tak tampak kosong misterius.
-                let txt = tab
-                    .doc
-                    .get_line_text(ln)
-                    .unwrap_or_else(|| String::from("…"));
+                let txt = match tab.doc.get_line_head(ln, crate::engine::HEAD_BYTES) {
+                    Some((mut head, total_b, true)) => {
+                        // Sisa = byte sumber − byte tampil (tepat untuk ASCII).
+                        head.push_str(&format!(
+                            " …(+{} B)",
+                            crate::engine::format_count(
+                                total_b.saturating_sub(head.len() as u64)
+                            )
+                        ));
+                        head
+                    }
+                    Some((head, _, false)) => head,
+                    None => String::from("…"),
+                };
                 rows.push((r, ln, txt));
             }
             let cur_hit_line = tab

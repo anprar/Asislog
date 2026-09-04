@@ -29,6 +29,14 @@ pub use search::Hit;
 pub const COPY_CAP_BYTES: usize = 16 * 1024 * 1024;
 /// Decoded-line LRU capacity.
 pub const CACHE_CAP: usize = 2000;
+/// Display decode budget per line (viewport/results/labels). Giant
+/// single-line blobs (100 MB minified INSERT) decode only this much;
+/// copy/export still read the full line.
+/// LRU entries above this size are skipped (see DecodedCache::put).
+pub const HEAD_BYTES: usize = 16 * 1024;
+/// Raw lines above this size never enter the LRU (would evict everything
+/// useful and hoard heap); they re-decode on demand.
+pub const CACHE_ENTRY_MAX: usize = 256 * 1024;
 
 /// One viewport row.
 #[derive(Clone, Debug)]
@@ -125,6 +133,12 @@ impl DecodedCache {
     }
     fn put(&mut self, line: u64, text: String) {
         if self.map.contains_key(&line) {
+            return;
+        }
+        // Giant lines bypass the cache (a 100 MB entry would evict everything
+        // useful and hoard heap); they re-decode on demand, display paths use
+        // bounded get_line_head anyway.
+        if text.len() > CACHE_ENTRY_MAX {
             return;
         }
         if self.map.len() >= self.cap {
@@ -357,6 +371,31 @@ impl Doc {
         t = decode::strip_cr(t);
         self.cache.put(line_no, t.clone());
         Some(t)
+    }
+
+    /// Decode only the first `max_bytes` of a line for DISPLAY (viewport,
+    /// results, labels). Returns (head_text, total_line_bytes, truncated).
+    /// Bounded work for 100 MB lines; copy/export keep get_line_text
+    /// (full). Bypasses the LRU (partials must not evict full entries).
+    pub fn get_line_head(&self, line_no: u64, max_bytes: usize) -> Option<(String, u64, bool)> {
+        let (s, e) = self.line_byte_range(line_no)?;
+        let total = e.saturating_sub(s);
+        let take = (total as usize).min(max_bytes).min(e as usize - s as usize);
+        let bytes = self.data().get(s as usize..s as usize + take)?;
+        let truncated = (total as usize) > max_bytes;
+        // Strip \r only at a true line end, never mid-line cut.
+        let end = if !truncated
+            && !bytes.is_empty()
+            && bytes[bytes.len() - 1] == b'\r'
+            && !self.encoding().is_wide()
+        {
+            &bytes[..bytes.len() - 1]
+        } else {
+            bytes
+        };
+        let mut t = decode::decode_bytes(end, self.encoding());
+        t = decode::strip_cr(t);
+        Some((t, total, truncated))
     }
 
     /// Viewport API: decode only `count` lines from `start` (1-based line).
@@ -774,8 +813,13 @@ impl Doc {
             self.status = format!("Penanda baris {} dihapus.", line);
         } else {
             let byte = self.line_byte_range(line).map(|(b, _)| b).unwrap_or(0);
-            let preview = self.get_line_text(line).unwrap_or_default();
-            let label: String = preview.chars().take(60).collect();
+            // Label cukup 60 karakter pertama: decode kepala saja (baris
+            // raksasa tak perlu di-decode penuh untuk label).
+            let head = self
+                .get_line_head(line, 256)
+                .map(|(t, _, _)| t)
+                .unwrap_or_default();
+            let label: String = head.chars().take(60).collect();
             self.bookmarks.push(Bookmark {
                 line,
                 byte,
@@ -1083,6 +1127,33 @@ mod tests {
         assert_eq!(v.len(), 2);
         assert_eq!(v[0].line_no, 2);
         assert_eq!(v[0].text, "b");
+    }
+
+    #[test]
+    fn giant_line_head_bounded_copy_full() {
+        // 1 baris 10 MB di antara baris normal (kasus INSERT minified).
+        let mut text = String::from("first\n");
+        text.push_str(&"X".repeat(10 * 1024 * 1024));
+        text.push_str("\nlast\n");
+        let mut d = make_doc_with_text(&text);
+        let full = index::build_full(d.data(), d.encoding(), d.bom_len);
+        d.apply_index(full);
+        assert_eq!(d.index.total_lines, 3);
+        // Display: kepala terbatas + flag + total tepat.
+        let (head, total, trunc) = d.get_line_head(2, HEAD_BYTES).unwrap();
+        assert!(trunc);
+        assert_eq!(total, 10 * 1024 * 1024);
+        assert!(head.len() <= HEAD_BYTES + 4, "head bytes={}", head.len());
+        // Baris normal tak terpotong.
+        let (h1, _, t1) = d.get_line_head(1, HEAD_BYTES).unwrap();
+        assert!(!t1);
+        assert_eq!(h1, "first");
+        // Salin/ekspor tetap penuh (klon tampilan tak memotong data).
+        let all = d.get_line_text(2).unwrap();
+        assert_eq!(all.len(), 10 * 1024 * 1024);
+        // Label penanda dari kepala: 60 karakter pertama, tanpa decode sia-sia.
+        d.toggle_bookmark(2);
+        assert_eq!(d.bookmarks[0].label.len(), 60);
     }
 
     #[test]
