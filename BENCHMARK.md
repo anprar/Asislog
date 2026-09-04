@@ -190,6 +190,14 @@ scan-dominated di 250rb hit; win membesar dengan kepadatan hit.
 **Arbiter sesungguhnya: ulangi `DELETE FROM` di `coba.txt`** (dulu
 42,45 dtk penuh) — ekspektasi satu digit.
 
+### Boolean conjunction-aware (2026-09-04 sore)
+
+Prefilter boolean memilih literal required terpanjang (bukan union):
+bench 1 GB (`bench_1gb_bool`, 2x lari) — `ERROR INFO` (0 hasil,
+dulu decode penuh) **5,63 → 2,10/2,23 dtk (2,6x)**;
+`OutOfMemoryError` (927 hasil, sudah prefilter-cepat) stabil ±2,2 dtk.
+Lantai waktu = pindai baris 1 GB, bukan decode.
+
 ## 7. Hasil uji ulang 12 GB pasca-P0 (2026-09-04 malam)
 
 Harness v2 (sementara, sudah dihapus): API pure streaming langsung di
@@ -231,3 +239,28 @@ pertama <0,5 dtk via streaming; heap <50 MB di 12 GB / 338 jt baris."**
 Tanpa embel-embel satu digit untuk full-scan dingin — itu janji yang
 tidak bisa ditepati siapa pun di SSD ini (bahkan `findstr` 20 dtk
 untuk pola yang sama tanpa nomor baris).
+
+## 8. Working set GUI asli 12 GB (2026-09-04 sore)
+
+Tanpa kode baru: `asislog.exe D:\teslog\coba.txt` (argumen CLI Batch 1),
+sampling Private + WS tiap 2 dtk selama 5 menit. Sidecar belum ada
+sehingga indeks dingin penuh berjalan di run ini (terbukti:
+`coba.txt.asisidx` 7,0 MB tertulis 15:37).
+
+| Metrik | Angka |
+|---|---|
+| Private Bytes puncak (buka + indeks + menetap) | **104,2 MB** |
+| Private menetap | ±69 MB |
+| Working set puncak | **111 MB** |
+
+WS 9,7 GB di §5 dipastikan artefak harness mmap-touching. Aplikasi
+(workers `BufReader` streaming + mmap hanya baris terlihat) resmi
+**<120 MB total di file 12 GB**. Gap "ramah mesin kecil" tertutup.
+
+### Sidecar 12 GB: buka kedua instan (2026-09-04 sore)
+
+- Ukuran: **6.979.587 byte** (335.298 checkpoint, teks biasa).
+- `load_sidecar`: **0,055 dtk** (vs rebuild 26 dtk → 470x).
+- `save_sidecar`: **0,023 dtk**.
+- GUI open kedua (`coba.txt`, sidecar ada): memori datar ~72 MB dari
+  detik ke-12, tanpa fase indeks 26 dtk. Klaim "buka kedua instan" SAH.

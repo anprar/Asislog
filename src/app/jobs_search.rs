@@ -485,6 +485,26 @@ pub(crate) fn spawn_bool_search(
             } else {
                 None
             };
+        // Conjunction-aware fast path: every full match must contain each
+        // required term, so ONE Finder on the longest (= most selective)
+        // beats the union automaton and subsumes it (its passers are a
+        // subset of union passers). Sound for any shape, no safety gate.
+        let required_pat: Option<Vec<u8>> = ast
+            .required_terms()
+            .into_iter()
+            .max_by_key(|t| t.len())
+            .map(|t| {
+                if case_sensitive {
+                    t.as_bytes().to_vec()
+                } else {
+                    t.as_bytes().to_ascii_lowercase()
+                }
+            })
+            .filter(|p| !p.is_empty());
+        let required_finder: Option<memchr::memmem::Finder> =
+            required_pat.as_ref().map(|p| memchr::memmem::Finder::new(p));
+        // Scratch fold buffer (reused per line, no realloc churn).
+        let mut fold_buf: Vec<u8> = Vec::new();
         let mut line_no: u64 = 1;
         let mut byte_off: u64 = 0;
         let mut scanned: u64 = 0;
@@ -548,8 +568,23 @@ pub(crate) fn spawn_bool_search(
                     continue;
                 }
             }
-            // Byte prefilter: lines without any positive term cannot match.
-            if let Some(ac) = prefilter.as_ref() {
+            // Prefilter hierarki: required-term tunggal (paling selektif,
+            // subsumes union) dulu, lalu union AC, lalu jalur eksak.
+            if required_finder.is_some() {
+                let hit = if case_sensitive {
+                    required_finder.as_ref().unwrap().find(bytes).is_some()
+                } else {
+                    fold_buf.clear();
+                    fold_buf.extend_from_slice(bytes);
+                    fold_buf.make_ascii_lowercase();
+                    required_finder.as_ref().unwrap().find(&fold_buf).is_some()
+                };
+                if !hit {
+                    line_no += 1;
+                    continue;
+                }
+            } else if let Some(ac) = prefilter.as_ref() {
+                // Byte prefilter: lines without any positive term cannot match.
                 if !ac.is_match(bytes) {
                     line_no += 1;
                     continue;
@@ -868,8 +903,13 @@ mod tests {
             };
             data.extend_from_slice(line.as_bytes());
         }
-        // Safe query (prefilter on) and unsafe query (exact fallback path).
-        for (q, cs) in [("error timeout", false), ("ERROR -DEBUG", true)] {
+        // Safe query (prefilter on), required-only query, and fully
+        // unprefilterable query (union unsafe + required empty).
+        for (q, cs) in [
+            ("error timeout", false),
+            ("ERROR -DEBUG", true),
+            ("ERROR OR -DEBUG", true),
+        ] {
             let got = run_bool_worker(&data, q, cs);
             let want = oracle_bool(&data, q, cs);
             assert_eq!(got.len(), want.len(), "{}: hit count differs", q);

@@ -60,6 +60,39 @@ impl Query {
             Query::And(qs) | Query::Or(qs) => !qs.is_empty() && qs.iter().all(|q| q.is_prefilter_safe()),
         }
     }
+
+    /// Terms that EVERY full match must contain (conjunction core).
+    /// Term(t) non-empty at positive polarity -> {t}; And (positive) ->
+    /// union of children's; Or/Not-anything-negative -> {}.
+    /// Sound by induction on polarity: an And-match implies every conjunct
+    /// matches, and a positive Term-match implies containment; Or branches
+    /// and anything under Not promise nothing, so they contribute nothing.
+    /// The worker prefilters on the longest one (most selective single
+    /// literal, plain SIMD memchr).
+    pub fn required_terms(&self) -> Vec<&str> {
+        let mut out = Vec::new();
+        self.collect_required(false, &mut out);
+        out
+    }
+
+    fn collect_required<'a>(&'a self, neg: bool, out: &mut Vec<&'a str>) {
+        match self {
+            Query::Term(t) => {
+                if !neg && !t.is_empty() {
+                    out.push(t.as_str());
+                }
+            }
+            Query::Not(q) => q.collect_required(!neg, out),
+            Query::And(qs) => {
+                if !neg {
+                    for q in qs {
+                        q.collect_required(neg, out);
+                    }
+                }
+            }
+            Query::Or(_) => {}
+        }
+    }
 }
 
 fn contains(hay: &str, needle: &str, case_sensitive: bool) -> bool {
@@ -505,7 +538,8 @@ mod tests {
 
     #[test]
     fn prefilter_sound_on_safe_queries() {
-        // Differential: full-match lines must all contain a positive term.
+        // Differential: full-match lines must all contain a
+        // positive term (union) and every required term.
         let lines = [
             "ERROR timeout on request",
             "error TIMEOUT twice timeout",
@@ -514,22 +548,47 @@ mod tests {
             "nothing here",
             "terror",
             "a b c",
+            "DEBUG noise",
         ];
-        for q in ["err timeout", "err OR timeout", "(err timeout) OR info", "\"all good\""] {
+        for q in [
+            "err timeout",
+            "err OR timeout",
+            "(err timeout) OR info",
+            "\"all good\"",
+            "err -debug",
+            "err OR -debug",
+            "NOT (err timeout)",
+            "NOT NOT err",
+        ] {
             let ast = parse_query(q).unwrap();
-            assert!(ast.is_prefilter_safe());
             let terms = ast.positive_terms();
+            let req = ast.required_terms();
             for ln in lines {
                 if ast.matches(ln, false) {
                     let low = ln.to_ascii_lowercase();
-                    assert!(
-                        terms.iter().any(|t| low.contains(&t.to_ascii_lowercase())),
-                        "query {:?} matched {:?} without any positive term",
-                        q,
-                        ln
-                    );
+                    for r in &req {
+                        assert!(
+                            low.contains(&r.to_ascii_lowercase()),
+                            "query {:?} matched {:?} without required {:?}",
+                            q,
+                            ln,
+                            r
+                        );
+                    }
                 }
             }
         }
+        // Shape expectations (parse-dependent, documents the contract).
+        assert_eq!(parse_query("err timeout").unwrap().required_terms(), vec!["err", "timeout"]);
+        assert!(parse_query("err OR -debug").unwrap().required_terms().is_empty());
+        assert_eq!(parse_query("err -debug").unwrap().required_terms(), vec!["err"]);
+        assert!(parse_query("-err").unwrap().required_terms().is_empty());
+        // Negated conjunction promises nothing (De Morgan): no prefilter.
+        assert!(parse_query("NOT (a b)").unwrap().required_terms().is_empty());
+        assert_eq!(parse_query("a NOT (b c)").unwrap().required_terms(), vec!["a"]);
+        assert_eq!(
+            parse_query("NOT NOT x").unwrap().required_terms(),
+            vec!["x"]
+        );
     }
 }
