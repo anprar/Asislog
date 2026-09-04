@@ -18,3 +18,10 @@ Thumbs.db
 *.profraw
 perf-*.log
 bench-data/
+# Scratch measurement logs at repo root (bench*.txt, mem*.txt, ...)
+bench*.txt
+mem*.txt
+gen*.txt
+check*.txt
+clippy*.txt
+err_summary.txt
