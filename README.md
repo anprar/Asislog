@@ -35,7 +35,8 @@ Pengguna tidak perlu menginstal Rust untuk **menjalankan** biner.
 
 Biner rilis tanpa jendela console, sudah dioptimasi ukuran (`opt-level=z`,
 LTO, strip ≈ 7 MB), berikon + metadata versi (via `build.rs` +
-`assets/asislog.ico`), lalu dikompresi UPX `--lzma` (≈ 2,5 MB) dan di-ZIP.
+`assets/asislog.ico`), lalu dikompresi UPX `--lzma` (≈ 2,55 MB; budget
+CI 6 MB) dan di-ZIP.
 CI (`release.yml`, picu tag `v*`) mengerjakan semuanya otomatis: tes →
 build Windows+Linux → smoke test `--version` → UPX → ZIP → SHA-256 →
 GitHub Release.

@@ -66,6 +66,12 @@ jobs:
       - name: Compress with UPX (--lzma)
         shell: bash
         run: upx --lzma --best "${{ matrix.out }}"
+      - name: Size guard (catch profile regressions)
+        shell: bash
+        run: |
+          size=$(stat -c%s "${{ matrix.out }}")
+          echo "packed bytes: $size"
+          test "$size" -lt 6291456 || (echo "packed binary exceeds 6 MB budget" && exit 1)
       - name: Pack ZIP (Windows)
         if: matrix.os == 'windows-latest'
         shell: powershell

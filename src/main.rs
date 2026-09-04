@@ -40,6 +40,13 @@ fn attach_parent_console() {
 
 use asislog::app::AsisLogApp;
 
+/// Print CLI output infallibly: detached launches (no console, attach
+/// failed) and broken pipes must exit 0, never panic on stdout.
+fn say(line: &str) {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stdout(), "{}", line);
+}
+
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cli = args
@@ -50,16 +57,19 @@ fn main() -> eframe::Result<()> {
         attach_parent_console();
     }
     if args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("AsisLog {}", env!("CARGO_PKG_VERSION"));
+        say(&format!("AsisLog {}", env!("CARGO_PKG_VERSION")));
         return Ok(());
     }
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("AsisLog {} - penampil log portabel untuk file sangat besar", env!("CARGO_PKG_VERSION"));
-        println!();
-        println!("Penggunaan:");
-        println!("  asislog [FILE]...        buka file log langsung sebagai tab");
-        println!("  asislog --version        tampilkan versi lalu keluar");
-        println!("  asislog --help           tampilkan bantuan ini lalu keluar");
+        say(&format!(
+            "AsisLog {} - penampil log portabel untuk file sangat besar",
+            env!("CARGO_PKG_VERSION")
+        ));
+        say("");
+        say("Penggunaan:");
+        say("  asislog [FILE]...        buka file log langsung sebagai tab");
+        say("  asislog --version        tampilkan versi lalu keluar");
+        say("  asislog --help           tampilkan bantuan ini lalu keluar");
         return Ok(());
     }
     let files: Vec<std::path::PathBuf> = args.iter().map(std::path::PathBuf::from).collect();

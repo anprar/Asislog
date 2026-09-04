@@ -198,6 +198,13 @@ dulu decode penuh) **5,63 → 2,10/2,23 dtk (2,6x)**;
 `OutOfMemoryError` (927 hasil, sudah prefilter-cepat) stabil ±2,2 dtk.
 Lantai waktu = pindai baris 1 GB, bukan decode.
 
+### Filter bitmap roaring (`LineSet`)
+
+`filter_map: Vec<u64>` (8 byte/baris) → `LineSet` (roaring): 200 jt
+baris konsekutif = **43.114 byte** (vs 1,6 GB); 1,27 jt baris renggang
+(kasus filter DELETE 12 GB) = **2,5 MB** (vs 10 MB). Bom memori
+filter-raksasa resmi ditutup; API `row_to_line`/`line_to_row` O(log).
+
 ## 7. Hasil uji ulang 12 GB pasca-P0 (2026-09-04 malam)
 
 Harness v2 (sementara, sudah dihapus): API pure streaming langsung di
