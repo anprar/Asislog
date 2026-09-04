@@ -458,6 +458,20 @@ pub(crate) fn spawn_bool_search(
             .map(|s| s.to_string())
             .collect();
         let term_refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+        // Byte prefilter over positive terms (Aho-Corasick, zero decode):
+        // only candidate lines pay decode + full AST eval. Enabled solely
+        // when the union is sound (Query::is_prefilter_safe); otherwise every
+        // line still goes through the exact path below.
+        let prefilter: Option<aho_corasick::AhoCorasick> =
+            if ast.is_prefilter_safe() && !terms.is_empty() {
+                let mut builder = aho_corasick::AhoCorasickBuilder::new();
+                if !case_sensitive {
+                    builder.ascii_case_insensitive(true);
+                }
+                builder.build(&terms).ok()
+            } else {
+                None
+            };
         let mut line_no: u64 = 1;
         let mut byte_off: u64 = 0;
         let mut scanned: u64 = 0;
@@ -508,6 +522,13 @@ pub(crate) fn spawn_bool_search(
             // Cakupan baris: lewati decode/match di luar interval.
             if let Some((lo, hi)) = scope_lines {
                 if line_no < lo || line_no > hi {
+                    line_no += 1;
+                    continue;
+                }
+            }
+            // Byte prefilter: lines without any positive term cannot match.
+            if let Some(ac) = prefilter.as_ref() {
+                if !ac.is_match(bytes) {
                     line_no += 1;
                     continue;
                 }
@@ -734,6 +755,151 @@ mod tests {
                     name
                 );
             }
+        }
+    }
+
+    /// Drive the boolean worker to completion.
+    fn run_bool_worker(data: &[u8], query: &str, case_sensitive: bool) -> Vec<Hit> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b.log");
+        std::fs::write(&path, data).unwrap();
+        run_bool_file(&path, query, case_sensitive)
+    }
+
+    fn run_bool_file(path: &std::path::Path, query: &str, case_sensitive: bool) -> Vec<Hit> {
+        use crate::engine::query;
+        let ast = query::parse_query(query).unwrap();
+        let (tx, rx) = mpsc::channel();
+        spawn_bool_search(
+            SearchJobParams {
+                path: path.to_path_buf(),
+                gen: 1,
+                gen_shared: Arc::new(AtomicU64::new(1)),
+                tx,
+                cancel: Arc::new(AtomicBool::new(false)),
+            },
+            ast,
+            Encoding::Utf8,
+            0,
+            case_sensitive,
+            None,
+        );
+        let mut out = Vec::new();
+        for msg in rx {
+            assert!(msg.error.is_none(), "worker error: {:?}", msg.error);
+            out.extend(msg.batch);
+            if msg.done {
+                break;
+            }
+        }
+        out
+    }
+
+    /// Independent oracle: decode every line, full AST eval.
+    fn oracle_bool(data: &[u8], query: &str, case_sensitive: bool) -> Vec<(u64, u64, u32, u32)> {
+        use crate::engine::{decode, query};
+        let ast = query::parse_query(query).unwrap();
+        let terms: Vec<String> = ast.positive_terms().into_iter().map(|s| s.to_string()).collect();
+        let refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
+        let mut out = Vec::new();
+        let mut start = 0usize;
+        // Trailing segment without '\n' counts as a line (read_until parity).
+        let mut spans: Vec<(usize, usize)> = memchr::memchr_iter(b'\n', data)
+            .map(|i| {
+                let s = (start, i);
+                start = i + 1;
+                s
+            })
+            .collect();
+        if start < data.len() {
+            spans.push((start, data.len()));
+        }
+        for (idx, (s, e)) in spans.iter().enumerate() {
+            let (s, e) = (*s, *e);
+            let line = idx as u64 + 1;
+            let mut lb = &data[s..e];
+            if !lb.is_empty() && lb[lb.len() - 1] == b'\r' {
+                lb = &lb[..lb.len() - 1];
+            }
+            let text = decode::decode_bytes(lb, Encoding::Utf8);
+            if ast.matches(&text, case_sensitive) {
+                let (cs, ce) = query::first_match_span(&text, &refs, case_sensitive);
+                out.push((line, s as u64, cs, ce));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn worker_bool_matches_oracle_prefiltered_and_fallback() {
+        // Small deterministic data (ASCII, \n endings).
+        let mut data = Vec::new();
+        for i in 0..5000u64 {
+            let line = match i % 6 {
+                0 => format!("ERROR timeout id={}\n", i),
+                1 => format!("error id={}\n", i),
+                2 => format!("WARN timeout id={}\n", i),
+                3 => format!("DEBUG noise id={}\n", i),
+                _ => format!("INFO ok id={}\n", i),
+            };
+            data.extend_from_slice(line.as_bytes());
+        }
+        // Safe query (prefilter on) and unsafe query (exact fallback path).
+        for (q, cs) in [("error timeout", false), ("ERROR -DEBUG", true)] {
+            let got = run_bool_worker(&data, q, cs);
+            let want = oracle_bool(&data, q, cs);
+            assert_eq!(got.len(), want.len(), "{}: hit count differs", q);
+            for (h, (line, byte, csa, cea)) in got.iter().zip(want.iter()) {
+                assert_eq!(
+                    (h.line, h.byte, h.col_start, h.col_end),
+                    (*line, *byte, *csa, *cea),
+                    "{}",
+                    q
+                );
+            }
+        }
+        // Prefilter actually engaged on the safe query: recompute manually is
+        // covered by oracle equality; hits must be non-trivial.
+        assert!(!oracle_bool(&data, "error timeout", false).is_empty());
+    }
+
+    /// Heavy local-only benchmark (ignored in CI):
+    /// `cargo test --release --lib -- --ignored bench_1gb_bool --nocapture`.
+    /// Compares a selective positive query (prefilter on) against a common
+    /// one (most lines decode anyway) over ~1 GB.
+    #[test]
+    #[ignore]
+    fn bench_1gb_bool() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bool-1gb.log");
+        {
+            let mut f = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+            let mut written: u64 = 0;
+            let mut i: u64 = 0;
+            while written < 1024 * 1024 * 1024 {
+                let line = if i.is_multiple_of(20_000) {
+                    format!("2026-09-04 OutOfMemoryError id={} heap exhausted\n", i)
+                } else if i.is_multiple_of(50) {
+                    format!("2026-09-04 ERROR timeout id={}\n", i)
+                } else {
+                    format!("2026-09-04 INFO ok id={} user=andi status=OK pad-pad\n", i)
+                };
+                f.write_all(line.as_bytes()).unwrap();
+                written += line.len() as u64;
+                i += 1;
+            }
+            f.flush().unwrap();
+        }
+        for q in ["OutOfMemoryError", "ERROR INFO"] {
+            let t = Instant::now();
+            let hits = run_bool_file(&path, q, false);
+            eprintln!(
+                "[bench-1gb-bool] {:?}: {:.2}s, {} hits",
+                q,
+                t.elapsed().as_secs_f64(),
+                hits.len()
+            );
         }
     }
 

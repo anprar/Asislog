@@ -46,6 +46,20 @@ impl Query {
             }
         }
     }
+
+    /// True when a byte-level OR over `positive_terms()` is a SOUND prefilter:
+    /// every full match must contain at least one positive term, so lines
+    /// without any of them can skip decode + AST eval without false negatives.
+    /// Holds for negation-free ASTs with non-empty leaves and non-empty
+    /// And/Or lists. Counter-example otherwise: `a OR -b` matches lines
+    /// containing neither (via `-b`), so a union prefilter would drop them.
+    pub fn is_prefilter_safe(&self) -> bool {
+        match self {
+            Query::Term(t) => !t.is_empty(),
+            Query::Not(_) => false,
+            Query::And(qs) | Query::Or(qs) => !qs.is_empty() && qs.iter().all(|q| q.is_prefilter_safe()),
+        }
+    }
 }
 
 fn contains(hay: &str, needle: &str, case_sensitive: bool) -> bool {
@@ -472,5 +486,50 @@ mod tests {
         let terms = vec!["timeout", "err"];
         assert_eq!(first_match_span("xx ERR yy", &terms, false), (3, 6));
         assert_eq!(first_match_span("nothing", &terms, false), (0, 0));
+    }
+
+    #[test]
+    fn prefilter_safe_flag() {
+        // Pure-positive shapes: union prefilter is sound.
+        for q in ["err timeout", "err OR timeout", "(a b) OR c", "\"a b\" c"] {
+            let ast = parse_query(q).unwrap();
+            assert!(ast.is_prefilter_safe(), "{}", q);
+            assert!(!ast.positive_terms().is_empty());
+        }
+        // Any negation (or empty leaf) disables the prefilter.
+        for q in ["err -debug", "err OR -debug", "-err", "NOT err", "a OR (b NOT c)"] {
+            let ast = parse_query(q).unwrap_or(Query::Term(String::new()));
+            assert!(!ast.is_prefilter_safe(), "{}", q);
+        }
+    }
+
+    #[test]
+    fn prefilter_sound_on_safe_queries() {
+        // Differential: full-match lines must all contain a positive term.
+        let lines = [
+            "ERROR timeout on request",
+            "error TIMEOUT twice timeout",
+            "INFO all good",
+            "timeout",
+            "nothing here",
+            "terror",
+            "a b c",
+        ];
+        for q in ["err timeout", "err OR timeout", "(err timeout) OR info", "\"all good\""] {
+            let ast = parse_query(q).unwrap();
+            assert!(ast.is_prefilter_safe());
+            let terms = ast.positive_terms();
+            for ln in lines {
+                if ast.matches(ln, false) {
+                    let low = ln.to_ascii_lowercase();
+                    assert!(
+                        terms.iter().any(|t| low.contains(&t.to_ascii_lowercase())),
+                        "query {:?} matched {:?} without any positive term",
+                        q,
+                        ln
+                    );
+                }
+            }
+        }
     }
 }

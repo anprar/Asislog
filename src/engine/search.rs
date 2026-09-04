@@ -32,27 +32,6 @@ fn count_nl(bytes: &[u8]) -> u64 {
     memchr::memchr_iter(b'\n', bytes).count() as u64
 }
 
-/// Build line-start table for a buffer starting at known (base_line, base_byte).
-/// Returns Vec of (line_no, line_start_in_buf, line_end_in_buf).
-fn split_lines(buf: &[u8]) -> Vec<(usize, usize)> {
-    let mut out = Vec::new();
-    let mut s = 0usize;
-    for (i, &b) in buf.iter().enumerate() {
-        if b == b'\n' {
-            out.push((s, i));
-            s = i + 1;
-        }
-    }
-    if s < buf.len() {
-        out.push((s, buf.len()));
-    } else if buf.is_empty() {
-        // no lines
-    }
-    // If buf ends with '\n', trailing empty line is not a real line; drop it
-    // (split_lines pushes only when s < len, so already correct).
-    out
-}
-
 /// Literal search over full slice. Pure + testable.
 /// `case_sensitive=false` folds ASCII case (chunked temp buffer, no full-file copy beyond input).
 pub fn find_literal(
@@ -76,8 +55,42 @@ pub fn find_literal(
     find_literal_case_sensitive(data, needle, data, max_hits)
 }
 
+/// Stream `hay` in 4 MiB chunks with an overlap tail, calling `f` per chunk.
+/// Chunk args: (combined, combined_base, first_line, carry_len, is_last).
+/// RAM is O(chunk); line numbers stay exact via per-chunk newline counts.
+fn scan_stream(hay: &[u8], overlap: usize, mut f: impl FnMut(&[u8], u64, u64, usize, bool) -> bool) {
+    let overlap = overlap.max(1);
+    let mut carry: Vec<u8> = Vec::new();
+    let mut offset: u64 = 0; // fresh bytes consumed so far
+    let mut line_no: u64 = 1; // 1-based line at `offset`
+    let mut pos = 0usize;
+    loop {
+        let end = (pos + SEARCH_CHUNK).min(hay.len());
+        let fresh = &hay[pos..end];
+        let mut combined = std::mem::take(&mut carry);
+        let base = offset.saturating_sub(combined.len() as u64);
+        let carry_len = combined.len();
+        let carry_nl = memchr::memchr_iter(b'\n', &combined).count() as u64;
+        let cur_line = line_no.saturating_sub(carry_nl);
+        combined.extend_from_slice(fresh);
+        pos = end;
+        let is_last = pos >= hay.len();
+        if f(&combined, base, cur_line, carry_len, is_last) {
+            break;
+        }
+        line_no += memchr::memchr_iter(b'\n', fresh).count() as u64;
+        offset += fresh.len() as u64;
+        let tail = overlap.min(combined.len());
+        carry = combined[combined.len() - tail..].to_vec();
+        if is_last {
+            break;
+        }
+    }
+}
+
 /// Core literal scan where `hay` is the bytes to search (may be lowercased view)
-/// but positions map 1:1 onto `orig` (same length).
+/// but positions map 1:1 onto `orig` (same length). Streaming: O(chunk) RAM,
+/// incremental line mapping, no dense line table (safe at any file size).
 fn find_literal_case_sensitive(
     hay: &[u8],
     needle: &[u8],
@@ -87,43 +100,48 @@ fn find_literal_case_sensitive(
     let finder = memchr::memmem::Finder::new(needle);
     let mut hits = Vec::new();
     let mut truncated = false;
-    // Precompute line starts to translate byte pos -> (line, col).
-    // For test-size inputs this is fine; background chunked search uses incremental counting.
-    let mut line_starts: Vec<usize> = vec![0];
-    for i in memchr::memchr_iter(b'\n', hay) {
-        if i + 1 < hay.len() {
-            line_starts.push(i + 1);
-        } else if i + 1 == hay.len() {
-            // trailing newline: no further line
+    scan_stream(hay, needle.len().min(16 * 1024), |combined, base, cur_line, carry_len, _| {
+        let mut prev_m = 0usize;
+        let mut prev_line = cur_line;
+        let mut prev_ls = 0usize;
+        for m in finder.find_iter(combined) {
+            // Fully inside the carried prefix: reported by the previous chunk.
+            if m + needle.len() <= carry_len {
+                continue;
+            }
+            let gap = &combined[prev_m..m];
+            let mut nl = 0u64;
+            let mut last_nl = 0usize;
+            for i in memchr::memchr_iter(b'\n', gap) {
+                nl += 1;
+                last_nl = i;
+            }
+            let (line, ls) = if nl == 0 {
+                (prev_line, prev_ls)
+            } else {
+                (prev_line + nl, prev_m + last_nl + 1)
+            };
+            prev_m = m;
+            prev_line = line;
+            prev_ls = ls;
+            hits.push(Hit {
+                line,
+                byte: base + ls as u64,
+                col_start: (m - ls) as u32,
+                col_end: (m + needle.len() - ls) as u32,
+            });
+            if hits.len() >= max_hits {
+                truncated = true;
+                return true;
+            }
         }
-    }
-    for m in finder.find_iter(hay) {
-        // binary search line starts
-        let li = match line_starts.binary_search(&m) {
-            Ok(i) => i,
-            Err(i) => i.saturating_sub(1),
-        };
-        let ls = line_starts[li];
-        let line = (li as u64) + 1;
-        let col_start = (m - ls) as u32;
-        let col_end = (m + needle.len() - ls) as u32;
-        // Skip matches in the phantom trailing region (shouldn't happen).
-        hits.push(Hit {
-            line,
-            byte: ls as u64,
-            col_start,
-            col_end,
-        });
-        if hits.len() >= max_hits {
-            truncated = true;
-            break;
-        }
-    }
-    // Fix `byte` to be global (here buf starts at 0, so same).
+        false
+    });
     (hits, truncated)
 }
 
 /// Regex search over bytes. Returns Err with message on invalid pattern (no panic).
+/// Streaming like the literal path: O(chunk) RAM, incremental line mapping.
 pub fn find_regex(
     data: &[u8],
     pattern: &str,
@@ -133,47 +151,61 @@ pub fn find_regex(
     let mut builder = regex::bytes::RegexBuilder::new(pattern);
     builder.case_insensitive(!case_sensitive);
     let re = builder.build().map_err(|e| e.to_string())?;
-    let mut line_starts: Vec<usize> = vec![0];
-    for i in memchr::memchr_iter(b'\n', data) {
-        if i + 1 < data.len() {
-            line_starts.push(i + 1);
-        }
-    }
     let mut hits = Vec::new();
     let mut truncated = false;
-    for m in re.find_iter(data) {
-        let s = m.start();
-        let e = m.end();
-        if e == s {
-            continue; // skip empty matches
+    scan_stream(data, 8 * 1024, |combined, base, cur_line, carry_len, _| {
+        let mut prev_s = 0usize;
+        let mut prev_line = cur_line;
+        let mut prev_ls = 0usize;
+        for m in re.find_iter(combined) {
+            let s = m.start();
+            let e = m.end();
+            if e == s {
+                continue; // skip empty matches
+            }
+            if e <= carry_len {
+                continue; // fully inside carried prefix: already reported
+            }
+            let gap = &combined[prev_s..s];
+            let mut nl = 0u64;
+            let mut last_nl = 0usize;
+            for i in memchr::memchr_iter(b'\n', gap) {
+                nl += 1;
+                last_nl = i;
+            }
+            let (line, ls) = if nl == 0 {
+                (prev_line, prev_ls)
+            } else {
+                (prev_line + nl, prev_s + last_nl + 1)
+            };
+            prev_s = s;
+            prev_line = line;
+            prev_ls = ls;
+            // Skip matches spanning lines? Keep them, clamp col_end to line end.
+            let line_end = combined
+                .iter()
+                .skip(s)
+                .position(|&b| b == b'\n')
+                .map(|k| s + k)
+                .unwrap_or(combined.len());
+            let ce = e.min(line_end).saturating_sub(ls) as u32;
+            hits.push(Hit {
+                line,
+                byte: base + ls as u64,
+                col_start: s.saturating_sub(ls) as u32,
+                col_end: ce,
+            });
+            if hits.len() >= max_hits {
+                truncated = true;
+                return true;
+            }
+            if hits.len() > MAX_STORED_HITS {
+                truncated = true;
+                return true;
+            }
         }
-        let li = match line_starts.binary_search(&s) {
-            Ok(i) => i,
-            Err(i) => i.saturating_sub(1),
-        };
-        let ls = line_starts[li];
-        // Skip matches spanning lines? Keep them, clamp col_end to line end.
-        let line_end = if li + 1 < line_starts.len() {
-            line_starts[li + 1].saturating_sub(1)
-        } else {
-            data.len()
-        };
-        let ce = e.min(line_end + 1).saturating_sub(ls) as u32;
-        hits.push(Hit {
-            line: (li as u64) + 1,
-            byte: ls as u64,
-            col_start: (s - ls) as u32,
-            col_end: ce,
-        });
-        if hits.len() >= max_hits {
-            truncated = true;
-            break;
-        }
-        if hits.len() > MAX_STORED_HITS {
-            truncated = true;
-            break;
-        }
-    }
+        false
+    });
     Ok((hits, truncated))
 }
 
@@ -244,6 +276,9 @@ where
         }
         // Number of newlines in this chunk determines base_line advance for next chunk.
         let nl_in_chunk = count_nl(chunk);
+        // Matches arrive ascending: running newline count, O(chunk + hits).
+        let mut prev_m = 0usize;
+        let mut nl_run = 0u64;
         for m in finder.find_iter(hay) {
             // Skip matches fully inside overlap region already reported?
             // Overlap handling: we extended previous chunk? Simpler approach:
@@ -254,9 +289,10 @@ where
             // the chunk ends mid-line AND needle longer than 1. Implement by
             // adjusting offset advance below.
             let global = offset + m;
-            // Determine line: count newlines before m within chunk + base.
-            let nl_before = count_nl(&chunk[..m.min(chunk.len())]);
-            let line = base_line + nl_before;
+            // Determine line: running newlines before m within chunk + base.
+            nl_run += count_nl(&chunk[prev_m..m.min(chunk.len())]);
+            prev_m = m;
+            let line = base_line + nl_run;
             // Column: distance to previous \n within combined view.
             let mut ls_rel = 0usize;
             // find greatest rel_start <= m, else line start is before chunk.
@@ -334,7 +370,6 @@ where
                 base_line = 1 + carry_nl_count;
             }
         }
-        let _ = split_lines; // keep helper referenced for future use
     }
     if !pending.is_empty() {
         on_batch(pending);

@@ -80,7 +80,10 @@ Kontrak performa (dari `asislog-agent-prompt.md`):
 
 - [x] Mesin sehat di 1 GB: indeks 0.62 dtk, literal 1.13 dtk, regex ringan
       0.46 dtk (2026-09-04, i5-10400 — lihat §4).
-- [ ] Literal search vs klogg di file ≥1 GB: ____ (mesin sama, file sama).
+- [x] Heap 12 GB terbukti: GUI Private 90.7 MB (coba.txt + search),
+      engine 55.2 MB (lihat §5 addendum, §6). Klaim `<250 MB` SAH.
+- [ ] Literal search vs klogg di file ≥1 GB: ulangi `DELETE FROM` di
+      `coba.txt` pasca-§6 (dulu 42.45 dtk) — ekspektasi satu digit.
 - [ ] Regex kompleks vs klogg (Hyperscan): ____ — ekspektasi jujur: klogg
       menang 2–4x sampai AsisLog memakai vectorscan/prefilter Aho-Corasick.
 - [ ] Open 10 GB + RAM <250 MB via GUI: ____ (first paint, RAM puncak).
@@ -128,3 +131,61 @@ Catatan jujur:
   tidak menghitung nomor baris dan memakai cache lebih hangat.
   PR optimasi: petakan nomor baris lebih murah (hitung `\n` inkremental
   per match, bukan tabel starts + binary search per chunk).
+
+### Addendum 12 GB — koreksi RAM: heap GUI 90,7 MB (2026-09-04 sore)
+
+Pengukuran ulang menjawab baris memori di atas dengan angka apple-to-apple
+(**Private Bytes**, bukan working set), memakai **proses GUI asli**
+(`asislog.exe` release) + file `coba.txt` yang sama + worker search nyata
+(`DELETE FROM`, case-sensitive, via session-restore yang memicu debounce):
+
+| Metrik | AsisLog (GUI) | klogg 24.11.0.1685 (GUI) |
+|---|---|---|
+| Private Bytes puncak (buka 12 GB + indeks + search 1,37 jt occ) | **90,7 MB** | 980 MB → **menetap 573 MB** |
+| Private Bytes menetap | **±73 MB** | 573 MB |
+| Working set selama run | ±91–103 MB | — |
+
+Bukti run sah: `coba.txt.asisidx` 6,7 MB tertulis 12:58:07 (indeks selesai
+di run ini) + `session.json` ditulis ulang detik yang sama (event loop +
+debounce search jalan). Sesi asli user dikembalikan setelah ukur.
+
+Klarifikasi arsitektur (mengoreksi catatan WS di atas): worker GUI membaca
+file via `BufReader` streaming (I/O biasa → system page cache, **bukan**
+working set proses); mmap hanya disentuh untuk baris terlihat. WS 11 GB
+kemarin adalah artefak harness bench12 yang menyentuh seluruh mmap,
+bukan perilaku aplikasi. Klaim `<250 MB` resmi **terbukti untuk heap
+(<100 MB di 12 GB + search)**, dan WS pun ±100 MB.
+
+## 6. Hasil optimasi P0 (2026-09-04 sore)
+
+Perubahan (semua diverifikasi 97 tes + clippy nol):
+
+1. **Pemetaan baris inkremental** (`spawn_search` literal + regex):
+   tabel `rel_starts` + binary search per hit diganti hitung `\n`
+   `hay[prev..m]` (satu pass memchr per chunk, O(1) per hit). Bonus:
+   loop pra-pindai mati di jalur insensitive (dulu memindai semua match
+   2x) ikut terbuang.
+2. **`view_row_of_line`**: `.position()` O(n) → `binary_search` O(log n)
+   untuk `filter_map` + `mode_lines` (keduanya terurut terjamin).
+3. **Boolean prefilter**: Aho-Corasick level-byte atas positive terms,
+   decode + AST hanya untuk kandidat. Diaktifkan hanya bila union
+   terbukti sound (`Query::is_prefilter_safe`, diuji: `a OR -b` tetap
+   jalur eksak). Bench 1 GB: query selektif `OutOfMemoryError`
+   **1,73 dtk**; query umum `ERROR INFO` 5,63 dtk (decode penuh, tanpa
+   regresi). Tindak lanjut: prefilter sadar-konjungsi (rarest-term).
+4. **Bonus bug — duplikat batas-chunk**: skip lama
+   `s < carry_len - overlap` selalu nol (`carry_len == overlap`) sehingga
+   match di ekor carry dilaporkan 2x (terbukti: 165 dobel / 85rb di tes).
+   Diganti skip berbasis akhir-match. Tes oracle kini mengunci
+   no-dup-no-miss di batas 4 MiB persis.
+5. **Pure `find_literal`/`find_regex` jadi streaming** (tutup footgun
+   tabel `line_starts` padat 2,5 GB di 12 GB) + `chunked_literal_search`
+   O(n·m) → running count. Footgun ini yang membuat harness ukur
+   Private 6.188 MB; pasca-rewrite **55,2 MB** (mmap + indeks + search
+   + filter 1,27 jt baris, file sintetis 12 GB / 317 jt baris).
+
+Angka 1 GB pasca-optimasi (i5-10400, 2x lari): literal 0,93–1,06 dtk
+(sebelum 1,13), regex 0,40–0,50 (sebelum 0,46) — dalam noise karena
+scan-dominated di 250rb hit; win membesar dengan kepadatan hit.
+**Arbiter sesungguhnya: ulangi `DELETE FROM` di `coba.txt`** (dulu
+42,45 dtk penuh) — ekspektasi satu digit.
