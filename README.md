@@ -192,4 +192,16 @@ Pengguna tidak perlu menginstal Rust untuk **menjalankan** biner.
 
 ## Struktur kode
 
+- `src/app/` — UI egui (dulu 1 file `app.rs` 5.316 baris, kini 15 modul <800 baris):
+  `tab` (state per tab), `jobs_index`/`jobs_search` (pekerja latar),
+  `state` (config/sesi/workspace), `actions` (pintasan/goto/salin),
+  `ui` + `ui_*` (render per panel/dialog).
+- `src/engine/` — mesin tanpa UI: `mmap`, `index` (checkpoint jarang),
+  `search`, `filter`, `follow`, `decode`, `archive`, `query`, `jsonlog`,
+  `marks`, `scratch`.
+- `tests/` — `engine_integration.rs` (CRLF, checkpoint, filter, follow,
+  search-gen, sidecar) + `bench_synthetic.rs` (bench 20 MB di CI,
+  1 GB lokal via `--ignored`). Lihat `BENCHMARK.md` untuk metodologi
+  perbandingan jujur vs klogg.
+
 Lihat `asislog-agent-prompt.md` untuk spesifikasi awal.
