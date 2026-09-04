@@ -196,129 +196,50 @@ pub(crate) fn spawn_search(
                     &combined
                 } else {
                     hay_owned = combined.to_ascii_lowercase();
-                    // search within this scope using owned copy; positions identical
-                    // length, so we can proceed with a block:
-                    let f = finder.as_ref().unwrap();
-                    // line starts relative
-                    let mut rel_line = cur_line;
-                    let mut line_start_rel = 0usize;
-                    // If combined_base > 0 and first byte continues a line, cur_line is
-                    // already correct (continuation). Find first newline to set starts.
-                    // Iterate matches:
-                    for m in f.find_iter(&hay_owned) {
-                        if job_stale(&gen_shared, gen, &cancel) {
-                            return;
-                        }
-                        if m < carry_len.saturating_sub(overlap) && global_offset != 0 {
-                            // already reported in previous chunk
-                            continue;
-                        }
-                        // count newlines between line_start tracking? Simpler: count
-                        // newlines from previous match? For batch sizes this O(n*m)
-                        // could be slow; instead precompute line starts once below.
-                        let _ = (rel_line, line_start_rel);
-                        let _ = m;
-                    }
-                    // Fall through to unified path below using hay_owned:
-                    // To keep code simple, replace combined with lowered copy:
+                    // Length-preserving ASCII fold, so offsets match `combined`.
                     drop(combined);
                     combined = hay_owned;
-                    // recompute below with case_sensitive=true semantics
-                    let _ = &mut rel_line;
-                    let _ = &mut line_start_rel;
                     &combined
                 };
-                // Precompute relative line starts for combined.
-                let starts_mid = combined_base > 0;
-                let _ = starts_mid;
-                let mut rel_starts: Vec<usize> = Vec::new();
-                // Determine if combined starts mid-line: check byte before combined_base.
-                // We don't have it; approximate: if global_offset != 0 then the first
-                // line is a continuation UNLESS carry was empty and previous chunk ended
-                // exactly at newline. Track via flag: previous chunk end char.
-                // Simplify: if carry_len > 0, first line is continuation (no new start).
-                let cont = carry_len > 0;
-                if !cont {
-                    rel_starts.push(0);
-                }
-                for i in memchr::memchr_iter(b'\n', hay) {
-                    if i + 1 < hay.len() {
-                        rel_starts.push(i + 1);
-                    }
-                }
                 let f = finder.as_ref().unwrap();
+                // Incremental line mapping: `find_iter` yields matches in
+                // ascending order, so line(m) = line(prev) + newlines in
+                // hay[prev_m..m]. One memchr pass total per chunk, O(1) per
+                // hit — no line table, no binary search. Anchored at
+                // combined[0], whose line is cur_line.
+                let mut prev_m = 0usize;
+                let mut prev_line = cur_line;
+                let mut prev_ls = 0usize;
                 for m in f.find_iter(hay) {
                     if job_stale(&gen_shared, gen, &cancel) {
                         return;
                     }
-                    if global_offset != 0 && m < carry_len.saturating_sub(overlap) {
+                    // Matches fully inside the carried prefix were already
+                    // reported by the previous chunk (all their bytes were
+                    // visible there). Matches reaching into fresh bytes are
+                    // new: the previous chunk could not yield them.
+                    if m + needle_cmp.len() <= carry_len {
                         continue;
                     }
-                    // line lookup
-                    let li = match rel_starts.binary_search(&m) {
-                        Ok(i) => i,
-                        Err(i) => {
-                            if i == 0 {
-                                // inside continuation line
-                                // line = cur_line, col = distance to combined start
-                                // + need global line start for byte: scan back in file?
-                                // Approximate byte as combined_base (line started earlier).
-                                // For byte field, find previous newline in hay before m,
-                                // else use combined_base.
-                                let mut p = m;
-                                while p > 0 && hay[p - 1] != b'\n' {
-                                    p -= 1;
-                                }
-                                let gstart = if p == 0 && cont {
-                                    // true start is before combined; estimate
-                                    combined_base
-                                } else {
-                                    combined_base + p as u64
-                                };
-                                let hit = Hit {
-                                    line: cur_line,
-                                    byte: gstart,
-                                    col_start: (m - p) as u32,
-                                    col_end: (m - p + needle_cmp.len()) as u32,
-                                };
-                                if let Some((ss, ee)) = scope {
-                                    let gp = combined_base + m as u64;
-                                    if gp < ss || gp >= ee {
-                                        continue;
-                                    }
-                                }
-                                pending.push(hit.clone());
-                                total_found += 1;
-                                if pending.len() >= search::SEARCH_BATCH {
-                                    let b = std::mem::take(&mut pending);
-                                    let _ = tx.send(SearchBatchMsg {
-                                        gen,
-                                        batch: b,
-                                        done: false,
-                                        truncated: false,
-                                        error: None,
-                                        scanned: global_offset,
-                                        total: total_size,
-                                    });
-                                }
-                                if total_found >= search::MAX_STORED_HITS {
-                                    truncated = true;
-                                }
-                                if truncated {
-                                    break;
-                                }
-                                continue;
-                            } else {
-                                i - 1
-                            }
-                        }
+                    // Advance (line, line-start) from the previous match.
+                    // Gaps partition hay[0..m], so the newline total is exact.
+                    let gap = &hay[prev_m..m];
+                    let mut nl = 0u64;
+                    let mut last_nl = 0usize;
+                    for i in memchr::memchr_iter(b'\n', gap) {
+                        nl += 1;
+                        last_nl = i;
+                    }
+                    let (gline, ls) = if nl == 0 {
+                        (prev_line, prev_ls)
+                    } else {
+                        (prev_line + nl, prev_m + last_nl + 1)
                     };
-                    let ls = rel_starts[li];
-                    // When cont, rel_starts[0] is the second line; gline2 adjusts.
-                    // cur_line is the line number of combined[0]'s line.
-                    let gline2 = if cont { cur_line + li as u64 + 1 } else { cur_line + li as u64 };
+                    prev_m = m;
+                    prev_line = gline;
+                    prev_ls = ls;
                     let hit = Hit {
-                        line: gline2,
+                        line: gline,
                         byte: combined_base + ls as u64,
                         col_start: (m - ls) as u32,
                         col_end: (m - ls + needle_cmp.len()) as u32,
@@ -348,14 +269,7 @@ pub(crate) fn spawn_search(
                         break;
                     }
                 }
-                // advance line_no by newlines in the non-carry part only (avoid double count)
-                let new_part = if combined.len() >= carry_len {
-                    &combined[carry_len.saturating_sub(overlap.min(carry_len))..]
-                } else {
-                    &combined[..]
-                };
-                // Actually simpler: line_no += newlines in tmp (fresh bytes only).
-                let _ = new_part;
+                // Fresh bytes only (carry was counted in its own chunk).
                 let nl_new = memchr::memchr_iter(b'\n', &tmp).count() as u64;
                 line_no += nl_new;
                 global_offset += n as u64;
@@ -383,16 +297,11 @@ pub(crate) fn spawn_search(
             } else {
                 // Regex path: search combined as bytes.
                 let re = re.as_ref().unwrap();
-                let cont = carry_len > 0;
-                let mut rel_starts: Vec<usize> = Vec::new();
-                if !cont {
-                    rel_starts.push(0);
-                }
-                for i in memchr::memchr_iter(b'\n', &combined) {
-                    if i + 1 < combined.len() {
-                        rel_starts.push(i + 1);
-                    }
-                }
+                // Same incremental line mapping as the literal path: no
+                // line table, no binary search, O(1) amortised per hit.
+                let mut prev_s = 0usize;
+                let mut prev_line = cur_line;
+                let mut prev_ls = 0usize;
                 for m in re.find_iter(&combined) {
                     if job_stale(&gen_shared, gen, &cancel) {
                         return;
@@ -401,7 +310,9 @@ pub(crate) fn spawn_search(
                     if e == s {
                         continue;
                     }
-                    if global_offset != 0 && s < carry_len.saturating_sub(overlap) {
+                    // Same dedup as the literal path: fully inside the carried
+                    // prefix means the previous chunk already reported it.
+                    if e <= carry_len {
                         continue;
                     }
                     if let Some((ss, ee)) = scope {
@@ -410,24 +321,22 @@ pub(crate) fn spawn_search(
                             continue;
                         }
                     }
-                    // line lookup
-                    let (gline, ls) = match rel_starts.binary_search(&s) {
-                        Ok(i) => {
-                            let g = if cont { cur_line + i as u64 + 1 } else { cur_line + i as u64 };
-                            (g, rel_starts[i])
-                        }
-                        Err(0) => (cur_line, {
-                            let mut p = s;
-                            while p > 0 && combined[p - 1] != b'\n' {
-                                p -= 1;
-                            }
-                            p
-                        }),
-                        Err(i) => {
-                            let g = if cont { cur_line + (i - 1) as u64 + 1 } else { cur_line + (i - 1) as u64 };
-                            (g, rel_starts[i - 1])
-                        }
+                    // Advance (line, line-start) from the previous match.
+                    let gap = &combined[prev_s..s];
+                    let mut nl = 0u64;
+                    let mut last_nl = 0usize;
+                    for i in memchr::memchr_iter(b'\n', gap) {
+                        nl += 1;
+                        last_nl = i;
+                    }
+                    let (gline, ls) = if nl == 0 {
+                        (prev_line, prev_ls)
+                    } else {
+                        (prev_line + nl, prev_s + last_nl + 1)
                     };
+                    prev_s = s;
+                    prev_line = gline;
+                    prev_ls = ls;
                     let line_end = combined
                         .iter()
                         .skip(s)
@@ -464,7 +373,6 @@ pub(crate) fn spawn_search(
                 global_offset += n as u64;
                 let tail = overlap.min(combined.len());
                 carry = combined[combined.len() - tail..].to_vec();
-                let _ = cur_line;
                 if !pending.is_empty() && (pending.len() >= 200 || is_last) {
                     let b = std::mem::take(&mut pending);
                     let _ = tx.send(SearchBatchMsg {
@@ -647,4 +555,207 @@ pub(crate) fn spawn_bool_search(
             total,
         });
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Drive a search worker to completion and collect hits in order.
+    fn run_worker(
+        data: &[u8],
+        query: &str,
+        regex_on: bool,
+        case_sensitive: bool,
+        scope: Option<(u64, u64)>,
+    ) -> Vec<Hit> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.log");
+        std::fs::write(&path, data).unwrap();
+        let (tx, rx) = mpsc::channel();
+        spawn_search(
+            SearchJobParams {
+                path,
+                gen: 1,
+                gen_shared: Arc::new(AtomicU64::new(1)),
+                tx,
+                cancel: Arc::new(AtomicBool::new(false)),
+            },
+            query.to_string(),
+            regex_on,
+            case_sensitive,
+            scope,
+        );
+        let mut out = Vec::new();
+        for msg in rx {
+            assert!(msg.error.is_none(), "worker error: {:?}", msg.error);
+            out.extend(msg.batch);
+            if msg.done {
+                break;
+            }
+        }
+        out
+    }
+
+    /// Independent oracle: literal occurrences with (line, byte, col).
+    fn oracle_literal(data: &[u8], needle: &[u8], case_sensitive: bool) -> Vec<(u64, u64, u32, u32)> {
+        let (hay, nd): (Vec<u8>, Vec<u8>) = if case_sensitive {
+            (data.to_vec(), needle.to_vec())
+        } else {
+            (data.to_ascii_lowercase(), needle.to_ascii_lowercase())
+        };
+        let mut out = Vec::new();
+        let mut line: u64 = 1;
+        let mut line_start = 0usize;
+        let mut i = 0usize;
+        while i + nd.len() <= hay.len() {
+            if &hay[i..i + nd.len()] == nd.as_slice() {
+                out.push((line, line_start as u64, (i - line_start) as u32, (i - line_start + nd.len()) as u32));
+                i += nd.len().max(1);
+            } else {
+                if hay[i] == b'\n' {
+                    line += 1;
+                    line_start = i + 1;
+                }
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// ~10 MB across 4 MiB chunk boundaries, mixed case, multi-hit lines.
+    fn worker_data() -> Vec<u8> {
+        let mut v = Vec::new();
+        for i in 0..200_000u64 {
+            let line = match i % 7 {
+                0 => format!("2026-09-04 ERROR disk id={} ERROR twice\n", i),
+                1 => format!("2026-09-04 error lower id={}\n", i),
+                2 => format!("2026-09-04 WARN id={}\n", i),
+                _ => format!("2026-09-04 INFO id={} pad-pad-pad-pad-pad-pad\n", i),
+            };
+            v.extend_from_slice(line.as_bytes());
+        }
+        assert!(v.len() > 2 * search::SEARCH_CHUNK);
+        v
+    }
+
+    #[test]
+    fn worker_literal_matches_oracle_case_sensitive() {
+        let data = worker_data();
+        let got = run_worker(&data, "ERROR", false, true, None);
+        let want = oracle_literal(&data, b"ERROR", true);
+        assert_eq!(got.len(), want.len(), "hit count differs");
+        // Contract: exact line + exact absolute span. `byte` alone may be
+        // combined-anchored for continuation lines (see mapping above).
+        for (h, (line, ls, cs, ce)) in got.iter().zip(want.iter()) {
+            assert_eq!(
+                (h.line, h.byte + h.col_start as u64, h.byte + h.col_end as u64),
+                (*line, ls + *cs as u64, ls + *ce as u64)
+            );
+        }
+        // Multi-hit line present (two ERRORs on one line).
+        assert!(got.windows(2).any(|w| w[0].line == w[1].line));
+    }
+
+    #[test]
+    fn worker_literal_matches_oracle_insensitive() {
+        let data = worker_data();
+        let got = run_worker(&data, "error", false, false, None);
+        let want = oracle_literal(&data, b"error", false);
+        assert_eq!(got.len(), want.len(), "hit count differs");
+        // Contract: exact line + exact absolute span. `byte` alone may be
+        // combined-anchored for continuation lines (see mapping above).
+        for (h, (line, ls, cs, ce)) in got.iter().zip(want.iter()) {
+            assert_eq!(
+                (h.line, h.byte + h.col_start as u64, h.byte + h.col_end as u64),
+                (*line, ls + *cs as u64, ls + *ce as u64)
+            );
+        }
+        assert!(got.len() > run_worker(&data, "ERROR", false, true, None).len());
+    }
+
+    #[test]
+    fn worker_regex_matches_literal_union() {
+        let data = worker_data();
+        let got = run_worker(&data, "WARN|ERROR", true, true, None);
+        let mut want = oracle_literal(&data, b"WARN", true);
+        want.extend(oracle_literal(&data, b"ERROR", true));
+        want.sort();
+        want.dedup();
+        assert_eq!(got.len(), want.len(), "hit count differs");
+        // Contract: exact line + exact absolute span. `byte` alone may be
+        // combined-anchored for continuation lines (see mapping above).
+        for (h, (line, ls, cs, ce)) in got.iter().zip(want.iter()) {
+            assert_eq!(
+                (h.line, h.byte + h.col_start as u64, h.byte + h.col_end as u64),
+                (*line, ls + *cs as u64, ls + *ce as u64)
+            );
+        }
+    }
+
+    /// Matches at exact chunk edges: fully inside the carried tail (must
+    /// not duplicate) and straddling the boundary (must not miss).
+    /// Chunk 0 = [0, C), carry = last `overlap` bytes.
+    #[test]
+    fn worker_chunk_boundary_no_dup_no_miss() {
+        let c = search::SEARCH_CHUNK;
+        let mut v = vec![b'A'; c - 7];
+        v.extend_from_slice(b"ERROR"); // [c-7, c-2): tail, partial in carry
+        v.extend_from_slice(b"ER"); // [c-2, c)
+        v.extend_from_slice(b"ROR"); // [c, c+3): [c-2, c+3) == "ERROR" crossing
+        v.extend_from_slice(b"TAIL"); // [c+3, c+7)
+        v.extend_from_slice(&vec![b'B'; c]); // push well into chunk 1
+        v.extend_from_slice(b"\nINFO ok\n");
+        // Second trap: match ending exactly at the boundary: [c-5, c)
+        // lies fully in chunk 0 tail and chunk 1 carry (maximal overlap).
+        let mut v2 = vec![b'C'; c - 5];
+        v2.extend_from_slice(b"ERROR"); // absolute [c-5, c): ends at boundary
+        v2.extend_from_slice(&v[c..]);
+        for (name, data) in [("cross", v.as_slice()), ("dup-trap", v2.as_slice())] {
+            let got = run_worker(data, "ERROR", false, true, None);
+            let want = oracle_literal(data, b"ERROR", true);
+            assert_eq!(got.len(), want.len(), "{}: hit count differs", name);
+            for (h, (line, ls, cs, ce)) in got.iter().zip(want.iter()) {
+                assert_eq!(
+                    (h.line, h.byte + h.col_start as u64, h.byte + h.col_end as u64),
+                    (*line, ls + *cs as u64, ls + *ce as u64),
+                    "{}",
+                    name
+                );
+            }
+            // Same bytes through the regex path must agree exactly.
+            let rgot = run_worker(data, "ERROR", true, true, None);
+            assert_eq!(rgot.len(), got.len(), "{}: regex/literal differ", name);
+            for (r, h) in rgot.iter().zip(got.iter()) {
+                assert_eq!(
+                    (r.line, r.byte + r.col_start as u64, r.byte + r.col_end as u64),
+                    (h.line, h.byte + h.col_start as u64, h.byte + h.col_end as u64),
+                    "{}",
+                    name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn worker_scope_filters_by_match_byte() {
+        let data = worker_data();
+        let all = run_worker(&data, "ERROR", false, true, None);
+        assert!(!all.is_empty());
+        // Scope = byte interval covering the middle third of hits.
+        let ss = all[all.len() / 3].byte;
+        let ee = all[2 * all.len() / 3].byte + 1;
+        let got = run_worker(&data, "ERROR", false, true, Some((ss, ee)));
+        let want: Vec<&Hit> = all
+            .iter()
+            .filter(|h| {
+                let gp = h.byte + h.col_start as u64;
+                gp >= ss && gp < ee
+            })
+            .collect();
+        assert_eq!(got.len(), want.len());
+        for (g, w) in got.iter().zip(want.iter()) {
+            assert_eq!((g.line, g.byte), (w.line, w.byte));
+        }
+    }
 }

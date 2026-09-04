@@ -87,3 +87,44 @@ Kontrak performa (dari `asislog-agent-prompt.md`):
 
 Sampai tabel terisi, klaim resmi proyek: **"setara untuk literal,
 belum tentu untuk regex kompleks"**.
+
+## 5. Hasil terukur — file nyata 12 GB (2026-09-04)
+
+File: `coba.txt` 12.16 GB (13.059.672.771 byte), dump SQL ASCII/CRLF,
+**337.662.998 baris**, 335.298 checkpoint.
+Mesin: Intel i5-10400, RAM 16 GB (±5 GB bebas), Windows 11.
+Kondisi: dingin (file > page cache; tiap pindai penuh baca dari disk).
+
+Harness: `examples/bench12.rs` (sementara, sudah dihapus) — mmap +
+pencarian chunked 4 MiB persis jalur worker GUI (`spawn_search`):
+lapor hit yang mulai di region segar, overlap lookahead, hit dibatasi
+200.000 seperti `MAX_STORED_HITS`, nomor baris via tillegg berjalan.
+
+| Metrik | AsisLog (engine) | klogg 24.11.0.1685 (GUI) |
+|---|---|---|
+| Indeks/open 12 GB | **24,05 dtk (517,9 MB/s)** | **±40 dtk** (CPU aktif s.d. datar; jendela langsung tampil) |
+| Memori puncak (working set) | 11,2 GB = halaman mmap tersentuh (heap hanya puluhan MB: checkpoint ±5 MB + hit ±6 MB) | **980 MB → menetap 573 MB** (heap: penyimpan posisi baris terkompresi) |
+| Cari literal `DELETE FROM` (1,37 jt occ, cap 200rb) | 42,45 dtk penuh, **500 hasil pertama 0,50 dtk** | (tidak terukur headless — tanpa CLI search) |
+| Cari literal `TRANSACTION` (15,2 jt occ, cap 200rb) | 26,14 dtk penuh, **500 hasil pertama 0,01 dtk** | (tidak terukur headless) |
+| Cari regex `DELETE\|INSERT` (cap 200rb) | 24,74 dtk penuh, **500 pertama 0,01 dtk** | (tidak terukur headless) |
+| Cari regex `BEGIN TRANSACTION-\d+` | 26,23 dtk | (tidak terukur headless) |
+| Seek 2000 baris acak via checkpoint | **0,219 dtk (rata-rata 0,11 ms)** | — |
+| Pembanding netral `findstr /c:"DELETE FROM"` | — | 20,2 dtk (tanpa nomor baris) |
+
+Catatan jujur:
+
+- Kedua aplikasi **lolos file 12 GB / 338 jt baris tanpa crash**.
+- Indeks AsisLog lebih cepat (24 vs ±40 dtk) karena checkpoint jarang;
+  imbalannya tiap pencarian memindai ulang, sedangkan klogg membayar
+  indeks penuh sekali lalu cari di atas posisi terkompresi.
+- Angka working set AsisLog (11 GB) adalah halaman mmap yang bisa
+  dibuang OS kapan saja, bukan alokasi heap — tapi di mesin RAM kecil
+  (<8 GB) ini menekan page cache lebih keras daripada model baca-blok
+  klogg. Klaim `<250 MB` hanya benar untuk heap, bukan working set.
+- Kemenangan UX AsisLog: hasil pertama mengalir dalam **<0,5 dtk**
+  selagi pindai latar 30–40 dtk berjalan (progress + cancel).
+  Itu perilaku yang dirasakan pengguna, bukan angka pindai penuh.
+- `findstr` 20 dtk vs AsisLog 42 dtk untuk pola yang sama: findstr
+  tidak menghitung nomor baris dan memakai cache lebih hangat.
+  PR optimasi: petakan nomor baris lebih murah (hitung `\n` inkremental
+  per match, bukan tabel starts + binary search per chunk).

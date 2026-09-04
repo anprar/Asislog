@@ -476,15 +476,13 @@ impl TabState {
     }
 
     pub(crate) fn view_row_of_line(&self, line: u64) -> Option<u64> {
+        // Both maps are sorted ascending (hits/bookmarks/filter all append in
+        // scan order; bookmarks re-sorted on insert), so binary search.
         if self.view_mode != ViewMode::All {
-            return self
-                .mode_lines
-                .iter()
-                .position(|&l| l == line)
-                .map(|i| i as u64);
+            return self.mode_lines.binary_search(&line).ok().map(|i| i as u64);
         }
         if self.doc.filter_active {
-            self.doc.filter_map.iter().position(|&l| l == line).map(|i| i as u64)
+            self.doc.filter_map.binary_search(&line).ok().map(|i| i as u64)
         } else {
             if line < 1 {
                 return None;
