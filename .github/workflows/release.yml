@@ -30,9 +30,11 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             out: asislog-windows.exe
+            zip: asislog-windows.zip
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             out: asislog-linux
+            zip: asislog-linux.zip
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -52,10 +54,32 @@ jobs:
           else
             cp "target/${{ matrix.target }}/release/asislog" "${{ matrix.out }}"
           fi
+      - name: Smoke test (--version must print and exit 0)
+        shell: bash
+        run: ./"${{ matrix.out }}" --version | grep "AsisLog"
+      - name: Install UPX (Windows)
+        if: matrix.os == 'windows-latest'
+        run: choco install upx -y
+      - name: Install UPX (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y upx-ucl
+      - name: Compress with UPX (--lzma)
+        shell: bash
+        run: upx --lzma --best "${{ matrix.out }}"
+      - name: Pack ZIP (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: powershell
+        run: Compress-Archive -Path "${{ matrix.out }}" -DestinationPath "${{ matrix.zip }}" -Force
+      - name: Pack ZIP (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: zip -j "${{ matrix.zip }}" "${{ matrix.out }}"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.out }}
-          path: ${{ matrix.out }}
+          path: |
+            ${{ matrix.out }}
+            ${{ matrix.zip }}
           if-no-files-found: error
 
   # Attach binaries to the GitHub Release when triggered by a v* tag.

@@ -531,6 +531,18 @@ impl AsisLogApp {
         }
     }
 
+    /// Open files passed on the command line (public for the binary crate).
+    /// Missing files become a status message, never a panic or dialog.
+    pub fn open_files(&mut self, files: Vec<PathBuf>) {
+        for p in files {
+            if p.exists() {
+                self.open_file(p);
+            } else {
+                self.global_status = format!("File tidak ditemukan: {}", p.display());
+            }
+        }
+    }
+
     pub(crate) fn open_file(&mut self, path: PathBuf) {
         // Arsip (zip/tar/gz): ekstrak entri teks terbaik ke temp dulu.
         let opened = match crate::engine::archive::open_maybe_archive(&path) {

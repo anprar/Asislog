@@ -31,6 +31,26 @@ cargo build --release
 
 Pengguna tidak perlu menginstal Rust untuk **menjalankan** biner.
 
+## Rilis portable (maintainer)
+
+Biner rilis tanpa jendela console, sudah dioptimasi ukuran (`opt-level=z`,
+LTO, strip ≈ 7 MB), lalu dikompresi UPX `--lzma` (≈ 2,5 MB) dan di-ZIP.
+CI (`release.yml`, picu tag `v*`) mengerjakan semuanya otomatis: tes →
+build Windows+Linux → smoke test `--version` → UPX → ZIP → GitHub Release.
+
+Lokal (Windows):
+
+```powershell
+cargo build --release
+.\target\release\asislog.exe --version   # smoke test
+winget install -e --id UPX.UPX          # sekali saja
+upx --lzma --best .\target\release\asislog.exe
+Compress-Archive .\target\release\asislog.exe asislog-windows.zip -Force
+```
+
+CLI: `asislog [FILE]...` membuka file langsung sebagai tab;
+`asislog --version` / `--help` tanpa membuka GUI.
+
 ## Penggunaan singkat
 
 - **Buka**: `Ctrl+O`, atau seret file ke jendela. Beberapa file dibuka sebagai tab.

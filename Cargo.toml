@@ -30,3 +30,10 @@ ureq = { version = "3", features = ["rustls"] }
 
 [dev-dependencies]
 tempfile = "3"
+
+# Portable release binary: small + fast to download, still fully optimized.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
