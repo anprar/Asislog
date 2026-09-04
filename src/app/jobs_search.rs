@@ -502,7 +502,7 @@ pub(crate) fn spawn_bool_search(
             })
             .filter(|p| !p.is_empty());
         let required_finder: Option<memchr::memmem::Finder> =
-            required_pat.as_ref().map(|p| memchr::memmem::Finder::new(p));
+            required_pat.as_deref().map(memchr::memmem::Finder::new);
         // Scratch fold buffer (reused per line, no realloc churn).
         let mut fold_buf: Vec<u8> = Vec::new();
         let mut line_no: u64 = 1;
@@ -570,14 +570,14 @@ pub(crate) fn spawn_bool_search(
             }
             // Prefilter hierarki: required-term tunggal (paling selektif,
             // subsumes union) dulu, lalu union AC, lalu jalur eksak.
-            if required_finder.is_some() {
+            if let Some(f) = required_finder.as_ref() {
                 let hit = if case_sensitive {
-                    required_finder.as_ref().unwrap().find(bytes).is_some()
+                    f.find(bytes).is_some()
                 } else {
                     fold_buf.clear();
                     fold_buf.extend_from_slice(bytes);
                     fold_buf.make_ascii_lowercase();
-                    required_finder.as_ref().unwrap().find(&fold_buf).is_some()
+                    f.find(&fold_buf).is_some()
                 };
                 if !hit {
                     line_no += 1;

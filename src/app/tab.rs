@@ -553,7 +553,7 @@ impl TabState {
         let Some((sb, sl)) = self.tail_anchor(old_bytes, old_lines) else {
             return;
         };
-        self.doc.filter_map.retain(|&l| l != sl);
+        self.doc.filter_map.remove(sl);
         let (tx, rx) = mpsc::channel();
         self.filter_rx = Some(rx);
         self.filter_append = true;
@@ -695,16 +695,16 @@ impl TabState {
                     self.doc.filter_active = true;
                     self.doc.status = format!(
                         "Filter: {} baris cocok (+{} baru).",
-                        format_count(self.doc.filter_map.len() as u64),
+                        format_count(self.doc.filter_map.len()),
                         format_count(added as u64),
                     );
                 } else {
-                    self.doc.filter_map = map;
+                    self.doc.filter_map.replace_with(map);
                     self.doc.filter_active = true;
                     self.top_row = 0;
                     self.doc.status = format!(
                         "Filter aktif: {} baris cocok.",
-                        format_count(self.doc.filter_map.len() as u64)
+                        format_count(self.doc.filter_map.len())
                     );
                 }
                 self.filter_rx = None;
@@ -778,13 +778,12 @@ impl TabState {
     }
 
     pub(crate) fn view_row_of_line(&self, line: u64) -> Option<u64> {
-        // Both maps are sorted ascending (hits/bookmarks/filter all append in
-        // scan order; bookmarks re-sorted on insert), so binary search.
+        // mode_lines terurut (binary search); filter_map bitmap terkompresi.
         if self.view_mode != ViewMode::All {
             return self.mode_lines.binary_search(&line).ok().map(|i| i as u64);
         }
         if self.doc.filter_active {
-            self.doc.filter_map.binary_search(&line).ok().map(|i| i as u64)
+            self.doc.filter_map.line_to_row(line)
         } else {
             if line < 1 {
                 return None;
@@ -1126,9 +1125,14 @@ mod tests {
         drain_filter(&mut tab);
         assert_eq!(tab.doc.filter_map.len(), 35);
         assert!(tab.doc.filter_active);
-        let mut sorted = tab.doc.filter_map.clone();
+        // Bitmap selalu terurut: iterasi == versi sort.
+        let got: Vec<u64> = tab.doc.filter_map.iter().collect();
+        let mut sorted = got.clone();
         sorted.sort_unstable();
-        assert_eq!(tab.doc.filter_map, sorted);
+        assert_eq!(got, sorted);
+        // Spot-check isi: ERROR tiap 100 baris + 5 baris ekor.
+        assert_eq!(got[0], 1);
+        assert_eq!(got[30], 3001);
     }
 
     #[test]

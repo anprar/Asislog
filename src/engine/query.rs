@@ -563,6 +563,7 @@ mod tests {
             let ast = parse_query(q).unwrap();
             let terms = ast.positive_terms();
             let req = ast.required_terms();
+            let safe = ast.is_prefilter_safe();
             for ln in lines {
                 if ast.matches(ln, false) {
                     let low = ln.to_ascii_lowercase();
@@ -573,6 +574,14 @@ mod tests {
                             q,
                             ln,
                             r
+                        );
+                    }
+                    if safe {
+                        assert!(
+                            terms.iter().any(|t| low.contains(&t.to_ascii_lowercase())),
+                            "query {:?} matched {:?} without any positive term",
+                            q,
+                            ln
                         );
                     }
                 }

@@ -12,6 +12,7 @@ pub mod filter;
 pub mod follow;
 pub mod index;
 pub mod jsonlog;
+pub mod lineset;
 pub mod marks;
 pub mod mmap;
 pub mod query;
@@ -21,6 +22,7 @@ pub mod search;
 pub use decode::Encoding;
 pub use filter::ParsedFilter;
 pub use index::SparseIndex;
+pub use lineset::LineSet;
 pub use search::Hit;
 
 /// Max bytes allowed through clipboard (16 MB per spec).
@@ -157,7 +159,9 @@ pub struct Doc {
     pub search_error: Option<String>,
     pub search_in_progress: bool,
     pub filter: ParsedFilter,
-    pub filter_map: Vec<u64>,
+    /// Filtered view rows -> original lines, roaring-compressed
+    /// (a 200M-line match costs MBs, not 1.6 GB).
+    pub filter_map: LineSet,
     pub filter_active: bool,
     pub follow: bool,
     pub stick_bottom: bool,
@@ -213,7 +217,7 @@ impl Doc {
                 search_error: None,
                 search_in_progress: false,
                 filter: ParsedFilter::default(),
-                filter_map: Vec::new(),
+                filter_map: LineSet::new(),
                 filter_active: false,
                 follow: false,
                 stick_bottom: false,
@@ -245,7 +249,7 @@ impl Doc {
             search_error: None,
             search_in_progress: false,
             filter: ParsedFilter::default(),
-            filter_map: Vec::new(),
+            filter_map: LineSet::new(),
             filter_active: false,
             follow: false,
             stick_bottom: false,
@@ -285,7 +289,7 @@ impl Doc {
     /// Total rows in current view (filter_map when filter active).
     pub fn view_row_count(&self) -> u64 {
         if self.filter_active {
-            self.filter_map.len() as u64
+            self.filter_map.len()
         } else if self.index.complete {
             self.index.total_lines
         } else {
@@ -310,7 +314,7 @@ impl Doc {
 
     pub fn view_row_to_line(&self, row: u64) -> Option<u64> {
         if self.filter_active {
-            self.filter_map.get(row as usize).copied()
+            self.filter_map.row_to_line(row)
         } else {
             let n = self.view_row_count();
             if row < n {
@@ -359,14 +363,17 @@ impl Doc {
     pub fn get_lines(&mut self, start: u64, count: usize) -> Vec<LineView> {
         let mut out = Vec::new();
         if self.filter_active {
-            // Indeks langsung ke filter_map (terurut) tanpa clone vec.
-            let s = (start.saturating_sub(1)) as usize;
-            let n = self.filter_map.len();
-            for k in s..n {
-                if out.len() >= count {
-                    break;
+            // Select per baris (O(log)) agar start dalam tetap murah;
+            // kumpulkan dulu agar pinjam tak bentrok dengan decode &mut.
+            let s = start.saturating_sub(1);
+            let mut lns = Vec::new();
+            for k in 0..count as u64 {
+                match self.filter_map.row_to_line(s + k) {
+                    Some(ln) => lns.push(ln),
+                    None => break,
                 }
-                let ln = self.filter_map[k];
+            }
+            for ln in lns {
                 let text = self.get_line_text(ln).unwrap_or_default();
                 let byte = self.line_byte_range(ln).map(|(b, _)| b).unwrap_or(0);
                 out.push(LineView {

@@ -716,7 +716,7 @@ pub(crate) fn apply_time_range(tab: &mut TabState, start: &str, end: &str) -> Re
         hi = lo + CAP - 1;
         truncated = true;
     }
-    tab.doc.filter_map = (lo..=hi).collect();
+    tab.doc.filter_map = crate::engine::LineSet::from_lines(lo..=hi);
     tab.doc.filter_active = true;
     tab.doc.filter = parse_filter("", tab.case_sensitive);
     tab.doc.filter.raw = format!("waktu {} s.d. {}", start.trim(), end.trim());

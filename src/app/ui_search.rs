@@ -383,7 +383,7 @@ impl AsisLogApp {
                         format!(
                             "Filter aktif: {} · {}/{} baris",
                             tab.doc.filter.raw,
-                            format_count(tab.doc.filter_map.len() as u64),
+                            format_count(tab.doc.filter_map.len()),
                             format_count(total),
                         ),
                     );

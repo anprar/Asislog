@@ -164,7 +164,7 @@ impl AsisLogApp {
                             ui.label(if tab.doc.filter_active {
                                 format!(
                                     "Filter: aktif ({})",
-                                    format_count(tab.doc.filter_map.len() as u64)
+                                    format_count(tab.doc.filter_map.len())
                                 )
                             } else {
                                 String::from("Filter: mati")
