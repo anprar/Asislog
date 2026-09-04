@@ -1,0 +1,20 @@
+# Rust build output — never commit (portable binary built in CI)
+target/
+# Cargo lock: keep for binary crate (reproducible CI), so NOT ignored.
+
+# AsisLog runtime sidecars / caches (per-file, regenerable, user-local)
+*.asisidx
+*.asislog.json
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Local test / benchmark artifacts
+*.profraw
+perf-*.log
+bench-data/
