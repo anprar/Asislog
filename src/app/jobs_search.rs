@@ -827,36 +827,49 @@ pub(crate) fn spawn_bool_search(
             .map(|s| s.to_string())
             .collect();
         let term_refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
-        // Byte prefilter over positive terms (Aho-Corasick, zero decode):
-        // only candidate lines pay decode + full AST eval. Enabled solely
-        // when the union is sound (Query::is_prefilter_safe); otherwise every
-        // line still goes through the exact path below.
-        let prefilter: Option<aho_corasick::AhoCorasick> =
-            if ast.is_prefilter_safe() && !terms.is_empty() {
-                let mut builder = aho_corasick::AhoCorasickBuilder::new();
-                if !case_sensitive {
-                    builder.ascii_case_insensitive(true);
-                }
-                builder.build(&terms).ok()
-            } else {
-                None
-            };
+        // Byte prefilter plan (engine/query.rs): union automaton, required
+        // Finder, or both — chosen so every skipped line provably cannot
+        // match. Insensitive queries fold each line for the Finder, so the
+        // union (native ASCII case-fold, zero-alloc) rejects first there.
+        let plan = ast.prefilter_plan(case_sensitive);
+        let use_union = matches!(
+            plan,
+            crate::engine::query::PrefilterPlan::UnionThenRequired
+                | crate::engine::query::PrefilterPlan::UnionOnly
+        );
+        let use_required = matches!(
+            plan,
+            crate::engine::query::PrefilterPlan::UnionThenRequired
+                | crate::engine::query::PrefilterPlan::RequiredOnly
+        );
+        let prefilter: Option<aho_corasick::AhoCorasick> = if use_union && !terms.is_empty() {
+            let mut builder = aho_corasick::AhoCorasickBuilder::new();
+            if !case_sensitive {
+                builder.ascii_case_insensitive(true);
+            }
+            builder.build(&terms).ok()
+        } else {
+            None
+        };
         // Conjunction-aware fast path: every full match must contain each
         // required term, so ONE Finder on the longest (= most selective)
         // beats the union automaton and subsumes it (its passers are a
         // subset of union passers). Sound for any shape, no safety gate.
-        let required_pat: Option<Vec<u8>> = ast
-            .required_terms()
-            .into_iter()
-            .max_by_key(|t| t.len())
-            .map(|t| {
-                if case_sensitive {
-                    t.as_bytes().to_vec()
-                } else {
-                    t.as_bytes().to_ascii_lowercase()
-                }
-            })
-            .filter(|p| !p.is_empty());
+        let required_pat: Option<Vec<u8>> = if use_required {
+            ast.required_terms()
+                .into_iter()
+                .max_by_key(|t| t.len())
+                .map(|t| {
+                    if case_sensitive {
+                        t.as_bytes().to_vec()
+                    } else {
+                        t.as_bytes().to_ascii_lowercase()
+                    }
+                })
+                .filter(|p| !p.is_empty())
+        } else {
+            None
+        };
         let required_finder: Option<memchr::memmem::Finder> =
             required_pat.as_deref().map(memchr::memmem::Finder::new);
         // Scratch fold buffer (reused per line, no realloc churn).
@@ -924,26 +937,33 @@ pub(crate) fn spawn_bool_search(
                     continue;
                 }
             }
-            // Prefilter hierarki: required-term tunggal (paling selektif,
-            // subsumes union) dulu, lalu union AC, lalu jalur eksak.
-            if let Some(f) = required_finder.as_ref() {
-                let hit = if case_sensitive {
-                    f.find(bytes).is_some()
-                } else {
-                    fold_buf.clear();
-                    fold_buf.extend_from_slice(bytes);
-                    fold_buf.make_ascii_lowercase();
-                    f.find(&fold_buf).is_some()
-                };
-                if !hit {
-                    line_no += 1;
-                    continue;
+            // Prefilter hierarchy per plan: union rejects first when present
+            // (cheap, zero-alloc), required Finder second; exact path last.
+            // UnionThenRequired keeps both sound: union only runs under the
+            // safety gate, required is sound for any shape.
+            if use_union {
+                if let Some(ac) = prefilter.as_ref() {
+                    // Byte prefilter: lines without any positive term cannot match.
+                    if !ac.is_match(bytes) {
+                        line_no += 1;
+                        continue;
+                    }
                 }
-            } else if let Some(ac) = prefilter.as_ref() {
-                // Byte prefilter: lines without any positive term cannot match.
-                if !ac.is_match(bytes) {
-                    line_no += 1;
-                    continue;
+            }
+            if use_required {
+                if let Some(f) = required_finder.as_ref() {
+                    let hit = if case_sensitive {
+                        f.find(bytes).is_some()
+                    } else {
+                        fold_buf.clear();
+                        fold_buf.extend_from_slice(bytes);
+                        fold_buf.make_ascii_lowercase();
+                        f.find(&fold_buf).is_some()
+                    };
+                    if !hit {
+                        line_no += 1;
+                        continue;
+                    }
                 }
             }
             let text = crate::engine::decode::decode_bytes(bytes, encoding);
@@ -1260,11 +1280,17 @@ mod tests {
             data.extend_from_slice(line.as_bytes());
         }
         // Safe query (prefilter on), required-only query, and fully
-        // unprefilterable query (union unsafe + required empty).
+        // unprefilterable query (union unsafe + required empty). Case
+        // variants added for every prefilter plan: RequiredOnly (both
+        // modes), UnionOnly, UnionThenRequired (insensitive reorder).
         for (q, cs) in [
             ("error timeout", false),
             ("ERROR -DEBUG", true),
             ("ERROR OR -DEBUG", true),
+            ("ERROR timeout", false),
+            ("ERROR OR WARN", false),
+            ("ERROR OR -DEBUG", false),
+            ("OutOfMemoryError heap", false),
         ] {
             let got = run_bool_worker(&data, q, cs);
             let want = oracle_bool(&data, q, cs);

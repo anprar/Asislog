@@ -93,6 +93,44 @@ impl Query {
             Query::Or(_) => {}
         }
     }
+
+    /// Byte-prefilter execution plan for one worker scan.
+    /// The required-term Finder is sound for ANY shape (a full match always
+    /// contains every required term), while the positive-term union needs
+    /// the `is_prefilter_safe` gate. Case-insensitive required matching
+    /// must fold each line (a full extra pass), so there the zero-alloc
+    /// union automaton (native ASCII case-fold) rejects first and the
+    /// Finder only runs on survivors.
+    pub fn prefilter_plan(&self, case_sensitive: bool) -> PrefilterPlan {
+        let has_required = !self.required_terms().is_empty();
+        if !self.is_prefilter_safe() {
+            return if has_required {
+                PrefilterPlan::RequiredOnly
+            } else {
+                PrefilterPlan::None
+            };
+        }
+        let has_terms = !self.positive_terms().is_empty();
+        match (has_required, case_sensitive, has_terms) {
+            (true, true, _) => PrefilterPlan::RequiredOnly,
+            (true, false, _) => PrefilterPlan::UnionThenRequired,
+            (false, _, true) => PrefilterPlan::UnionOnly,
+            (false, _, false) => PrefilterPlan::None,
+        }
+    }
+}
+
+/// Byte-prefilter execution plan, see `Query::prefilter_plan`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PrefilterPlan {
+    /// One SIMD Finder on the longest required term (subsumes the union).
+    RequiredOnly,
+    /// Union automaton rejects first, Finder runs only on survivors.
+    UnionThenRequired,
+    /// Union automaton only (no required term, e.g. pure OR).
+    UnionOnly,
+    /// No sound byte prefilter: every line takes the exact path.
+    None,
 }
 
 fn contains(hay: &str, needle: &str, case_sensitive: bool) -> bool {
@@ -538,6 +576,32 @@ mod tests {
                 Query::Not(Box::new(Query::Term("debug".into()))),
             ])
         );
+    }
+
+    #[test]
+    fn prefilter_plan_shapes() {
+        use PrefilterPlan::*;
+        // Conjunction: required term exists in both modes.
+        let q = parse_query("err timeout -debug").unwrap();
+        assert_eq!(q.prefilter_plan(true), RequiredOnly);
+        // Unsafe overall (OR with negation) but required term usable alone.
+        let q = parse_query("err AND (timeout OR -debug)").unwrap();
+        assert!(!q.is_prefilter_safe());
+        assert_eq!(q.prefilter_plan(true), RequiredOnly);
+        assert_eq!(q.prefilter_plan(false), RequiredOnly);
+        // Pure OR: union only.
+        let q = parse_query("a OR b").unwrap();
+        assert_eq!(q.prefilter_plan(true), UnionOnly);
+        assert_eq!(q.prefilter_plan(false), UnionOnly);
+        // Required + insensitive: union rejects first (native case-fold),
+        // Finder runs on survivors only.
+        let q = parse_query("OutOfMemoryError heap").unwrap();
+        assert_eq!(q.prefilter_plan(true), RequiredOnly);
+        assert_eq!(q.prefilter_plan(false), UnionThenRequired);
+        // Bare negation: nothing sound.
+        let q = parse_query("-debug").unwrap();
+        assert_eq!(q.prefilter_plan(true), None);
+        assert_eq!(q.prefilter_plan(false), None);
     }
 
     #[test]
