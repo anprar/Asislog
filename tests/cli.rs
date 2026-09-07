@@ -142,5 +142,26 @@ fn cli_grep_subcommand() {
         .output()
         .expect("spawn");
     assert_eq!(out_err.status.code(), Some(2));
+
+    // 6. Language flag BEFORE the subcommand still routes to grep
+    // (regression: it used to fall through and launch the GUI).
+    let out_lang = Command::new(exe())
+        .args(["--lang", "en", "grep", "-c", "ERROR", file.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .output()
+        .expect("spawn");
+    assert!(out_lang.status.success());
+    assert_eq!(String::from_utf8_lossy(&out_lang.stdout).trim(), "1");
+
+    // 7. A pattern literally named "en" is searchable, not swallowed.
+    let file2 = dir.path().join("words.log");
+    std::fs::write(&file2, "open ticket\ngolden hour\n").unwrap();
+    let out_en = Command::new(exe())
+        .args(["grep", "-c", "en", file2.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .output()
+        .expect("spawn");
+    assert!(out_en.status.success());
+    assert_eq!(String::from_utf8_lossy(&out_en.stdout).trim(), "2");
 }
 

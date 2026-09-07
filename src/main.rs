@@ -48,13 +48,16 @@ fn say(line: &str) {
 }
 
 fn main() -> eframe::Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
     // UI language for CLI: --lang en|id, -L en|id, or ASISLOG_LANG env.
     // GUI persists in config.json; CLI defaults to Indonesian (backward compatible).
     // Portable: no install, no registry, single binary unchanged.
-    let cli_lang = {
-        let mut lang = std::env::var("ASISLOG_LANG").unwrap_or_default();
-        let mut it = args.iter().peekable();
+    // Strip language flags FIRST so `asislog --lang en grep ...` still
+    // routes to the subcommand instead of launching the GUI.
+    let mut lang = std::env::var("ASISLOG_LANG").unwrap_or_default();
+    let mut args: Vec<String> = Vec::with_capacity(raw_args.len());
+    {
+        let mut it = raw_args.iter().peekable();
         while let Some(a) = it.next() {
             if a == "--lang" || a == "-L" {
                 if let Some(v) = it.next() {
@@ -62,10 +65,12 @@ fn main() -> eframe::Result<()> {
                 }
             } else if let Some(v) = a.strip_prefix("--lang=") {
                 lang = v.to_string();
+            } else {
+                args.push(a.clone());
             }
         }
-        asislog::i18n::Lang::from_key(&lang)
-    };
+    }
+    let cli_lang = asislog::i18n::Lang::from_key(&lang);
     let is_id = cli_lang != asislog::i18n::Lang::En;
     let is_subcommand = !args.is_empty() && (args[0] == "grep" || args[0] == "count");
     let cli = is_subcommand
@@ -179,12 +184,6 @@ fn main() -> eframe::Result<()> {
                 show_line_num = true;
             } else if a == "-c" || a == "--count" {
                 count_only = true;
-            } else if a == "--lang" || a == "-L" {
-                // consumed above; skip its value too when it looks like en/id
-                continue;
-            } else if a == "en" || a == "id" {
-                // possible --lang value; ignore as pattern/file
-                continue;
             } else if pattern.is_none() {
                 pattern = Some(a.as_str());
             } else if file_path.is_none() {
