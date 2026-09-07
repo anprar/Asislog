@@ -48,6 +48,19 @@ impl LineSet {
         self.inner.extend(it.into_iter().filter_map(|l| u32::try_from(l).ok()));
     }
 
+    /// Insert one line. Beyond u32::MAX the line is skipped (same rule as
+    /// the bulk constructors; documented, never panics).
+    pub fn insert(&mut self, line: u64) {
+        if let Ok(l) = u32::try_from(line) {
+            self.inner.insert(l);
+        }
+    }
+
+    /// Union another set in (roaring-native, no re-sort).
+    pub fn absorb(&mut self, other: LineSet) {
+        self.inner |= other.inner;
+    }
+
     /// Replace the whole set.
     pub fn replace_with(&mut self, it: impl IntoIterator<Item = u64>) {
         *self = Self::from_lines(it);

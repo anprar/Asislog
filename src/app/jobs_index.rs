@@ -170,18 +170,19 @@ pub(crate) fn spawn_filter(
     encoding: Encoding,
     _bom_len: usize,
     f: ParsedFilter,
-    tx: mpsc::Sender<(Vec<u64>, bool)>,
+    tx: mpsc::Sender<crate::engine::LineSet>,
     // Tail refresh: mulai dari (byte, nomor baris 1-based) alih-alih 0.
     // Penelepon menjamin byte adalah awal baris; semua nomor yang
     // dihasilkan >= nomor awal sehingga penggabungan tetap terurut.
     tail_from: Option<(u64, u64)>,
+    cancel: Arc<AtomicBool>,
 ) {
     std::thread::spawn(move || {
         use std::io::{BufRead, Seek, SeekFrom};
         let file = match std::fs::File::open(&path) {
             Ok(x) => x,
             Err(_) => {
-                let _ = tx.send((Vec::new(), false));
+                let _ = tx.send(crate::engine::LineSet::new());
                 return;
             }
         };
@@ -193,11 +194,21 @@ pub(crate) fn spawn_filter(
                 line_no = sl.max(1);
             }
         }
-        let mut map: Vec<u64> = Vec::new();
+        // No match cap: results stream straight into a roaring bitmap
+        // (200M consecutive lines ≈ 43 KB), so the old silent 5M-line
+        // truncation is gone — reported counts are always exact.
+        let mut map = crate::engine::LineSet::new();
         let mut buf: Vec<u8> = Vec::new();
-        let cap = 5_000_000usize;
-        let mut truncated = false;
+        // Pre-cancelled (superseded before first line): send nothing.
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
         loop {
+            // Cooperative cancel so a superseded filter stops promptly
+            // instead of burning a full scan nobody will read.
+            if line_no & 4095 == 0 && cancel.load(Ordering::Relaxed) {
+                return;
+            }
             buf.clear();
             match reader.read_until(b'\n', &mut buf) {
                 Ok(0) => break,
@@ -217,15 +228,14 @@ pub(crate) fn spawn_filter(
                 crate::engine::filter::line_bytes_match(line_bytes, encoding, &f)
             };
             if ok {
-                map.push(line_no);
-                if map.len() >= cap {
-                    truncated = true;
-                    break;
-                }
+                map.insert(line_no);
             }
             line_no += 1;
         }
-        let _ = tx.send((map, truncated));
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        let _ = tx.send(map);
     });
 }
 
@@ -564,6 +574,65 @@ mod tests {
             }
         }
         (msgs, out)
+    }
+
+    fn run_filter(path: PathBuf, query: &str) -> crate::engine::LineSet {
+        let (tx, rx) = mpsc::channel();
+        spawn_filter(
+            path,
+            Encoding::Utf8,
+            0,
+            parse_filter(query, true),
+            tx,
+            None,
+            Arc::new(AtomicBool::new(false)),
+        );
+        rx.recv_timeout(Duration::from_secs(60)).expect("filter finished")
+    }
+
+    #[test]
+    fn filter_reports_exact_count_with_roaring_heap() {
+        // 100k consecutive matches: the old Vec+5M-cap design is gone —
+        // exact count, and a heap a fraction of the old 800 KB Vec.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dense.log");
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&path).unwrap();
+            for i in 0..100_000u64 {
+                writeln!(f, "2026-09-04 ERROR id={}", i).unwrap();
+            }
+        }
+        let map = run_filter(path, "ERROR");
+        assert_eq!(map.len(), 100_000);
+        assert_eq!(map.iter().next(), Some(1));
+        assert_eq!(map.iter().last(), Some(100_000));
+        assert!(
+            map.heap_bytes() < 100_000,
+            "roaring heap must stay tiny, got {}",
+            map.heap_bytes()
+        );
+    }
+
+    #[test]
+    fn filter_precancelled_sends_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.log");
+        std::fs::write(&path, "2026-09-04 ERROR x\n").unwrap();
+        let (tx, rx) = mpsc::channel();
+        spawn_filter(
+            path,
+            Encoding::Utf8,
+            0,
+            parse_filter("ERROR", true),
+            tx,
+            None,
+            Arc::new(AtomicBool::new(true)),
+        );
+        assert!(
+            rx.recv_timeout(Duration::from_secs(2)).is_err(),
+            "cancelled worker must stay silent"
+        );
     }
 
     #[test]

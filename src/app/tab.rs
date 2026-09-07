@@ -112,7 +112,10 @@ pub(crate) struct TabState {
     pub(crate) export_context: usize,
     pub(crate) index_rx: Option<mpsc::Receiver<IndexUpdate>>,
     pub(crate) search_rx: Option<mpsc::Receiver<SearchBatchMsg>>,
-    pub(crate) filter_rx: Option<mpsc::Receiver<(Vec<u64>, bool)>>,
+    pub(crate) filter_rx: Option<mpsc::Receiver<crate::engine::LineSet>>,
+    /// Cancel flag for the in-flight filter worker (a superseding filter
+    /// or clear stops it promptly instead of wasting a full scan).
+    pub(crate) filter_cancel: Arc<AtomicBool>,
     /// Peta bucket ERROR/WARN (512 byte) + ukuran file saat dipindai.
     pub(crate) marker_bits: Option<Vec<u8>>,
     pub(crate) marker_size: u64,
@@ -202,6 +205,7 @@ impl TabState {
             index_rx: Some(index_rx),
             search_rx: None,
             filter_rx: None,
+            filter_cancel: Arc::new(AtomicBool::new(false)),
             marker_bits: None,
             marker_size: 0,
             marker_rx: None,
@@ -418,6 +422,9 @@ impl TabState {
     }
 
     pub(crate) fn start_filter(&mut self, query: String) {
+        // A superseding filter (or clear) retires the running worker first.
+        self.filter_cancel.store(true, Ordering::Relaxed);
+        self.filter_rx = None;
         let f = parse_filter(&query, self.case_sensitive);
         self.doc.filter = f.clone();
         self.range_applied = None;
@@ -430,6 +437,8 @@ impl TabState {
         }
         self.doc.filter_active = false; // aktif setelah selesai
         self.doc.status = String::from("Memfilter…");
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.filter_cancel = cancel.clone();
         let (tx, rx) = mpsc::channel();
         self.filter_rx = Some(rx);
         spawn_filter(
@@ -439,6 +448,7 @@ impl TabState {
             f,
             tx,
             None,
+            cancel,
         );
         self.top_row = 0;
     }
@@ -559,6 +569,8 @@ impl TabState {
             return;
         };
         self.doc.filter_map.remove(sl);
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.filter_cancel = cancel.clone();
         let (tx, rx) = mpsc::channel();
         self.filter_rx = Some(rx);
         self.filter_append = true;
@@ -570,6 +582,7 @@ impl TabState {
             self.doc.filter.clone(),
             tx,
             Some((sb, sl)),
+            cancel,
         );
     }
 
@@ -688,15 +701,16 @@ impl TabState {
                 }
             }
         }
-        // Filter result
+        // Filter result (exact counts: the worker streams into a roaring
+        // bitmap with no match cap, so nothing here is truncated).
         if let Some(rx) = &self.filter_rx {
-            if let Ok((map, _trunc)) = rx.try_recv() {
+            if let Ok(map) = rx.try_recv() {
                 if self.filter_append {
                     // Gabungan ekor: filter_map lama tetap terurut, ekor
                     // bernomor lebih besar -> extend + posisi dipertahankan.
                     self.filter_append = false;
                     let added = map.len();
-                    self.doc.filter_map.extend(map);
+                    self.doc.filter_map.absorb(map);
                     self.doc.filter_active = true;
                     self.doc.status = format!(
                         "Filter: {} baris cocok (+{} baru).",
@@ -704,7 +718,7 @@ impl TabState {
                         format_count(added as u64),
                     );
                 } else {
-                    self.doc.filter_map.replace_with(map);
+                    self.doc.filter_map = map;
                     self.doc.filter_active = true;
                     self.top_row = 0;
                     self.doc.status = format!(
@@ -965,6 +979,7 @@ impl TabState {
                 self.gen_shared.store(self.doc.search_gen, Ordering::Relaxed);
                 self.search_cancel.store(true, Ordering::Relaxed);
                 self.search_rx = None;
+                self.filter_cancel.store(true, Ordering::Relaxed);
                 self.filter_rx = None;
                 self.search_merge_quiet = false;
                 self.filter_append = false;
