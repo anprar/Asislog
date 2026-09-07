@@ -569,6 +569,9 @@ impl TabState {
             return;
         };
         self.doc.filter_map.remove(sl);
+        // Retire the previous tail worker first (same rule as start_filter:
+        // a superseded scan must stop, not burn to completion unread).
+        self.filter_cancel.store(true, Ordering::Relaxed);
         let cancel = Arc::new(AtomicBool::new(false));
         self.filter_cancel = cancel.clone();
         let (tx, rx) = mpsc::channel();
@@ -1156,8 +1159,47 @@ mod tests {
     }
 
     #[test]
-    fn follow_rotation_clears_and_notifies() {
+    fn superseding_filter_retires_running_worker() {
+        use std::sync::atomic::Ordering;
         let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("k.log");
+        std::fs::write(&path, test_lines(3000, 100)).unwrap();
+        let mut tab = open_tab(&path);
+        tab.case_sensitive = true;
+        // First filter claims a cancel flag; superseding must signal it
+        // synchronously (no timing involved — the store itself is proof).
+        tab.start_filter(String::from("ERROR"));
+        let old = tab.filter_cancel.clone();
+        assert!(!old.load(Ordering::Relaxed));
+        tab.start_filter(String::from("WARN"));
+        assert!(old.load(Ordering::Relaxed));
+        drain_filter(&mut tab);
+        assert!(tab.doc.filter_active);
+    }
+
+    #[test]
+    fn tail_refresh_retires_previous_filter_worker() {
+        use std::sync::atomic::Ordering;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.log");
+        std::fs::write(&path, test_lines(3000, 100)).unwrap();
+        let mut tab = open_tab(&path);
+        tab.case_sensitive = true;
+        tab.filter_text = String::from("ERROR");
+        tab.start_filter(String::from("ERROR"));
+        drain_filter(&mut tab);
+        assert!(tab.doc.filter_active);
+        let old = tab.filter_cancel.clone();
+        // Direct tail refresh (no throttle sleep): bytes/lines of the file.
+        let bytes = std::fs::metadata(&path).unwrap().len();
+        tab.refresh_filter_tail(bytes, 3000);
+        assert!(old.load(Ordering::Relaxed));
+        drain_filter(&mut tab);
+        assert!(tab.doc.filter_active);
+    }
+
+    #[test]
+    fn follow_rotation_clears_and_notifies() {        let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("h.log");
         std::fs::write(&path, test_lines(3000, 100)).unwrap();
         let mut tab = open_tab(&path);

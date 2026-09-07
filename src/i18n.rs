@@ -842,8 +842,7 @@ const TEMPLATE_PAIRS: &[(&str, &str)] = &[
 
 /// Match `msg` against one ID template; on success rebuild the EN
 /// template with captures in order. Literals match exactly (anchored).
-fn try_template(id_tpl: &str, en_tpl: &str, msg: &str) -> Option<String> {
-    let re = template_regex(id_tpl);
+fn try_template(re: &regex::Regex, en_tpl: &str, msg: &str) -> Option<String> {
     let caps = re.captures(msg)?;
     if caps.len() - 1 != en_tpl.matches("{}").count() {
         return None;
@@ -870,12 +869,26 @@ fn template_regex(id_tpl: &str) -> regex::Regex {
 }
 
 fn match_template(msg: &str) -> Option<String> {
-    for (id_tpl, en_tpl) in TEMPLATE_PAIRS {
-        if let Some(out) = try_template(id_tpl, en_tpl, msg) {
+    for (re, en_tpl) in compiled_templates() {
+        if let Some(out) = try_template(re, en_tpl, msg) {
             return Some(out);
         }
     }
     None
+}
+
+/// Compiled template table, built once. Without this, every status-bar
+/// frame would recompile ~40 regexes for each template miss (notably the
+/// multi-second follow-note window) — pure waste for immutable patterns.
+fn compiled_templates() -> &'static [(regex::Regex, &'static str)] {
+    use std::sync::OnceLock;
+    static TABLE: OnceLock<Vec<(regex::Regex, &'static str)>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        TEMPLATE_PAIRS
+            .iter()
+            .map(|(id_tpl, en_tpl)| (template_regex(id_tpl), *en_tpl))
+            .collect()
+    })
 }
 
 #[cfg(test)]
@@ -1041,6 +1054,22 @@ mod tests {
             match_template("Filter: 5 baris cocok (+3 baru).").as_deref(),
             Some("Filter: 5 lines match (+3 new).")
         );
+    }
+
+    #[test]
+    fn template_cache_covers_all_pairs_and_is_stable() {
+        // The compiled table must mirror TEMPLATE_PAIRS exactly, and
+        // repeated translation must be deterministic (cache reuse, no
+        // recompilation side effects).
+        assert_eq!(compiled_templates().len(), TEMPLATE_PAIRS.len());
+        let en = Lang::En;
+        for _ in 0..3 {
+            assert_eq!(
+                en.tr_status("Dari zip: catalina.out (3 entri)"),
+                "From zip: catalina.out (3 entries)"
+            );
+            assert_eq!(en.tr_status("+128 baris baru"), "+128 new lines");
+        }
     }
 
     #[test]
