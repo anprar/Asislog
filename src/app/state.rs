@@ -76,6 +76,12 @@ pub struct AsisLogApp {
     pub(crate) favorites: Vec<String>,
     /// Jendela daftar pintasan (F1).
     pub(crate) shortcuts_open: bool,
+    /// Configurable shortcuts: stored overrides + compiled runtime table
+    /// + in-progress key recording (None = not recording).
+    pub(crate) scut_overrides: std::collections::HashMap<String, String>,
+    pub(crate) scut_compiled:
+        std::collections::HashMap<String, crate::app::shortcuts::ParsedBinding>,
+    pub(crate) scut_recording: Option<String>,
     /// History pola pencarian global (config, maks 30).
     pub(crate) history: Vec<HistEntry>,
     /// True bila sesi perlu ditulis (debounce 10 dtk).
@@ -221,6 +227,9 @@ impl AsisLogApp {
             session_dirty: false,
             last_session_save: Instant::now(),
             shortcuts_open: false,
+            scut_overrides: cfg.shortcuts.clone(),
+            scut_compiled: crate::app::shortcuts::compile_all(&cfg.shortcuts),
+            scut_recording: None,
             zoom,
             scratch_open: false,
             scratch_text: cfg.scratch.clone(),
@@ -313,9 +322,10 @@ impl AsisLogApp {
             zen_mode: self.zen_mode,
             split_view: self.split_view,
             font_family: Some(self.font_family.clone()),
-            sql_cols: self.sql_cols_enabled,
-            lang: Some(self.lang.key().to_string()),
-        };
+              sql_cols: self.sql_cols_enabled,
+              lang: Some(self.lang.key().to_string()),
+              shortcuts: self.scut_overrides.clone(),
+          };
         if let Err(e) = crate::store::save(&cfg) {
             self.global_status = e;
         }

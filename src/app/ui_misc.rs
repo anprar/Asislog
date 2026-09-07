@@ -273,39 +273,105 @@ impl AsisLogApp {
                 });
         }
 
-        // Jendela daftar pintasan (F1).
-        if self.shortcuts_open {            egui::Window::new(lang.tr("Pintasan AsisLog (F1)"))
+        // Jendela pintasan (F1): editor konfigurabel, bukan daftar statis.
+        // Baris dari tabel SHORTCUTS (label + binding efektif + reset);
+        // footer tetap untuk aksi yang disengaja fixed (Esc, 1–9, navigasi).
+        if self.shortcuts_open {
+            // Rekam tombol: tangkap tombol non-modifier pertama yang turun.
+            // Esc membatalkan perekaman (Esc sendiri tetap fixed global).
+            if let Some(id) = self.scut_recording.clone() {
+                let mut done: Option<Option<String>> = None; // None=batal
+                ctx.input(|i| {
+                    if i.key_pressed(egui::Key::Escape) {
+                        done = Some(None);
+                    } else {
+                        let mut named: Vec<egui::Key> =
+                            i.keys_down.iter().filter(|k| crate::app::shortcuts::key_name(**k) != "?").copied().collect();
+                        named.sort_by_key(|k| *k as u32);
+                        if let Some(&k) = named.first() {
+                            let mods = crate::app::shortcuts::live_mods(ctx);
+                            done = Some(Some(crate::app::shortcuts::binding_string(k, mods)));
+                        }
+                    }
+                });
+                if let Some(maybe) = done {
+                    match maybe {
+                        None => self.scut_recording = None,
+                        Some(s) => {
+                            // Tolak duplikat agar tak ada aksi yang mati diam-diam.
+                            let clash = crate::app::shortcuts::SHORTCUTS
+                                .iter()
+                                .find(|d| d.id != id && self.scut_label(d.id) == s)
+                                .map(|d| d.id);
+                            match clash {
+                                Some(other) => {
+                                    let oname = crate::app::shortcuts::SHORTCUTS
+                                        .iter()
+                                        .find(|d| d.id == other)
+                                        .map(|d| lang.tr(d.label_id).to_string())
+                                        .unwrap_or_default();
+                                    self.global_status =
+                                        lang.f2("Pintasan {} sudah dipakai oleh {}.", s, oname);
+                                }
+                                None => {
+                                    self.scut_overrides.insert(id.clone(), s);
+                                    self.rebuild_shortcuts();
+                                    self.cfg_dirty = true;
+                                    self.save_config();
+                                }
+                            }
+                            self.scut_recording = None;
+                        }
+                    }
+                }
+            }
+            egui::Window::new(lang.tr("Pintasan AsisLog (F1)"))
                 .collapsible(false)
                 .resizable(true)
-                .default_width(380.0)
+                .default_width(460.0)
                 .show(ctx, |ui| {
-                    for (keys, desc) in [
-                        ("Ctrl+O", lang.tr("Buka file log")),
-                        ("Ctrl+F", lang.tr("Fokus ke kolom Cari")),
-                        ("F3 / Shift+F3", lang.tr("Hasil berikutnya / sebelumnya")),
-                        ("n / N", lang.tr("Hasil berikut / sebelum (di luar kolom ketik)")),
-                        ("1-9", lang.tr("Label warna dari query aktif")),
-                        ("Ctrl+G", lang.tr("Ke baris / persen / akhir / waktu")),
-                        ("Ctrl+E", lang.tr("Ekspor hasil pencarian")),
-                        ("Ctrl+Home / Ctrl+End", lang.tr("Awal / akhir file")),
-                        ("Ctrl+Tab / Ctrl+Shift+Tab", lang.tr("Pindah tab (berlaku juga saat mengetik)")),
-                        ("Ctrl+Shift+F", lang.tr("Ikuti akhir file (LIVE)")),
-                        ("Ctrl+B", lang.tr("Tandai baris aktif")),
-                        ("Ctrl+Shift+B", lang.tr("Panel penanda")),
-                        ("F2", lang.tr("Ubah label penanda")),
-                        ("Alt+Left / Alt+Right", lang.tr("History mundur / maju")),
-                        ("Alt+Atas / Alt+Bawah", lang.tr("Penanda sebelumnya / berikutnya")),
-                        ("Ctrl+= / Ctrl+- / Ctrl+0", lang.tr("Zoom UI")),
-                        ("PgUp / PgDn, Panah", lang.tr("Gulir viewport (di luar kolom ketik)")),
-                        ("Esc", lang.tr("Tutup dialog teratas; lalu batalkan pencarian")),
-                    ] {
-                        ui.horizontal(|ui| {
-                            ui.strong(keys);
-                            ui.label(desc);
-                        });
-                    }
+                    egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+                        for def in crate::app::shortcuts::SHORTCUTS {
+                            ui.horizontal(|ui| {
+                                ui.label(lang.tr(def.label_id)).on_hover_text(def.id);
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    let overridden = self.scut_overrides.contains_key(def.id);
+                                    if overridden
+                                        && ui.small_button(lang.tr("Reset")).clicked()
+                                    {
+                                        self.scut_overrides.remove(def.id);
+                                        self.rebuild_shortcuts();
+                                        self.cfg_dirty = true;
+                                        self.save_config();
+                                    }
+                                    let rec = self.scut_recording.as_deref() == Some(def.id);
+                                    let btn = if rec {
+                                        lang.tr("Tekan tombol… (Esc batal)").to_string()
+                                    } else {
+                                        self.scut_label(def.id)
+                                    };
+                                    if ui.button(btn).clicked() {
+                                        self.scut_recording = Some(def.id.to_string());
+                                    }
+                                });
+                            });
+                        }
+                        ui.separator();
+                        for (keys, desc) in [
+                            ("Esc", lang.tr("Tutup dialog teratas; lalu batalkan pencarian")),
+                            ("1-9", lang.tr("Label warna dari query aktif")),
+                            ("PgUp / PgDn, Panah", lang.tr("Gulir viewport (di luar kolom ketik)")),
+                        ] {
+                            ui.horizontal(|ui| {
+                                ui.strong(keys);
+                                ui.label(desc);
+                            });
+                        }
+                        ui.label(lang.tr("Esc, 1–9, dan navigasi viewport tetap (tidak dapat diubah)."));
+                    });
                     if ui.button(lang.tr("Tutup")).clicked() {
                         self.shortcuts_open = false;
+                        self.scut_recording = None;
                     }
                 });
         }

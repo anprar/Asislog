@@ -10,6 +10,7 @@ use crate::engine::search::Hit;
 pub(crate) mod actions;
 pub(crate) mod jobs_index;
 pub(crate) mod jobs_search;
+pub(crate) mod shortcuts;
 pub(crate) mod state;
 pub(crate) mod tab;
 pub(crate) mod ui;

@@ -57,18 +57,27 @@ impl AsisLogApp {
     }
 
     pub(crate) fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        // Semua kombinasi tombol lewat tabel konfigurabel (shortcuts.rs);
+        // guard konteks (tab/mengetik/dialog) ikut per aksi agar perilaku
+        // lama tidak bergeser saat binding diubah.
+        let has_tab = !self.tabs.is_empty();
+        // Angka & n/N milik editor saat mengetik di kolom teks / dialog terbuka.
+        // (Dihitung SEBELUM pinjam tab: current_tab_mut meminjam seluruh self.)
+        let (field_focused, dialog_open) = self.focus_state(ctx);
+        let typing = field_focused || dialog_open;
+        // Modifier mentah untuk gerbang grup label 1-9 (tetap, di luar tabel).
         let ctrl = ctx.input(|i| i.modifiers.ctrl);
+        let alt = ctx.input(|i| i.modifiers.alt);
         let shift = ctx.input(|i| i.modifiers.shift);
-        // Ctrl+O
-        if ctrl && ctx.input(|i| i.key_pressed(egui::Key::O)) {
+        if self.scut_pressed(ctx, "open_file", has_tab, typing, dialog_open) {
             self.open_dialog();
         }
         // F1: jendela daftar pintasan (berlaku tanpa tab).
-        if ctx.input(|i| i.key_pressed(egui::Key::F1)) {
+        if self.scut_pressed(ctx, "help", has_tab, typing, dialog_open) {
             self.shortcuts_open = true;
         }
         // F11: toggle Mode Zen (C-B1)
-        if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
+        if self.scut_pressed(ctx, "zen", has_tab, typing, dialog_open) {
             self.zen_mode = !self.zen_mode;
             self.cfg_dirty = true;
             self.global_status = if self.zen_mode {
@@ -78,30 +87,60 @@ impl AsisLogApp {
             };
         }
         // Ctrl+Shift+P: Command Palette (C-C3)
-        if ctrl && shift && ctx.input(|i| i.key_pressed(egui::Key::P)) {
+        if self.scut_pressed(ctx, "palette", has_tab, typing, dialog_open) {
             self.palette_open = !self.palette_open;
             self.palette_query.clear();
             self.palette_selected = 0;
         }
         // Ctrl+F fokus cari: kami tandai lewat status (fokus widget di bawah via id)
-        if ctrl && !shift && ctx.input(|i| i.key_pressed(egui::Key::F)) {
+        if self.scut_pressed(ctx, "focus_search", has_tab, typing, dialog_open) {
             if self.zen_mode {
                 self.zen_search_open = true;
             }
             ctx.memory_mut(|m| m.request_focus(egui::Id::new("cari")));
         }
-        // Angka & n/N milik editor saat mengetik di kolom teks / dialog terbuka.
-        // (Dihitung SEBELUM pinjam tab: current_tab_mut meminjam seluruh self.)
-        let (field_focused, dialog_open) = self.focus_state(ctx);
-        let typing = field_focused || dialog_open;
+        // Ctrl+Shift+S: dual-pane hasil (berlaku tanpa tab).
+        if self.scut_pressed(ctx, "split", has_tab, typing, dialog_open) {
+            self.split_view = !self.split_view;
+            self.cfg_dirty = true;
+            if self.split_view {
+                if let Some(t) = self.tabs.get_mut(self.current) {
+                    t.results_collapsed = false;
+                }
+            }
+        }
+        // Hitung SEMUA flag tab-action di sini (sebelum pinjam tab mutabel):
+        // scut_pressed meminjam &self dan tak boleh berjalan berdampingan
+        // dengan `tab` di bawah.
+        let go_prev = self.scut_pressed(ctx, "prev_hit", has_tab, typing, dialog_open);
+        let go_next = !go_prev && self.scut_pressed(ctx, "next_hit", has_tab, typing, dialog_open);
+        let go_vi = self.scut_pressed(ctx, "next_hit_vi", has_tab, typing, dialog_open);
+        let go_goto = self.scut_pressed(ctx, "goto", has_tab, typing, dialog_open);
+        let go_export = self.scut_pressed(ctx, "export", has_tab, typing, dialog_open);
+        let go_home = self.scut_pressed(ctx, "home", has_tab, typing, dialog_open);
+        let go_end = self.scut_pressed(ctx, "end", has_tab, typing, dialog_open);
+        let go_follow = self.scut_pressed(ctx, "follow", has_tab, typing, dialog_open);
+        let go_hist_back = self.scut_pressed(ctx, "hist_back", has_tab, typing, dialog_open);
+        let go_hist_fwd = self.scut_pressed(ctx, "hist_fwd", has_tab, typing, dialog_open);
+        let go_mark_prev = self.scut_pressed(ctx, "mark_prev", has_tab, typing, dialog_open);
+        let go_mark_next = self.scut_pressed(ctx, "mark_next", has_tab, typing, dialog_open);
+        let go_bookmark = self.scut_pressed(ctx, "bookmark", has_tab, typing, dialog_open);
+        let go_marks_panel = self.scut_pressed(ctx, "marks_panel", has_tab, typing, dialog_open);
+        let go_rename = self.scut_pressed(ctx, "rename", has_tab, typing, dialog_open);
+        let go_tab_prev = self.scut_pressed(ctx, "tab_prev", has_tab, typing, dialog_open);
+        let go_tab_next = !go_tab_prev && self.scut_pressed(ctx, "tab_next", has_tab, typing, dialog_open);
+        let go_zoom_in = self.scut_pressed(ctx, "zoom_in", has_tab, typing, dialog_open);
+        let go_zoom_out = !go_zoom_in && self.scut_pressed(ctx, "zoom_out", has_tab, typing, dialog_open);
+        let go_zoom_reset = !go_zoom_in && !go_zoom_out && self.scut_pressed(ctx, "zoom_reset", has_tab, typing, dialog_open);
         let Some(tab) = self.current_tab_mut() else { return };
         let mut sess_touch = false;
         // F3 / Shift+F3: boleh saat mengetik query (tangan di keyboard),
-        // tapi jangan di balik dialog yang terbuka.
-        if !dialog_open && ctx.input(|i| i.key_pressed(egui::Key::F3)) && !tab.doc.hits.is_empty() {
+        // tapi jangan di balik dialog yang terbuka. Arah mengikuti aksi
+        // yang ditekan (prev prioritas, paritas perilaku lama Shift+F3).
+        if (go_prev || go_next) && !tab.doc.hits.is_empty() {
             let n = tab.doc.hits.len();
             let cur = tab.current_hit.unwrap_or(0);
-            let nxt = if shift {
+            let nxt = if go_prev || (go_next && shift) {
                 cur.saturating_sub(1).min(n - 1)
             } else {
                 (cur + 1).min(n - 1)
@@ -109,26 +148,26 @@ impl AsisLogApp {
             tab.jump_to_hit(nxt);
         }
         // Ctrl+G: buka dialog (jangan menumpuk di atas dialog lain).
-        if !dialog_open && ctrl && ctx.input(|i| i.key_pressed(egui::Key::G)) {
+        if go_goto {
             tab.goto_open = true;
         }
         // Ctrl+E: dialog ekspor hasil
-        if !dialog_open && ctrl && ctx.input(|i| i.key_pressed(egui::Key::E)) {
+        if go_export {
             tab.export_open = true;
         }
         // Ctrl+Home / Ctrl+End: milik caret saat mengetik di kolom teks.
-        if !typing && ctrl && ctx.input(|i| i.key_pressed(egui::Key::Home)) {
+        if go_home {
             tab.top_row = 0;
             tab.selected_line = tab.row_to_line(0).unwrap_or(1);
             tab.doc.stick_bottom = false; // pergi dari ekor = jeda LIVE
         }
-        if !typing && ctrl && ctx.input(|i| i.key_pressed(egui::Key::End)) {
+        if go_end {
             let total = tab.total_view_rows();
             tab.top_row = total.saturating_sub(tab.last_visible.max(10));
             tab.doc.stick_bottom = true;
         }
         // Ctrl+Shift+F: cermin tombol LIVE (aktif / jeda-lanjut / mati).
-        if !typing && ctrl && shift && ctx.input(|i| i.key_pressed(egui::Key::F)) {
+        if go_follow {
             if tab.doc.follow && !tab.doc.stick_bottom {
                 tab.doc.stick_bottom = true;
             } else {
@@ -138,18 +177,17 @@ impl AsisLogApp {
             sess_touch = true;
         }
         // Alt+Left / Alt+Right: history navigasi (bukan saat mengetik).
-        let alt = ctx.input(|i| i.modifiers.alt);
-        if !typing && alt && ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) && !tab.go_hist(true) {
+        if go_hist_back && !tab.go_hist(true) {
             tab.doc.status = String::from("Tidak ada lokasi sebelumnya.");
         }
-        if !typing && alt && ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) && !tab.go_hist(false) {
+        if go_hist_fwd && !tab.go_hist(false) {
             tab.doc.status = String::from("Tidak ada lokasi berikutnya.");
         }
         // Alt+Up / Alt+Down: penanda sebelumnya/berikutnya
-        if !typing && alt && ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) && !tab.go_mark(true) {
+        if go_mark_prev && !tab.go_mark(true) {
             tab.doc.status = String::from("Belum ada penanda.");
         }
-        if !typing && alt && ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) && !tab.go_mark(false) {
+        if go_mark_next && !tab.go_mark(false) {
             tab.doc.status = String::from("Belum ada penanda.");
         }
         // Esc: tutup SATU dialog teratas (prioritas tetap); bila tak ada
@@ -215,7 +253,7 @@ impl AsisLogApp {
             self.session_dirty = true;
         }
         // Ctrl+B: toggle penanda di baris aktif (+ simpan sidecar)
-        if !dialog_open && ctrl && !shift && ctx.input(|i| i.key_pressed(egui::Key::B)) {
+        if go_bookmark {
             let idx = self.current;
             if let Some(t) = self.tabs.get_mut(idx) {
                 let ln = t.selected_line;
@@ -225,13 +263,13 @@ impl AsisLogApp {
             Self::save_marks(idx, &mut self.tabs);
         }
         // Ctrl+Shift+B: buka/tutup panel penanda
-        if !dialog_open && ctrl && shift && ctx.input(|i| i.key_pressed(egui::Key::B)) {
+        if go_marks_panel {
             if let Some(t) = self.tabs.get_mut(self.current) {
                 t.show_bookmarks = !t.show_bookmarks;
             }
         }
         // F2: ubah label penanda di baris aktif
-        if !dialog_open && ctx.input(|i| i.key_pressed(egui::Key::F2)) {
+        if go_rename {
             let idx = self.current;
             let found = self.tabs.get(idx).and_then(|t| {
                 let ln = t.selected_line;
@@ -257,26 +295,26 @@ impl AsisLogApp {
         }
         // Ctrl+Tab / Ctrl+Shift+Tab: pindah tab, berlaku juga saat mengetik
         // di kolom teks (seperti peramban); Tab polos tetap milik caret/fokus.
-        if ctrl && !alt && ctx.input(|i| i.key_pressed(egui::Key::Tab)) {
+        if go_tab_prev {
             let n = self.tabs.len();
             if n > 1 {
-                if shift {
-                    self.current = (self.current + n - 1) % n;
-                } else {
-                    self.current = (self.current + 1) % n;
-                }
+                self.current = (self.current + n - 1) % n;
+                self.session_dirty = true;
+            }
+        } else if go_tab_next {
+            let n = self.tabs.len();
+            if n > 1 {
+                self.current = (self.current + 1) % n;
                 self.session_dirty = true;
             }
         }
         // Zoom Ctrl+= / Ctrl+- / Ctrl+0 (jangan saat dialog terbuka).
-        if !dialog_open && ctrl && !shift && !alt {
-            if ctx.input(|i| i.key_pressed(egui::Key::Equals)) {
-                self.bump_zoom(ctx, self.zoom + 0.1);
-            } else if ctx.input(|i| i.key_pressed(egui::Key::Minus)) {
-                self.bump_zoom(ctx, self.zoom - 0.1);
-            } else if ctx.input(|i| i.key_pressed(egui::Key::Num0)) {
-                self.bump_zoom(ctx, 1.0);
-            }
+        if go_zoom_in {
+            self.bump_zoom(ctx, self.zoom + 0.1);
+        } else if go_zoom_out {
+            self.bump_zoom(ctx, self.zoom - 0.1);
+        } else if go_zoom_reset {
+            self.bump_zoom(ctx, 1.0);
         }
         // Label warna 1-9 dari query aktif (bukan saat mengetik).
         if !typing && !ctrl && !alt {
@@ -297,17 +335,17 @@ impl AsisLogApp {
                     break;
                 }
             }
-            // n / N: hasil berikut/sebelum tanpa panel.
-            if ctx.input(|i| i.key_pressed(egui::Key::N)) {
-                if let Some(t) = self.tabs.get_mut(self.current) {
-                    if !t.doc.hits.is_empty() {
-                        let n = t.doc.hits.len();
-                        let c = t.current_hit.unwrap_or(0);
-                        if shift {
-                            t.jump_to_hit(c.saturating_sub(1).min(n - 1));
-                        } else {
-                            t.jump_to_hit((c + 1).min(n - 1));
-                        }
+        }
+        // n / N: hasil berikut/sebelum tanpa panel (arah via Shift, warisan).
+        if go_vi {
+            if let Some(t) = self.tabs.get_mut(self.current) {
+                if !t.doc.hits.is_empty() {
+                    let n = t.doc.hits.len();
+                    let c = t.current_hit.unwrap_or(0);
+                    if shift {
+                        t.jump_to_hit(c.saturating_sub(1).min(n - 1));
+                    } else {
+                        t.jump_to_hit((c + 1).min(n - 1));
                     }
                 }
             }
