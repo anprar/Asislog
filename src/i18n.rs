@@ -538,6 +538,10 @@ impl Lang {
             "Pola" => "Pattern",
             "Peka huruf" => "Case sensitive",
             "Baris penuh" => "Whole line",
+            "Variasi warna" => "Vary color",
+            "Warna sedikit beda per teks cocok" => "Slightly different color per matched text",
+            "Hanya grup tangkap" => "Capture groups only",
+            "Regex saja: sorot grup (a|b) bukan seluruh cocok" => "Regex only: highlight groups (a|b), not the whole match",
             "Tambah" => "Add",
             "Buat/pilih set dulu sebelum menambah aturan." => {
                 "Create/select a set before adding rules."
@@ -751,6 +755,7 @@ impl Lang {
             ("Query pencarian tidak valid", "Invalid search query"),
             ("Gagal konversi ke filter", "Failed to convert to filter"),
             ("Boolean search belum mendukung UTF-16", "Boolean search does not support UTF-16 yet"),
+            ("Regex kompleks belum mendukung UTF-16", "Complex regex does not support UTF-16 yet"),
             ("Regex tidak valid", "Invalid regex"),
             ("URL kosong", "URL is empty"),
             ("Teks kosong", "Text is empty"),

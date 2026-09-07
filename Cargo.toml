@@ -16,6 +16,10 @@ memmap2 = "0.9"
 memchr = "2.7"
 aho-corasick = "1.1"
 regex = "1.11"
+# fancy-regex: fallback for complex patterns the fast `regex` engine rejects
+# (look-around, backreferences). Slower (backtracking) but correct; the fast
+# path is always tried first. Pure Rust, portable single binary kept.
+fancy-regex = "0.19"
 encoding_rs = "0.8"
 rfd = "0.15"
 rayon = "1.10"

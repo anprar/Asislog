@@ -238,6 +238,8 @@ pub(crate) fn spawn_search(
     // Tail refresh: start scanning at (byte, 1-based line) instead of 0,
     // so follow-append re-scans only new bytes. None = full scan.
     seek_to: Option<(u64, u64)>,
+    encoding: Encoding,
+    bom_len: usize,
 ) {
     std::thread::spawn(move || {
         use std::io::Read;
@@ -255,6 +257,31 @@ pub(crate) fn spawn_search(
             return;
         }
         // Compile regex once (bytes).
+        // Fast engine first; complex patterns (look-around, backrefs)
+        // route to the sequential fancy worker instead of erroring out.
+        // (Rebuilds `params` for the handoff; other arms keep ownership.)
+        if regex_on {
+            match crate::engine::search::compile_regex_auto(&query, case_sensitive) {
+                Ok(crate::engine::search::CompiledRegex::Fancy(_)) => {
+                    let params = SearchJobParams { path, gen, gen_shared, tx, cancel };
+                    spawn_fancy_search(params, query, case_sensitive, scope, seek_to, encoding, bom_len);
+                    return;
+                }
+                Ok(crate::engine::search::CompiledRegex::Fast(_)) => {}
+                Err(e) => {
+                    let _ = tx.send(SearchBatchMsg {
+                        gen,
+                        batch: Vec::new(),
+                        done: true,
+                        truncated: false,
+                        error: Some(format!("Regex tidak valid: {}", e)),
+                        scanned: 0,
+                        total: 0,
+                    });
+                    return;
+                }
+            }
+        }
         let re: Option<regex::bytes::Regex> = if regex_on {
             let mut b = regex::bytes::RegexBuilder::new(&query);
             b.case_insensitive(!case_sensitive);
@@ -775,8 +802,192 @@ pub(crate) fn spawn_search(
     });
 }
 
+/// Worker regex kompleks (fancy-regex backtracking): pindai sekuensial
+/// per baris terdecode, batch 500 hit + progres byte, hormati `search_gen`
+/// seperti worker literal. Hanya untuk pola yang ditolak mesin cepat;
+/// pola biasa tetap di jalur rayon paralel (jangan perlambat fast path).
+/// Mendukung semua encoding byte-oriented; UTF-16 ditolak eksplisit
+/// (paritas dengan worker boolean) karena splitter baris byte `\n`.
+pub(crate) fn spawn_fancy_search(
+    params: SearchJobParams,
+    query: String,
+    case_sensitive: bool,
+    scope: Option<(u64, u64)>,
+    seek_to: Option<(u64, u64)>,
+    encoding: Encoding,
+    bom_len: usize,
+) {
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let SearchJobParams { path, gen, gen_shared, tx, cancel } = params;
+        let mut fb = fancy_regex::RegexBuilder::new(&query);
+        fb.case_insensitive(!case_sensitive);
+        let re = match fb.build() {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = tx.send(SearchBatchMsg {
+                    gen,
+                    batch: Vec::new(),
+                    done: true,
+                    truncated: false,
+                    error: Some(format!("Regex tidak valid: {}", e)),
+                    scanned: 0,
+                    total: 0,
+                });
+                return;
+            }
+        };
+        if encoding.is_wide() {
+            let _ = tx.send(SearchBatchMsg {
+                gen,
+                batch: Vec::new(),
+                done: true,
+                truncated: false,
+                error: Some(String::from(
+                    "Regex kompleks belum mendukung UTF-16; gunakan literal.",
+                )),
+                scanned: 0,
+                total: 0,
+            });
+            return;
+        }
+        let file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                let _ = tx.send(SearchBatchMsg {
+                    gen,
+                    batch: Vec::new(),
+                    done: true,
+                    truncated: false,
+                    error: Some(format!("Gagal membaca file: {}", e)),
+                    scanned: 0,
+                    total: 0,
+                });
+                return;
+            }
+        };
+        let total = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let mut reader = std::io::BufReader::with_capacity(1024 * 1024, file);
+        let mut line_no: u64 = 1;
+        let mut byte_off: u64 = 0;
+        let mut scanned: u64 = 0;
+        let mut pending: Vec<Hit> = Vec::with_capacity(search::SEARCH_BATCH);
+        let mut total_found: usize = 0;
+        let mut truncated = false;
+        let mut buf: Vec<u8> = Vec::new();
+        let mut first = true;
+        if let Some((sb, sl)) = seek_to {
+            use std::io::Seek;
+            if reader.seek(std::io::SeekFrom::Start(sb)).is_ok() {
+                byte_off = sb;
+                scanned = sb;
+                line_no = sl.max(1);
+                first = sb == 0;
+            }
+        }
+        loop {
+            if job_stale(&gen_shared, gen, &cancel) {
+                return;
+            }
+            buf.clear();
+            let n = match reader.read_until(b'\n', &mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) => {
+                    let _ = tx.send(SearchBatchMsg {
+                        gen,
+                        batch: Vec::new(),
+                        done: true,
+                        truncated,
+                        error: Some(format!("Gagal membaca file: {}", e)),
+                        scanned,
+                        total,
+                    });
+                    return;
+                }
+            };
+            let line_start = byte_off;
+            byte_off += n as u64;
+            scanned += n as u64;
+            let mut lb = &buf[..];
+            if lb.ends_with(b"\n") {
+                lb = &lb[..lb.len() - 1];
+            }
+            if first {
+                first = false;
+                if bom_len > 0 && lb.len() >= bom_len {
+                    lb = &lb[bom_len..];
+                }
+            }
+            let mut bytes = lb;
+            if !bytes.is_empty() && bytes[bytes.len() - 1] == b'\r' {
+                bytes = &bytes[..bytes.len() - 1];
+            }
+            // Cakupan byte: samakan dengan jalur cepat (filter by match byte).
+            let text = crate::engine::decode::decode_bytes(bytes, encoding);
+            let ts: &str = &text;
+            let mut iter = re.find_iter(ts);
+            loop {
+                let (s, e) = match iter.next() {
+                    Some(Ok(m)) => (m.start(), m.end()),
+                    // Backtrack meledak di baris ganas: lewati baris ini,
+                    // lanjutkan file (pekerja tak boleh hang).
+                    _ => break,
+                };
+                if e == s {
+                    continue;
+                }
+                if let Some((ss, ee)) = scope {
+                    let gp = line_start + s as u64;
+                    if gp < ss || gp >= ee {
+                        continue;
+                    }
+                }
+                pending.push(Hit {
+                    line: line_no,
+                    byte: line_start,
+                    col_start: s as u32,
+                    col_end: e as u32,
+                });
+                total_found += 1;
+                if pending.len() >= search::SEARCH_BATCH {
+                    let b = std::mem::take(&mut pending);
+                    let _ = tx.send(SearchBatchMsg {
+                        gen,
+                        batch: b,
+                        done: false,
+                        truncated: false,
+                        error: None,
+                        scanned,
+                        total,
+                    });
+                }
+                if total_found >= search::MAX_STORED_HITS {
+                    truncated = true;
+                    break;
+                }
+            }
+            if truncated {
+                break;
+            }
+            line_no += 1;
+        }
+        if job_stale(&gen_shared, gen, &cancel) {
+            return;
+        }
+        let _ = tx.send(SearchBatchMsg {
+            gen,
+            batch: std::mem::take(&mut pending),
+            done: true,
+            truncated,
+            error: None,
+            scanned: total,
+            total,
+        });
+    });
+}
+
 /// Worker pencarian boolean: evaluasi AST per baris terdecode.
-/// Batch 500 hit + progres byte, hormati `search_gen` seperti worker literal.
 pub(crate) fn spawn_bool_search(
     params: SearchJobParams,
     ast: crate::engine::query::Query,
@@ -1035,13 +1246,15 @@ mod tests {
                 tx,
                 cancel: Arc::new(AtomicBool::new(false)),
             },
-            query.to_string(),
-            regex_on,
-            case_sensitive,
-            scope,
-            None,
-        );
-        let mut out = Vec::new();
+              query.to_string(),
+              regex_on,
+              case_sensitive,
+              scope,
+              None,
+              Encoding::Utf8,
+              0,
+          );
+          let mut out = Vec::new();
         for msg in rx {
             assert!(msg.error.is_none(), "worker error: {:?}", msg.error);
             out.extend(msg.batch);
@@ -1151,6 +1364,24 @@ mod tests {
     /// Matches at exact chunk edges: fully inside the carried tail (must
     /// not duplicate) and straddling the boundary (must not miss).
     /// Chunk 0 = [0, C), carry = last `overlap` bytes.
+    #[test]
+    fn worker_fancy_lookaround_end_to_end() {
+        // Routes through spawn_search (compile auto-detects Fancy) and
+        // returns exact lines + spans, like the fast path contract.
+        let data = b"order 111 approved\norder 222 denied\norder 333 approved\n";
+        let got = run_worker(data, r"order \d+(?= approved)", true, true, None);
+        let lines: Vec<u64> = got.iter().map(|h| h.line).collect();
+        assert_eq!(lines, vec![1, 3]);
+        // Byte columns point at the match ("order 111" starts col 0).
+        assert_eq!((got[0].col_start, got[0].col_end), (0, 9));
+        // Backreference pattern also routes to fancy.
+        let got2 = run_worker(data, r"(order) \d+ \1", false, false, None);
+        assert!(got2.is_empty(), "no repeated word here, just routing check");
+        let data2 = b"foo foo\nbar bar\n";
+        let got3 = run_worker(data2, r"(\w+) \1", true, true, None);
+        assert_eq!(got3.iter().map(|h| h.line).collect::<Vec<_>>(), vec![1, 2]);
+    }
+
     #[test]
     fn worker_chunk_boundary_no_dup_no_miss() {
         let c = search::SEARCH_CHUNK;

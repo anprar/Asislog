@@ -58,6 +58,8 @@ pub struct AsisLogApp {
     pub(crate) hl_case: bool,
     pub(crate) hl_color_idx: usize,
     pub(crate) hl_whole: bool,
+    pub(crate) hl_variate: bool,
+    pub(crate) hl_groups_only: bool,
     // Dialog ubah label penanda.
     pub(crate) rename_open: bool,
     pub(crate) rename_line: u64,
@@ -201,6 +203,8 @@ impl AsisLogApp {
             hl_case: false,
             hl_color_idx: 0,
             hl_whole: false,
+            hl_variate: false,
+            hl_groups_only: false,
             rename_open: false,
             rename_line: 1,
             rename_label: String::new(),
@@ -666,6 +670,8 @@ impl AsisLogApp {
                     color: COLORS[idx].to_string(),
                     whole_line: false,
                     enabled: true,
+                    variate: false,
+                    groups_only: false,
                 });
                 msg = lang.f3("Label {}: \"{}\" ({}). Tekan lagi untuk hapus.", idx + 1, short, cname);
             }
@@ -683,7 +689,7 @@ impl AsisLogApp {
             .iter()
             .filter(|r| r.enabled)
             .filter_map(|r| {
-                CompiledRule::compile(&r.pattern, r.regex, r.case_sensitive, &r.color, r.whole_line)
+                CompiledRule::compile(&r.pattern, r.regex, r.case_sensitive, &r.color, r.whole_line, r.variate, r.groups_only)
             })
             .collect();
         self.hl_dirty = false;

@@ -26,6 +26,15 @@ pub struct HighlightRule {
     /// True = whole line, false = match span only.
     pub whole_line: bool,
     pub enabled: bool,
+    /// True = vary the color slightly per distinct matched text
+    /// (klogg-style color variance), so different values stand out.
+    #[serde(default)]
+    pub variate: bool,
+    /// True (regex only) = highlight capture groups 1..n instead of the
+    /// whole match. Falls back to whole match when the pattern captures
+    /// nothing. Literal patterns ignore this.
+    #[serde(default)]
+    pub groups_only: bool,
 }
 
 impl HighlightRule {
@@ -443,6 +452,8 @@ mod tests {
             color: "red".into(),
             whole_line: false,
             enabled: true,
+            variate: false,
+            groups_only: false,
         };
         assert!(ok.validate().is_ok());
         let bad = HighlightRule { pattern: "([a".into(), regex: true, ..ok.clone() };
@@ -551,6 +562,8 @@ mod tests {
                 color: "red".into(),
                 whole_line: false,
                 enabled: true,
+                variate: false,
+                groups_only: false,
             }],
             ..Config::default()
         };
@@ -582,6 +595,8 @@ mod tests {
                 color: "red".into(),
                 whole_line: false,
                 enabled: true,
+                variate: false,
+                groups_only: false,
             }],
         });
         let text = serde_json::to_string(&ws).unwrap();

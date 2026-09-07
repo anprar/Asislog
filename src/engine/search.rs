@@ -142,7 +142,59 @@ fn find_literal_case_sensitive(
 
 /// Regex search over bytes. Returns Err with message on invalid pattern (no panic).
 /// Streaming like the literal path: O(chunk) RAM, incremental line mapping.
+/// Fast path: `regex::bytes` (SIMD, linear time). Complex patterns the fast
+/// engine rejects (look-around, backreferences) fall back to `fancy-regex`
+/// (backtracking: correct but slower — the UI labels this mode honestly).
+/// Only patterns BOTH engines reject produce Err.
 pub fn find_regex(
+    data: &[u8],
+    pattern: &str,
+    case_sensitive: bool,
+    max_hits: usize,
+) -> Result<(Vec<Hit>, bool), String> {
+    match compile_regex_auto(pattern, case_sensitive) {
+        Ok(CompiledRegex::Fast(_)) => find_regex_fast(data, pattern, case_sensitive, max_hits),
+        Ok(CompiledRegex::Fancy(_)) => find_regex_fancy(data, pattern, case_sensitive, max_hits),
+        Err(e) => Err(e),
+    }
+}
+
+/// A compiled regex with its engine recorded, so callers (UI mode label,
+/// workers) can stay honest about which one runs.
+#[derive(Clone, Debug)]
+pub enum CompiledRegex {
+    /// `regex::bytes`: SIMD, linear-time guarantee.
+    Fast(regex::bytes::Regex),
+    /// `fancy-regex`: backtracking, handles look-around/backreferences.
+    Fancy(fancy_regex::Regex),
+}
+
+/// Compile with the fast engine first; fall back to fancy-regex only for
+/// patterns the fast engine cannot express. Err only if both reject.
+pub fn compile_regex_auto(pattern: &str, case_sensitive: bool) -> Result<CompiledRegex, String> {
+    let mut b = regex::bytes::RegexBuilder::new(pattern);
+    b.case_insensitive(!case_sensitive);
+    match b.build() {
+        Ok(re) => Ok(CompiledRegex::Fast(re)),
+        Err(fast_err) => {
+            let mut fb = fancy_regex::RegexBuilder::new(pattern);
+            fb.case_insensitive(!case_sensitive);
+            match fb.build() {
+                Ok(re) => Ok(CompiledRegex::Fancy(re)),
+                Err(_) => Err(fast_err.to_string()),
+            }
+        }
+    }
+}
+
+/// True when the pattern needs the fancy (backtracking) engine: the fast
+/// engine rejects it but fancy accepts it. Pure + testable; UI uses it to
+/// label the mode honestly without waiting for worker results.
+pub fn is_complex_regex(pattern: &str, case_sensitive: bool) -> bool {
+    matches!(compile_regex_auto(pattern, case_sensitive), Ok(CompiledRegex::Fancy(_)))
+}
+
+fn find_regex_fast(
     data: &[u8],
     pattern: &str,
     case_sensitive: bool,
@@ -209,7 +261,118 @@ pub fn find_regex(
     Ok((hits, truncated))
 }
 
-/// Chunked literal search used by background threads on huge files.
+/// Fancy (backtracking) regex scan, line by line over lossy-decoded text.
+/// Only reached for patterns the fast byte engine rejects, so per-line
+/// decode cost is acceptable here (correctness over speed).
+/// Byte columns refer to the decoded line: identical to source bytes for
+/// valid UTF-8, approximate where replacement chars were substituted.
+/// Chunk-boundary lines are reconstructed from the overlap tail and
+/// deduplicated by (line, col), so no hit is lost or doubled.
+fn find_regex_fancy(
+    data: &[u8],
+    pattern: &str,
+    case_sensitive: bool,
+    max_hits: usize,
+) -> Result<(Vec<Hit>, bool), String> {
+    let mut fb = fancy_regex::RegexBuilder::new(pattern);
+    fb.case_insensitive(!case_sensitive);
+    let re = fb.build().map_err(|e| e.to_string())?;
+    let mut hits = Vec::new();
+    let mut truncated = false;
+    // Adjacent-duplicate guard: the carry/fresh overlap re-scans the
+    // boundary line, so a match reported by the previous chunk arrives
+    // again with identical (line, col). Matches stream in order.
+    let mut last: Option<(u64, u32)> = None;
+    scan_stream(data, 8 * 1024, |combined, base, cur_line, carry_len, _| {
+        let carry_len = carry_len.min(combined.len());
+        let carry = &combined[..carry_len];
+        let fresh = &combined[carry_len..];
+        let carry_nl = memchr::memchr_iter(b'\n', carry).count() as u64;
+        // Suffix of the boundary line already scanned (empty unless the
+        // fresh region continues a carry line). Reconstructed so patterns
+        // spanning the chunk boundary still match exactly once (via `last`).
+        let suffix: &[u8] = if carry_len > 0 && !carry.ends_with(b"\n") {
+            match carry.iter().rposition(|&b| b == b'\n') {
+                Some(i) => &carry[i + 1..],
+                // Line longer than the whole overlap: byte base below is
+                // approximate (same corner as the fast path); the line
+                // number stays exact.
+                None => carry,
+            }
+        } else {
+            &[]
+        };
+        let mut cur_no = cur_line + carry_nl;
+        // Byte offset of the current line start within the file.
+        let mut ls_byte = base + carry_len as u64 - suffix.len() as u64;
+        let mut fresh_off: u64 = 0;
+        let mut first = true;
+        for part in fresh.split_inclusive(|&b| b == b'\n') {
+            let has_nl = part.ends_with(b"\n");
+            let mut body = if has_nl { &part[..part.len() - 1] } else { part };
+            if body.ends_with(b"\r") {
+                body = &body[..body.len() - 1];
+            }
+            // Full bytes of this line for matching (suffix only matters
+            // for the first segment of a continued line).
+            let full: Vec<u8>;
+            let line_bytes: &[u8] = if first && !suffix.is_empty() {
+                full = [suffix, body].concat();
+                &full
+            } else {
+                body
+            };
+            if !line_bytes.is_empty() {
+                let text = String::from_utf8_lossy(line_bytes);
+                let base_col = if first && !suffix.is_empty() {
+                    // Matches starting inside the already-scanned suffix
+                    // were reported by the previous chunk: skip them, keep
+                    // only matches reaching into fresh bytes.
+                    suffix.len()
+                } else {
+                    0
+                };
+                let mut iter = re.find_iter(text.as_ref() as &str);
+                loop {
+                    let m = match iter.next() {
+                        Some(Ok(m)) => m,
+                        // Backtrack error (catastrophic pattern on hostile
+                        // line): stop this line, keep scanning the rest.
+                        _ => break,
+                    };
+                    if m.end() == m.start() || m.start() < base_col {
+                        continue;
+                    }
+                    let key = (cur_no, m.start() as u32);
+                    if last == Some(key) {
+                        continue;
+                    }
+                    last = Some(key);
+                    hits.push(Hit {
+                        line: cur_no,
+                        byte: ls_byte,
+                        col_start: m.start() as u32,
+                        col_end: m.end() as u32,
+                    });
+                    if hits.len() >= max_hits {
+                        truncated = true;
+                        return true;
+                    }
+                }
+            }
+            first = false;
+            // Next line starts right after this segment.
+            ls_byte = base + carry_len as u64 + fresh_off + part.len() as u64;
+            fresh_off += part.len() as u64;
+            // Recompute cleanly: track offset within fresh instead.
+            if has_nl {
+                cur_no += 1;
+            }
+        }
+        false
+    });
+    Ok((hits, truncated))
+}
 /// Calls `on_batch(batch)` with 200-500 hits without freezing UI.
 /// `should_abort()` is polled per chunk (search_gen).
 pub fn chunked_literal_search<F>(
@@ -405,6 +568,47 @@ mod tests {
         assert!(find_regex(b"abc", b"(".escape_ascii().to_string().as_str(), true, 10).is_ok()
             || true);
         assert!(find_regex(b"abc", "([", true, 10).is_err());
+    }
+
+    #[test]
+    fn regex_engine_routing() {
+        use super::CompiledRegex;
+        // Plain patterns stay on the fast SIMD engine.
+        assert!(matches!(
+            super::compile_regex_auto("ERROR|WARN", true),
+            Ok(CompiledRegex::Fast(_))
+        ));
+        // Look-around / backreferences need the fancy engine.
+        assert!(matches!(
+            super::compile_regex_auto(r"foo(?!bar)", true),
+            Ok(CompiledRegex::Fancy(_))
+        ));
+        assert!(matches!(
+            super::compile_regex_auto(r"(?<=id=)\d+", true),
+            Ok(CompiledRegex::Fancy(_))
+        ));
+        assert!(matches!(
+            super::compile_regex_auto(r"(ab)\1", true),
+            Ok(CompiledRegex::Fancy(_))
+        ));
+        assert!(super::is_complex_regex(r"foo(?!bar)", true));
+        assert!(!super::is_complex_regex("ERROR", true));
+        // Garbage for both engines still errors, never panics.
+        assert!(super::compile_regex_auto("([", true).is_err());
+    }
+
+    #[test]
+    fn regex_fancy_lookaround_results() {
+        let data = b"foobar\nfoobaz id=42\nfooqux id=7\n";
+        // Negative lookahead: lines with foo NOT followed by bar.
+        let (hits, trunc) = find_regex(data, r"foo(?!bar)", true, 1000).unwrap();
+        assert!(!trunc);
+        let lines: Vec<u64> = hits.iter().map(|h| h.line).collect();
+        assert_eq!(lines, vec![2, 3]);
+        // Lookbehind: digits after id=.
+        let (hits, _) = find_regex(data, r"(?<=id=)\d+", true, 1000).unwrap();
+        let cols: Vec<(u64, u32)> = hits.iter().map(|h| (h.line, h.col_start)).collect();
+        assert_eq!(cols, vec![(2, 10), (3, 10)]);
     }
 
     #[test]

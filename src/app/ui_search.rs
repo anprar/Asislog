@@ -169,7 +169,11 @@ impl AsisLogApp {
                     ui.label(lang.f1("Tidak ada kecocokan \"{}\"", q));
                 } else {
                     let mode = if tab.regex_on {
-                        "regex"
+                        if tab.regex_complex {
+                            "regex-complex"
+                        } else {
+                            "regex"
+                        }
                     } else if crate::engine::query::is_boolean_query(&tab.search_text) {
                         "boolean"
                     } else {

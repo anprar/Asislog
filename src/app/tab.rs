@@ -72,6 +72,10 @@ pub(crate) struct TabState {
     pub(crate) debounce_at: Option<Instant>,
     pub(crate) case_sensitive: bool,
     pub(crate) regex_on: bool,
+    /// True when the regex needs the fancy backtracking engine (look-around
+    /// / backreferences): shown honestly in the mode label, and the worker
+    /// takes the sequential fancy path instead of the rayon fast path.
+    pub(crate) regex_complex: bool,
     pub(crate) current_hit: Option<usize>,
     /// Progress pindaian pencarian (diperbarui per batch).
     pub(crate) search_scanned: u64,
@@ -175,6 +179,7 @@ impl TabState {
             debounce_at: None,
             case_sensitive: false,
             regex_on: false,
+            regex_complex: false,
             current_hit: None,
             search_scanned: 0,
             search_total: 0,
@@ -304,6 +309,7 @@ impl TabState {
         self.cancel_search_worker();
         self.search_text.clear();
         self.last_searched.clear();
+        self.regex_complex = false;
         self.doc.hits.clear();
         self.doc.search_error = None;
         self.current_hit = None;
@@ -381,6 +387,10 @@ impl TabState {
             return;
         }
         self.pending_key = Some(key);
+        // Label mode jujur: pola kompleks terdeteksi saat mulai (compile
+        // <1ms), worker memakai jalur fancy sekuensial untuknya.
+        self.regex_complex = self.regex_on
+            && crate::engine::search::is_complex_regex(&q, self.case_sensitive);
         if bool_mode {
             match query::parse_query(&q) {
                 Ok(ast) => spawn_bool_search(
@@ -418,6 +428,8 @@ impl TabState {
             self.case_sensitive,
             scope_bytes,
             None,
+            self.doc.encoding(),
+            self.doc.bom_len,
         );
     }
 
@@ -556,6 +568,8 @@ impl TabState {
             self.case_sensitive,
             None,
             seek,
+            self.doc.encoding(),
+            self.doc.bom_len,
         );
     }
 

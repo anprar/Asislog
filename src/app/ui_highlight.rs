@@ -136,6 +136,10 @@ impl AsisLogApp {
                         ui.checkbox(&mut self.hl_regex, "Regex");
                         ui.checkbox(&mut self.hl_case, lang.tr("Peka huruf"));
                         ui.checkbox(&mut self.hl_whole, lang.tr("Baris penuh"));
+                        ui.checkbox(&mut self.hl_variate, lang.tr("Variasi warna"))
+                            .on_hover_text(lang.tr("Warna sedikit beda per teks cocok"));
+                        ui.checkbox(&mut self.hl_groups_only, lang.tr("Hanya grup tangkap"))
+                            .on_hover_text(lang.tr("Regex saja: sorot grup (a|b) bukan seluruh cocok"));
                         egui::ComboBox::from_id_salt("hlcolor")
                             .selected_text(color_name_lang(
                                 highlight_keys()[self.hl_color_idx % highlight_keys().len()].0,
@@ -163,6 +167,8 @@ impl AsisLogApp {
                             color: key,
                             whole_line: self.hl_whole,
                             enabled: true,
+                            variate: self.hl_variate,
+                            groups_only: self.hl_groups_only && self.hl_regex,
                         };
                         match rule.validate() {
                             Ok(()) => {

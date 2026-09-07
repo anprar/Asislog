@@ -190,10 +190,22 @@ pub fn highlight_spans(line: &str) -> Vec<(usize, usize, LineKind)> {
 /// Compiled once (app caches by version), evaluated per visible row.
 pub struct CompiledRule {
     pub whole_line: bool,
+    pub variate: bool,
+    pub groups_only: bool,
     color_dark: egui::Color32,
     color_light: egui::Color32,
     literal: Option<(String, bool)>,
     regex: Option<regex::Regex>,
+}
+
+/// FNV-1a 32-bit, for deterministic per-text color variance.
+fn fnv1a(bytes: &[u8]) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for &b in bytes {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
 }
 
 impl CompiledRule {
@@ -204,6 +216,8 @@ impl CompiledRule {
         case_sensitive: bool,
         color_key: &str,
         whole_line: bool,
+        variate: bool,
+        groups_only: bool,
     ) -> Option<Self> {
         if pattern.is_empty() {
             return None;
@@ -220,6 +234,8 @@ impl CompiledRule {
         let ((dr, dg, db), (lr, lg, lb)) = crate::store::highlight_palette(color_key);
         Some(Self {
             whole_line,
+            variate,
+            groups_only,
             color_dark: egui::Color32::from_rgb(dr, dg, db),
             color_light: egui::Color32::from_rgb(lr, lg, lb),
             literal,
@@ -235,10 +251,49 @@ impl CompiledRule {
         }
     }
 
+    /// Per-span color: base color, or a deterministic lightness variant
+    /// derived from the matched text (same text = same shade, so equal
+    /// values stay visually grouped). No-op when `variate` is off.
+    pub fn span_color(&self, dark: bool, matched: &str) -> egui::Color32 {
+        let base = self.color(dark);
+        if !self.variate || matched.is_empty() {
+            return base;
+        }
+        // 5 stable shades: -12% .. +12% lightness around the base color.
+        let k = 1.0 + ((fnv1a(matched.as_bytes()) % 5) as f32 - 2.0) * 0.06;
+        let scale = |c: u8| ((c as f32) * k).clamp(0.0, 255.0) as u8;
+        egui::Color32::from_rgb(scale(base.r()), scale(base.g()), scale(base.b()))
+    }
+
     /// Byte spans of matches in the ORIGINAL text (never panics on slicing:
     /// literal path is ASCII length-preserving, regex yields valid indices).
+    /// With `groups_only`, capture groups 1..n replace the whole match;
+    /// patterns without groups (or literal rules) fall back to full spans.
     pub fn find_spans(&self, text: &str) -> Vec<(usize, usize)> {
         if let Some(re) = &self.regex {
+            if self.groups_only {
+                let mut out = Vec::new();
+                for caps in re.captures_iter(text) {
+                    let mut any = false;
+                    for i in 1..caps.len() {
+                        if let Some(m) = caps.get(i) {
+                            if m.end() > m.start() {
+                                out.push((m.start(), m.end()));
+                                any = true;
+                            }
+                        }
+                    }
+                    if !any {
+                        // No captured group matched: fall back to group 0.
+                        if let Some(m) = caps.get(0) {
+                            if m.end() > m.start() {
+                                out.push((m.start(), m.end()));
+                            }
+                        }
+                    }
+                }
+                return out;
+            }
             return re
                 .find_iter(text)
                 .filter(|m| m.end() > m.start())
@@ -306,13 +361,14 @@ pub fn render_log_line(
             return ui.label(
                 egui::RichText::new(text.to_owned())
                     .monospace()
-                    .color(r.color(dark)),
+                    .color(r.span_color(dark, text)),
             );
         }
     }
     let spans = highlight_spans(if ts > 0 { &text[ts..] } else { text });
     // Merge builtin spans (priority 0) with user match spans (priority 1+).
-    // User rules win overlaps; earlier start wins ties.
+    // User rules win overlaps; earlier start wins ties. Per-span colors
+    // carry the variance shade so equal values group visually.
     let mut all: Vec<(usize, usize, u32, egui::Color32)> = spans
         .into_iter()
         .map(|(s, e, k)| (s + ts, e + ts, 0u32, color_for_theme(k, dark)))
@@ -325,7 +381,9 @@ pub fn render_log_line(
             if e <= ts {
                 continue; // keep timestamp color
             }
-            all.push((s.max(ts), e, 1 + ri as u32, r.color(dark)));
+            let (s, e) = (s.max(ts), e);
+            let c = r.span_color(dark, text.get(s..e).unwrap_or(""));
+            all.push((s, e, 1 + ri as u32, c));
         }
     }
     all.sort_by_key(|a| (a.0, a.2));
@@ -422,13 +480,60 @@ mod tests {
 
     #[test]
     fn user_rule_spans_ascii_safe() {
-        let r = CompiledRule::compile("rollback", false, false, "red", false).unwrap();
+        let r = CompiledRule::compile("rollback", false, false, "red", false, false, false).unwrap();
         assert_eq!(r.find_spans("ROLLBACK WORK done"), vec![(0, 8)]);
-        let cs = CompiledRule::compile("rollback", false, true, "red", false).unwrap();
+        let cs = CompiledRule::compile("rollback", false, true, "red", false, false, false).unwrap();
         assert!(cs.find_spans("ROLLBACK WORK").is_empty());
-        let rx = CompiledRule::compile("ERR(O|A)R", true, false, "red", false).unwrap();
+        let rx = CompiledRule::compile("ERR(O|A)R", true, false, "red", false, false, false).unwrap();
         assert_eq!(rx.find_spans("x ERROR y"), vec![(2, 7)]);
-        assert!(CompiledRule::compile("", false, false, "red", false).is_none());
-        assert!(CompiledRule::compile("([", true, false, "red", false).is_none());
+        assert!(CompiledRule::compile("", false, false, "red", false, false, false).is_none());
+        assert!(CompiledRule::compile("([", true, false, "red", false, false, false).is_none());
+    }
+
+    #[test]
+    fn groups_only_highlights_captures() {
+        let rx = CompiledRule::compile(r"id=(\d+)", true, true, "red", false, false, true).unwrap();
+        // Only the digits, not the "id=" prefix.
+        assert_eq!(rx.find_spans("req id=42 ok"), vec![(7, 9)]);
+        // Multiple groups all highlighted.
+        let rx2 = CompiledRule::compile(r"(\w+)=(\d+)", true, true, "blue", false, false, true).unwrap();
+        assert_eq!(rx2.find_spans("id=42"), vec![(0, 2), (3, 5)]);
+        // No groups: falls back to the whole match.
+        let rx3 = CompiledRule::compile(r"id=\d+", true, true, "red", false, false, true).unwrap();
+        assert_eq!(rx3.find_spans("req id=42 ok"), vec![(4, 9)]);
+        // Literal rules ignore groups_only.
+        let lit = CompiledRule::compile("id=42", false, true, "red", false, false, true).unwrap();
+        assert_eq!(lit.find_spans("req id=42 ok"), vec![(4, 9)]);
+    }
+
+    #[test]
+    fn variance_is_deterministic_per_text() {
+        let r = CompiledRule::compile("ERROR", false, true, "red", false, true, false).unwrap();
+        let a1 = r.span_color(true, "ERROR disk full");
+        let a2 = r.span_color(true, "ERROR disk full");
+        assert_eq!(a1, a2, "same text must give same shade");
+        // Off switch returns the exact base color.
+        let plain = CompiledRule::compile("ERROR", false, true, "red", false, false, false).unwrap();
+        assert_eq!(plain.span_color(true, "ERROR disk full"), plain.color(true));
+        // Shades stay near the base (bounded ±12% per channel-ish).
+        let base = plain.color(true);
+        for shade in ["ERROR a", "ERROR b", "timeout x", "id=1", "id=2"] {
+            let c = r.span_color(true, shade);
+            for (got, want) in [(c.r(), base.r()), (c.g(), base.g()), (c.b(), base.b())] {
+                let lo = (want as f32 * 0.85) as u8;
+                let hi = (want as f32 * 1.15).min(255.0) as u8;
+                assert!((lo..=hi).contains(&got), "shade drifted too far");
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_rule_json_still_loads() {
+        // Old configs lack variate/groups_only: serde defaults apply.
+        let rule: crate::store::HighlightRule =
+            serde_json::from_str(r#"{"name":"e","pattern":"ERROR","regex":false,"case_sensitive":false,"color":"red","whole_line":false,"enabled":true}"#)
+                .unwrap();
+        assert!(!rule.variate);
+        assert!(!rule.groups_only);
     }
 }
