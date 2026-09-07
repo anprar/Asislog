@@ -65,6 +65,20 @@ impl ViewMode {
 
 // ---------- one tab ----------
 
+/// One pinned result set ("keep results", klogg parity): a frozen copy of
+/// a finished search to compare against while the live query moves on.
+/// Session-only (never persisted): each holds at most MAX_STORED_HITS hits
+/// (24 B each), and at most MAX_KEPT snapshots per tab exist.
+#[derive(Clone, Debug)]
+pub(crate) struct KeptResult {
+    pub name: String,
+    pub query: String,
+    pub hits: Vec<Hit>,
+}
+
+/// Max pinned snapshots per tab (memory bound, documented in UI).
+pub(crate) const MAX_KEPT: usize = 5;
+
 pub(crate) struct TabState {
     pub(crate) doc: Doc,
     pub(crate) search_text: String,
@@ -109,6 +123,10 @@ pub(crate) struct TabState {
     pub(crate) range_applied: Option<(String, String)>,
     /// Panel hasil diciutkan (header saja) agar viewport log lega.
     pub(crate) results_collapsed: bool,
+    /// Pinned result snapshots (keep results) + which one is shown.
+    /// `kept_view=None` = live results; `Some(i)` = frozen snapshot i.
+    pub(crate) kept: Vec<KeptResult>,
+    pub(crate) kept_view: Option<usize>,
     pub(crate) goto_open: bool,
     pub(crate) goto_input: String,
     pub(crate) goto_msg: String,
@@ -202,6 +220,8 @@ impl TabState {
             mark_query: String::new(),
             range_applied: None,
             results_collapsed: true,
+            kept: Vec::new(),
+            kept_view: None,
             goto_open: false,
             goto_input: String::new(),
             goto_msg: String::new(),
@@ -310,11 +330,56 @@ impl TabState {
         self.search_text.clear();
         self.last_searched.clear();
         self.regex_complex = false;
+        self.kept_view = None;
         self.doc.hits.clear();
         self.doc.search_error = None;
         self.current_hit = None;
         self.results_collapsed = true;
         self.refresh_mode_map();
+    }
+
+    /// Pin the finished live results as a named snapshot (keep results,
+    /// klogg parity): the frozen copy survives query changes, rotation
+    /// clears it (line numbers would lie). Oldest drops past MAX_KEPT.
+    pub(crate) fn keep_results(&mut self, name: String) -> Result<(), &'static str> {
+        if self.doc.hits.is_empty() {
+            return Err("empty");
+        }
+        if self.kept.len() >= MAX_KEPT {
+            self.kept.remove(0);
+            if let Some(v) = self.kept_view.as_mut() {
+                *v = v.saturating_sub(1);
+            }
+        }
+        let title = if name.trim().is_empty() {
+            format!(
+                "{} · {}",
+                self.search_text.chars().take(30).collect::<String>(),
+                self.doc.hits.len()
+            )
+        } else {
+            name
+        };
+        self.kept.push(KeptResult {
+            name: title,
+            query: self.search_text.clone(),
+            hits: self.doc.hits.clone(),
+        });
+        self.kept_view = Some(self.kept.len() - 1);
+        Ok(())
+    }
+
+    /// Drop a snapshot; a viewed one falls back to live results.
+    pub(crate) fn drop_kept(&mut self, idx: usize) {
+        if idx >= self.kept.len() {
+            return;
+        }
+        self.kept.remove(idx);
+        match self.kept_view {
+            Some(v) if v == idx => self.kept_view = None,
+            Some(v) if v > idx => self.kept_view = Some(v - 1),
+            _ => {}
+        }
     }
 
     pub(crate) fn start_search(&mut self, history: &mut Vec<HistEntry>) {
@@ -349,6 +414,8 @@ impl TabState {
         let (tx, rx) = mpsc::channel();
         self.search_rx = Some(rx);
         self.doc.hits.clear();
+        // Kueri baru = kembali ke live; snapshot tersimpan tidak ikut berubah.
+        self.kept_view = None;
         self.refresh_mode_map();
         self.doc.search_truncated = false;
         self.doc.search_error = None;
@@ -1011,10 +1078,13 @@ impl TabState {
                     self.search_cache.clear();
                     // Isi baris berubah -> cache teks tampil ikut gugur.
                     self.disp_cache.clear();
-                    // Hasil & filter lama tak valid lagi di file baru.
-                    self.doc.hits.clear();
-                    self.current_hit = None;
-                    self.doc.search_in_progress = false;
+                      // Hasil & filter lama tak valid lagi di file baru.
+                      self.doc.hits.clear();
+                      self.current_hit = None;
+                      // Snapshot tersimpan mengacu nomor baris lama: gugur juga.
+                      self.kept.clear();
+                      self.kept_view = None;
+                      self.doc.search_in_progress = false;
                     self.doc.search_error = None;
                     self.doc.search_truncated = false;
                     self.doc.filter_map.clear();
@@ -1212,8 +1282,50 @@ mod tests {
         assert!(tab.doc.filter_active);
     }
 
+        #[test]
+    fn kept_snapshots_pin_view_and_drop() {
+        use crate::engine::search::Hit;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("k.log");
+        std::fs::write(&path, test_lines(3000, 100)).unwrap();
+        let mut tab = open_tab(&path);
+        // Nothing live: keeping fails honestly instead of snapshotting air.
+        assert!(tab.keep_results(String::new()).is_err());
+        assert!(tab.kept.is_empty());
+        // Fake a finished search (30 hits like the ERROR queries above).
+        tab.search_text = String::from("ERROR");
+        tab.doc.hits = (1..=30)
+            .map(|i| Hit { line: i * 100, byte: 0, col_start: 0, col_end: 5 })
+            .collect();
+        tab.keep_results(String::new()).unwrap();
+        assert_eq!(tab.kept.len(), 1);
+        assert_eq!(tab.kept_view, Some(0));
+        assert!(tab.kept[0].name.contains("ERROR"));
+        assert_eq!(tab.kept[0].hits.len(), 30);
+        // New search returns to live; the snapshot survives untouched.
+        tab.search_text = String::from("WARN");
+        tab.doc.hits.clear();
+        tab.kept_view = None; // (start_search does this; mirrored here)
+        tab.keep_results("second".into()).ok();
+        // Second keep failed (no hits) — still exactly one snapshot.
+        assert_eq!(tab.kept.len(), 1);
+        // Viewing then dropping falls back to live.
+        tab.kept_view = Some(0);
+        tab.drop_kept(0);
+        assert!(tab.kept.is_empty());
+        assert_eq!(tab.kept_view, None);
+        // Cap: oldest drops past MAX_KEPT.
+        for i in 0..(super::MAX_KEPT + 2) {
+            tab.doc.hits = vec![Hit { line: i as u64 + 1, byte: 0, col_start: 0, col_end: 1 }];
+            tab.keep_results(format!("s{}", i)).unwrap();
+        }
+        assert_eq!(tab.kept.len(), super::MAX_KEPT);
+        assert_eq!(tab.kept[0].name, "s2");
+    }
+
     #[test]
-    fn follow_rotation_clears_and_notifies() {        let dir = tempfile::tempdir().unwrap();
+    fn follow_rotation_clears_and_notifies() {
+        let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("h.log");
         std::fs::write(&path, test_lines(3000, 100)).unwrap();
         let mut tab = open_tab(&path);

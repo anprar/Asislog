@@ -85,6 +85,9 @@ pub struct Config {
     /// Mode Zen / padat (sembunyikan 5 baris kontrol menjadi 1 baris ramping).
     #[serde(default)]
     pub zen_mode: bool,
+    /// Dual-pane split: results pane opens tall beside/below the log.
+    #[serde(default)]
+    pub split_view: bool,
     /// Pilihan font monospace (Bawaan, JetBrains Mono, Consolas).
     #[serde(default)]
     pub font_family: Option<String>,
@@ -476,6 +479,7 @@ mod tests {
             zoom: 1.2,
             scratch: String::new(),
             zen_mode: false,
+            split_view: true,
             font_family: Some("JetBrains Mono".into()),
             sql_cols: false,
             lang: Some("en".into()),
@@ -489,6 +493,7 @@ mod tests {
         assert_eq!(back.favorites, cfg.favorites);
         assert_eq!(back.zoom, 1.2);
         assert_eq!(back.lang.as_deref(), Some("en"));
+        assert!(back.split_view);
         // Old config without lang still loads (backward compatible).
         let old = r#"{"zoom":1.0}"#;
         let old_cfg: Config = serde_json::from_str(old).unwrap();

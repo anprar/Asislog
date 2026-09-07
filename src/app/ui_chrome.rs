@@ -311,6 +311,19 @@ impl AsisLogApp {
                         self.zen_mode = true;
                         self.cfg_dirty = true;
                     }
+                    if ui
+                        .add(egui::Button::selectable(self.split_view, lang.tr("Bagi")))
+                        .on_hover_text(lang.tr("Dual-pane: panel hasil selalu terbuka lebar"))
+                        .clicked()
+                    {
+                        self.split_view = !self.split_view;
+                        self.cfg_dirty = true;
+                        if self.split_view {
+                            if let Some(t) = self.tabs.get_mut(self.current) {
+                                t.results_collapsed = false;
+                            }
+                        }
+                    }
                     if ui.button(lang.tr("Palet")).on_hover_text("Command Palette (Ctrl+Shift+P)").clicked() {
                         self.palette_open = true;
                         self.palette_query.clear();

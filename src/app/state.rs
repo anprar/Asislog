@@ -101,6 +101,8 @@ pub struct AsisLogApp {
     pub(crate) confirm: Option<ConfirmAction>,
     /// Mode Zen / padat (C-B1: sembunyikan 5 baris kontrol menjadi 1 baris ramping).
     pub(crate) zen_mode: bool,
+    /// Dual-pane: panel hasil selalu terbuka lebar (paritas klogg).
+    pub(crate) split_view: bool,
     /// Floating search HUD saat di Zen mode (Ctrl+F).
     pub(crate) zen_search_open: bool,
     /// Pilihan font monospace (C-B3: Bawaan, JetBrains Mono, Consolas).
@@ -231,6 +233,7 @@ impl AsisLogApp {
             goto_all: false,
             confirm: None,
             zen_mode: cfg.zen_mode,
+            split_view: cfg.split_view,
             zen_search_open: false,
             font_family: cfg.font_family.unwrap_or_else(|| "Bawaan".to_string()),
             sql_cols_enabled: cfg.sql_cols,
@@ -308,6 +311,7 @@ impl AsisLogApp {
             zoom: self.zoom,
             scratch,
             zen_mode: self.zen_mode,
+            split_view: self.split_view,
             font_family: Some(self.font_family.clone()),
             sql_cols: self.sql_cols_enabled,
             lang: Some(self.lang.key().to_string()),

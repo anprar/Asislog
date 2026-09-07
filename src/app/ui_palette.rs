@@ -14,6 +14,7 @@ pub const PALETTE_ACTIONS: &[PaletteAction] = &[
     PaletteAction { title: "Buka file log…", shortcut: "Ctrl+O", category: "File", id: "open_file" },
     PaletteAction { title: "Fokus pencarian", shortcut: "Ctrl+F", category: "Navigasi", id: "focus_search" },
     PaletteAction { title: "Toggle Mode Zen (Kepadatan)", shortcut: "F11", category: "Tampilan", id: "toggle_zen" },
+    PaletteAction { title: "Panel belah (dual-pane hasil)", shortcut: "", category: "Tampilan", id: "toggle_split" },
     PaletteAction { title: "Toggle Ikuti log (LIVE)", shortcut: "Ctrl+Shift+F", category: "Log", id: "toggle_follow" },
     PaletteAction { title: "Ke baris / cap waktu…", shortcut: "Ctrl+G", category: "Navigasi", id: "goto_line" },
     PaletteAction { title: "Ekspor hasil pencarian…", shortcut: "Ctrl+E", category: "Ekspor", id: "export_hits" },
@@ -200,6 +201,15 @@ impl AsisLogApp {
             "toggle_marks_panel" => {
                 if let Some(tab) = self.current_tab_mut() {
                     tab.show_bookmarks = !tab.show_bookmarks;
+                }
+            }
+            "toggle_split" => {
+                self.split_view = !self.split_view;
+                self.cfg_dirty = true;
+                if self.split_view {
+                    if let Some(t) = self.current_tab_mut() {
+                        t.results_collapsed = false;
+                    }
                 }
             }
             "open_scratch" => self.scratch_open = true,

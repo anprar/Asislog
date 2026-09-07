@@ -184,31 +184,54 @@ impl AsisLogApp {
                     });
             });
 
-        // ---- hasil pencarian: header ramping, collapsible ----
+        // ---- hasil pencarian: header ramping, collapsible, dual-pane ----
         // Tertutup = tepat 28px (header saja) agar viewport log lega;
-        // terbuka = resizable 30..460 (bawaan 180).
+        // terbuka = resizable (bawaan 180, 320 dalam mode Bagi).
+        // Mode Bagi (dual-pane, paritas klogg): panel selalu terbuka lebar
+        // sehingga log + hasil terlihat bersamaan seperti dua jendela klogg.
+        let split = self.split_view;
         let show_body = {
             let t = &self.tabs[cur_idx];
-            !t.results_collapsed
-                && (!t.search_text.trim().is_empty()
-                    || !t.doc.hits.is_empty()
-                    || t.doc.search_in_progress
-                    || t.doc.search_error.is_some())
+            split
+                || !t.results_collapsed
+                    && (!t.search_text.trim().is_empty()
+                        || !t.doc.hits.is_empty()
+                        || t.doc.search_in_progress
+                        || t.doc.search_error.is_some())
         };
-        let mut panel = egui::TopBottomPanel::bottom("hasil").max_height(460.0);
+        let mut panel = egui::TopBottomPanel::bottom("hasil")
+            .max_height(if split { 600.0 } else { 460.0 });
         if show_body {
-            panel = panel.resizable(true).default_height(180.0).min_height(30.0);
+            panel = panel
+                .resizable(true)
+                .default_height(if split { 320.0 } else { 180.0 })
+                .min_height(if split { 120.0 } else { 30.0 });
         } else {
             // Header saja; tinggi ikut zoom agar teks tak terpotong.
             panel = panel.exact_height((28.0 * self.zoom).round().clamp(24.0, 44.0));
         }
         panel.show(ctx, |ui| {
+                // Snapshot yang sedang dilihat (None = live). Disalin keluar
+                // dulu agar pinjam tab di bawah tidak konflik.
+                let kept_view: Option<usize> = self.tabs[cur_idx].kept_view;
+                let kept_names: Vec<String> =
+                    self.tabs[cur_idx].kept.iter().map(|k| k.name.clone()).collect();
+                let viewing_name: Option<String> =
+                    kept_view.and_then(|i| kept_names.get(i).cloned());
                 ui.horizontal(|ui| {
-                    let n = self.tabs[cur_idx].doc.hits.len();
-                    ui.strong(lang.f1("Hasil ({})", format_count(n as u64)));
-                    if let Some(c) = self.tabs[cur_idx].current_hit {
-                        if n > 0 {
-                            ui.label(lang.f2("dipilih #{}/{}", c + 1, n));
+                    let n = match kept_view {
+                        Some(i) => self.tabs[cur_idx].kept.get(i).map(|k| k.hits.len()).unwrap_or(0),
+                        None => self.tabs[cur_idx].doc.hits.len(),
+                    };
+                    match &viewing_name {
+                        Some(name) => ui.strong(format!("{} ({})", name, format_count(n as u64))),
+                        None => ui.strong(lang.f1("Hasil ({})", format_count(n as u64))),
+                    };
+                    if kept_view.is_none() {
+                        if let Some(c) = self.tabs[cur_idx].current_hit {
+                            if n > 0 {
+                                ui.label(lang.f2("dipilih #{}/{}", c + 1, n));
+                            }
                         }
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -220,7 +243,7 @@ impl AsisLogApp {
                             self.tabs[cur_idx].clear_search();
                         }
                         let t = &mut self.tabs[cur_idx];
-                        let (icon, tip) = if t.results_collapsed {
+                        let (icon, tip) = if t.results_collapsed && !split {
                             (Icon::ChevronDown, lang.tr("Tampilkan panel hasil"))
                         } else {
                             (Icon::ChevronUp, lang.tr("Ciutkan panel hasil"))
@@ -236,8 +259,7 @@ impl AsisLogApp {
                 }
                 ui.horizontal_wrapped(|ui| {
                     // konteks hasil terpilih
-                    if ui.button(lang.tr("Tampilkan ±20 baris")).clicked() {
-                        let t = &mut self.tabs[cur_idx];
+                    if ui.button(lang.tr("Tampilkan ±20 baris")).clicked() {                        let t = &mut self.tabs[cur_idx];
                         if let Some(c) = t.current_hit {
                             if let Some(h) = t.doc.hits.get(c) {
                                 let ln = h.line;
@@ -286,7 +308,64 @@ impl AsisLogApp {
                         self.tabs[cur_idx].export_open = true;
                     }
                 });
-            let total = self.tabs[cur_idx].doc.hits.len();
+                // Keep results (paritas klogg): bekukan hasil live menjadi
+                // snapshot bernama; query boleh pindah tanpa kehilangan.
+                // Session-only, maks 5 per tab (lihat MAX_KEPT).
+                ui.horizontal_wrapped(|ui| {
+                    let can_keep = !self.tabs[cur_idx].doc.hits.is_empty()
+                        && self.tabs[cur_idx].kept.len() < crate::app::tab::MAX_KEPT
+                        && kept_view.is_none();
+                    if ui
+                        .add_enabled(can_keep, egui::Button::new(lang.tr("Simpan hasil")))
+                        .on_hover_text(lang.tr("Bekukan hasil ini sebagai snapshot"))
+                        .clicked()
+                    {
+                        let t = &mut self.tabs[cur_idx];
+                        let auto = format!(
+                            "{} · {}",
+                            t.search_text.chars().take(30).collect::<String>(),
+                            t.doc.hits.len()
+                        );
+                        if t.keep_results(auto).is_err() {
+                            t.doc.status = lang.tr("Tidak ada hasil untuk disimpan.").to_string();
+                        }
+                    }
+                    if !kept_names.is_empty() || kept_view.is_some() {
+                        let cur_label = viewing_name
+                            .clone()
+                            .unwrap_or_else(|| lang.tr("Live").to_string());
+                        egui::ComboBox::from_id_salt("kept_view")
+                            .selected_text(cur_label)
+                            .show_ui(ui, |ui| {
+                                if ui
+                                    .selectable_label(kept_view.is_none(), lang.tr("Live"))
+                                    .on_hover_text(lang.tr("Kembali ke hasil live"))
+                                    .clicked()
+                                {
+                                    self.tabs[cur_idx].kept_view = None;
+                                }
+                                for (i, name) in kept_names.iter().enumerate() {
+                                    if ui.selectable_label(kept_view == Some(i), name).clicked() {
+                                        self.tabs[cur_idx].kept_view = Some(i);
+                                        self.tabs[cur_idx].results_collapsed = false;
+                                    }
+                                }
+                            });
+                        if kept_view.is_some()
+                            && ui
+                                .small_button("×")
+                                .on_hover_text(lang.tr("Hapus snapshot ini"))
+                                .clicked()
+                        {
+                            self.tabs[cur_idx].drop_kept(kept_view.unwrap_or(0));
+                        }
+                    }
+                });
+            let total: usize = match kept_view {
+                Some(i) => self.tabs[cur_idx].kept.get(i).map(|k| k.hits.len()).unwrap_or(0),
+                None => self.tabs[cur_idx].doc.hits.len(),
+            };
+            let live = kept_view.is_none();
             if total == 0 {
                 ui.label(lang.tr("Belum ada hasil. Ketik kata kunci di kolom Cari."));
             } else {
@@ -299,8 +378,23 @@ impl AsisLogApp {
                         // Decode preview per row (cached in Doc); Hit disalin
                         // per baris terlihat saja (24 B), bukan seluruh vec.
                         for i in range {
-                            let Some(h) = self.tabs[cur_idx].doc.hits.get(i).cloned() else {
-                                continue;
+                            // Snapshot dibaca per indeks (tanpa clone seluruh vec).
+                            let h = if live {
+                                match self.tabs[cur_idx].doc.hits.get(i).cloned() {
+                                    Some(h) => h,
+                                    None => continue,
+                                }
+                            } else {
+                                let kv = self.tabs[cur_idx].kept_view.unwrap_or(usize::MAX);
+                                match self.tabs[cur_idx]
+                                    .kept
+                                    .get(kv)
+                                    .and_then(|k| k.hits.get(i))
+                                    .cloned()
+                                {
+                                    Some(h) => h,
+                                    None => continue,
+                                }
                             };
                             // Kepala 16 KiB (baris raksasa tak dirender penuh).
                             let (text, total_b, trunc) = self.tabs[cur_idx]
@@ -317,10 +411,16 @@ impl AsisLogApp {
                                 ));
                             }
                             let disp = self.tabs[cur_idx].display_cached(h.line, &text);
-                            let sel = self.tabs[cur_idx].current_hit == Some(i);
+                            let sel = live && self.tabs[cur_idx].current_hit == Some(i);
                             let label = result_row(i, h.line, &disp);
                             if ui.selectable_label(sel, label).clicked() {
-                                self.tabs[cur_idx].jump_to_hit(i);
+                                if live {
+                                    self.tabs[cur_idx].jump_to_hit(i);
+                                } else {
+                                    // Snapshot beku: lompat langsung, tanpa
+                                    // menggeser current_hit milik live.
+                                    self.tabs[cur_idx].nav_to(h.line);
+                                }
                             }
                         }
                     });
