@@ -1,3 +1,0 @@
-2026-09-04 10:00:01 ERROR OrderService boom id=1
-2026-09-04 10:00:02 INFO ok id=2
-2026-09-04 10:00:03 ERROR Timeout id=3
