@@ -160,7 +160,12 @@ impl AsisLogApp {
         // Config global (preset, sorotan, tema, riwayat); abaikan bila belum ada.
         let mut cfg = crate::store::load();
         crate::store::migrate_sets(&mut cfg);
-        let lang = cfg.lang.as_deref().map(Lang::from_key).unwrap_or_default();
+        // Saved choice wins; first run (no saved lang) follows OS locale.
+        let lang = cfg
+            .lang
+            .as_deref()
+            .map(Lang::from_key)
+            .unwrap_or_else(Lang::detect_system_lang);
         let tema = cfg
             .tema
             .as_deref()

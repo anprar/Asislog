@@ -193,6 +193,19 @@ asislog --help                     tampilkan bantuan ringkas
   toggle aktif (Aa, .*, LIVE) memakai gaya terpilih yang tegas.
   Semua ikon tombol digambar vektor (tanpa font simbol) sehingga tidak
   ada kotak tofu di Windows/Linux mana pun.
+- **Bahasa / Language**: menu **Bahasa** di bilah atas beralih
+  Indonesia ⇄ English seketika, tersimpan di `config.json` (portabel,
+  tanpa instal ulang). Palet (`Ctrl+Shift+P`) → *Ganti bahasa /
+  Switch language* bisa dipakai dari mode Zen. CLI:
+  `asislog --lang en --help` atau `ASISLOG_LANG=en`.
+  Format ekspor tiket Markdown stabil dua bahasa agar tetap bisa di-grep.
+- **Language**: the **Bahasa** menu in the top bar switches
+  Indonesian ⇄ English instantly, persisted to portable `config.json`.
+  Palette (`Ctrl+Shift+P`) → *Ganti bahasa / Switch language* also works
+  from Zen mode. CLI: `asislog --lang en --help` or `ASISLOG_LANG=en`.
+  First run (GUI) without saved config follows the OS locale (`LANG`/`LC_*`;
+  English for unknown locales, Indonesian when undetectable as before —
+  Windows display language needs OS APIs, so it stays Indonesian default).
   Panel hasil dan penanda bisa diubah ukurannya dengan menyeret pembatasnya;
   baris log yang panjang digulir mendatar agar tidak terpotong.
 - **Mode Zen (`F11`)**: Memadatkan seluruh bilah toolbar dan header 5-baris menjadi 1-baris ramping (22px) untuk memaksimalkan ruang baca log. Menekan `Ctrl+F` di mode Zen memunculkan jendela pencarian HUD melayang (floating search bar).

@@ -32,6 +32,37 @@ impl Lang {
         }
     }
 
+    /// Best-effort OS locale for FIRST RUN only (no saved `lang` in config).
+    /// Env-based, zero new dependencies (portable constraint): explicit
+    /// `ASISLOG_LANG` wins, then `LANGUAGE` (colon-separated priority),
+    /// `LC_ALL`, `LANG`, `LC_MESSAGES`. `en*` → En, `id*`/`ms*` → Id,
+    /// `C`/`POSIX`/empty → keep looking, any other known locale → En
+    /// (lingua franca beats an untranslated default), nothing found →
+    /// Id (historical default).
+    /// Known limitation: Windows display language is invisible without OS
+    /// APIs (no std-only way); Windows users without these vars set keep
+    /// the Indonesian default and switch once in the toolbar.
+    pub fn detect_system_lang() -> Lang {
+        Self::detect_from_env(&["ASISLOG_LANG", "LANGUAGE", "LC_ALL", "LANG", "LC_MESSAGES"])
+    }
+
+    fn detect_from_env(keys: &[&str]) -> Lang {
+        for key in keys {
+            let Ok(v) = std::env::var(key) else { continue };
+            for part in v.split(':') {
+                let tag = part.trim().to_ascii_lowercase();
+                let lang = tag.split(['_', '.', '@']).next().unwrap_or("");
+                match lang {
+                    "en" => return Lang::En,
+                    "id" | "ms" => return Lang::Id,
+                    "" | "c" | "posix" => continue,
+                    _ => return Lang::En,
+                }
+            }
+        }
+        Lang::Id
+    }
+
     /// Name for an auto-created quick-label highlight set.
     /// Stored in config as ordinary data; old configs may hold either
     /// language's name, so callers must accept both (see toggle_label).
@@ -897,8 +928,46 @@ mod tests {
     }
 
     #[test]
-    fn quick_set_and_font_names() {
-        assert_eq!(Lang::Id.quick_set_name(), "Cepat");
+    fn system_locale_detection() {
+        // No other test reads locale env; still save/restore defensively.
+        let keys = ["ASISLOG_LANG", "LANGUAGE", "LC_ALL", "LANG", "LC_MESSAGES"];
+        let saved: Vec<(String, Option<String>)> = keys
+            .iter()
+            .map(|k| (k.to_string(), std::env::var(k).ok()))
+            .collect();
+        let clear = || {
+            for k in keys {
+                std::env::remove_var(k);
+            }
+        };
+        clear();
+        // Nothing set → historical Indonesian default.
+        assert_eq!(Lang::detect_system_lang(), Lang::Id);
+        std::env::set_var("LANG", "en_US.UTF-8");
+        assert_eq!(Lang::detect_system_lang(), Lang::En);
+        std::env::set_var("LANG", "id_ID.UTF-8");
+        assert_eq!(Lang::detect_system_lang(), Lang::Id);
+        // LANGUAGE priority list: first known wins; C skipped.
+        std::env::set_var("LANGUAGE", "C:en");
+        std::env::remove_var("LANG");
+        assert_eq!(Lang::detect_system_lang(), Lang::En);
+        // Unknown locale → English (not an untranslated default).
+        std::env::set_var("LANG", "de_DE.UTF-8");
+        std::env::remove_var("LANGUAGE");
+        assert_eq!(Lang::detect_system_lang(), Lang::En);
+        // Explicit override beats everything.
+        std::env::set_var("ASISLOG_LANG", "id");
+        assert_eq!(Lang::detect_system_lang(), Lang::Id);
+        clear();
+        for (k, v) in saved {
+            if let Some(v) = v {
+                std::env::set_var(k, v);
+            }
+        }
+    }
+
+    #[test]
+    fn quick_set_and_font_names() {        assert_eq!(Lang::Id.quick_set_name(), "Cepat");
         assert_eq!(Lang::En.quick_set_name(), "Quick");
         // Quick-label rule names round-trip per language.
         assert_eq!(Lang::Id.f2("Kunci {}: {}", 1, "ERROR"), "Kunci 1: ERROR");
@@ -1062,6 +1131,9 @@ mod tests {
         "Label:",
         "Font: {}",
         "Tab: {}",
+        // Self-bilingual palette title: shown as-is, found by typing
+        // either "bahasa" or "language" (fuzzy matches both halves).
+        "Ganti bahasa / Switch language",
     ];
 
     /// Extract `"..."` string literals from Rust source, skipping comments,

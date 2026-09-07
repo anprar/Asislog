@@ -36,6 +36,7 @@ pub const PALETTE_ACTIONS: &[PaletteAction] = &[
     PaletteAction { title: "Tema: Senja Biru", shortcut: "", category: "Tema", id: "theme_dusk" },
     PaletteAction { title: "Tema: Solarized Gelap", shortcut: "", category: "Tema", id: "theme_solar_dark" },
     PaletteAction { title: "Tema: Solarized Terang", shortcut: "", category: "Tema", id: "theme_solar_light" },
+    PaletteAction { title: "Ganti bahasa / Switch language", shortcut: "", category: "Tampilan", id: "toggle_language" },
     PaletteAction { title: "Zoom: Perbesar (+10%)", shortcut: "Ctrl+=", category: "Tampilan", id: "zoom_in" },
     PaletteAction { title: "Zoom: Perkecil (-10%)", shortcut: "Ctrl+-", category: "Tampilan", id: "zoom_out" },
     PaletteAction { title: "Zoom: Reset (100%)", shortcut: "Ctrl+0", category: "Tampilan", id: "zoom_reset" },
@@ -241,6 +242,10 @@ impl AsisLogApp {
             "theme_dusk" => { self.tema = Tema::SenjaBiru; self.cfg_dirty = true; }
             "theme_solar_dark" => { self.tema = Tema::SolarGelap; self.cfg_dirty = true; }
             "theme_solar_light" => { self.tema = Tema::SolarTerang; self.cfg_dirty = true; }
+            "toggle_language" => {
+                use crate::i18n::Lang;
+                self.set_lang(if self.lang == Lang::En { Lang::Id } else { Lang::En });
+            }
             "zoom_in" => self.bump_zoom(ctx, self.zoom + 0.1),
             "zoom_out" => self.bump_zoom(ctx, self.zoom - 0.1),
             "zoom_reset" => self.bump_zoom(ctx, 1.0),
