@@ -333,13 +333,9 @@ fn find_regex_fancy(
                     0
                 };
                 let mut iter = re.find_iter(text.as_ref() as &str);
-                loop {
-                    let m = match iter.next() {
-                        Some(Ok(m)) => m,
-                        // Backtrack error (catastrophic pattern on hostile
-                        // line): stop this line, keep scanning the rest.
-                        _ => break,
-                    };
+                // Backtrack error (catastrophic pattern on hostile line):
+                // stop this line, keep scanning the rest.
+                while let Some(Ok(m)) = iter.next() {
                     if m.end() == m.start() || m.start() < base_col {
                         continue;
                     }

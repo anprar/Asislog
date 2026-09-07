@@ -31,7 +31,6 @@ pub struct ShortcutDef {
     pub id: &'static str,
     /// Indonesian source for `lang.tr` (also the English fallback text).
     pub label_id: &'static str,
-    pub default: &'static str,
     pub key: egui::Key,
     pub req_ctrl: bool,
     pub req_shift: bool,
@@ -48,32 +47,32 @@ pub struct ShortcutDef {
 /// editor footer): Escape (dialog safety — unbinding it could trap dialogs)
 /// and the 1–9 quick color labels (dynamic group bound to the active query).
 pub const SHORTCUTS: &[ShortcutDef] = &[
-    ShortcutDef { id: "open_file", label_id: "Buka file log", default: "Ctrl+O", key: egui::Key::O, req_ctrl: true, req_shift: false, req_alt: false, extra_ctrl: false, extra_shift: true, extra_alt: true, needs_tab: false, allow_typing: true, allow_dialog: true },
-    ShortcutDef { id: "help", label_id: "Bantuan / daftar pintasan", default: "F1", key: egui::Key::F1, req_ctrl: false, req_shift: false, req_alt: false, extra_ctrl: true, extra_shift: true, extra_alt: true, needs_tab: false, allow_typing: true, allow_dialog: true },
-    ShortcutDef { id: "zen", label_id: "Mode Zen", default: "F11", key: egui::Key::F11, req_ctrl: false, req_shift: false, req_alt: false, extra_ctrl: true, extra_shift: true, extra_alt: true, needs_tab: false, allow_typing: true, allow_dialog: true },
-    ShortcutDef { id: "palette", label_id: "Command Palette", default: "Ctrl+Shift+P", key: egui::Key::P, req_ctrl: true, req_shift: true, req_alt: false, extra_ctrl: false, extra_shift: false, extra_alt: true, needs_tab: false, allow_typing: true, allow_dialog: true },
-    ShortcutDef { id: "focus_search", label_id: "Fokus ke kolom Cari", default: "Ctrl+F", key: egui::Key::F, req_ctrl: true, req_shift: false, req_alt: false, extra_ctrl: false, extra_shift: false, extra_alt: true, needs_tab: false, allow_typing: true, allow_dialog: true },
-    ShortcutDef { id: "next_hit", label_id: "Hasil berikutnya", default: "F3", key: egui::Key::F3, req_ctrl: false, req_shift: false, req_alt: false, extra_ctrl: true, extra_shift: true, extra_alt: true, needs_tab: true, allow_typing: true, allow_dialog: false },
-    ShortcutDef { id: "prev_hit", label_id: "Hasil sebelumnya", default: "Shift+F3", key: egui::Key::F3, req_ctrl: false, req_shift: true, req_alt: false, extra_ctrl: true, extra_shift: false, extra_alt: true, needs_tab: true, allow_typing: true, allow_dialog: false },
-    ShortcutDef { id: "next_hit_vi", label_id: "Hasil berikut/plin (gaya vi)", default: "N", key: egui::Key::N, req_ctrl: false, req_shift: false, req_alt: false, extra_ctrl: false, extra_shift: true, extra_alt: false, needs_tab: true, allow_typing: false, allow_dialog: false },
-    ShortcutDef { id: "goto", label_id: "Ke baris / persen / akhir / waktu", default: "Ctrl+G", key: egui::Key::G, req_ctrl: true, req_shift: false, req_alt: false, extra_ctrl: false, extra_shift: true, extra_alt: true, needs_tab: true, allow_typing: true, allow_dialog: false },
-    ShortcutDef { id: "export", label_id: "Ekspor hasil pencarian", default: "Ctrl+E", key: egui::Key::E, req_ctrl: true, req_shift: false, req_alt: false, extra_ctrl: false, extra_shift: true, extra_alt: true, needs_tab: true, allow_typing: true, allow_dialog: false },
-    ShortcutDef { id: "home", label_id: "Awal file", default: "Ctrl+Home", key: egui::Key::Home, req_ctrl: true, req_shift: false, req_alt: false, extra_ctrl: false, extra_shift: true, extra_alt: true, needs_tab: true, allow_typing: false, allow_dialog: false },
-    ShortcutDef { id: "end", label_id: "Akhir file", default: "Ctrl+End", key: egui::Key::End, req_ctrl: true, req_shift: false, req_alt: false, extra_ctrl: false, extra_shift: true, extra_alt: true, needs_tab: true, allow_typing: false, allow_dialog: false },
-    ShortcutDef { id: "follow", label_id: "Ikuti akhir file (LIVE)", default: "Ctrl+Shift+F", key: egui::Key::F, req_ctrl: true, req_shift: true, req_alt: false, extra_ctrl: false, extra_shift: false, extra_alt: true, needs_tab: true, allow_typing: false, allow_dialog: false },
-    ShortcutDef { id: "hist_back", label_id: "History mundur", default: "Alt+Left", key: egui::Key::ArrowLeft, req_ctrl: false, req_shift: false, req_alt: true, extra_ctrl: true, extra_shift: true, extra_alt: false, needs_tab: true, allow_typing: false, allow_dialog: false },
-    ShortcutDef { id: "hist_fwd", label_id: "History maju", default: "Alt+Right", key: egui::Key::ArrowRight, req_ctrl: false, req_shift: false, req_alt: true, extra_ctrl: true, extra_shift: true, extra_alt: false, needs_tab: true, allow_typing: false, allow_dialog: false },
-    ShortcutDef { id: "mark_prev", label_id: "Penanda sebelumnya", default: "Alt+Up", key: egui::Key::ArrowUp, req_ctrl: false, req_shift: false, req_alt: true, extra_ctrl: true, extra_shift: true, extra_alt: false, needs_tab: true, allow_typing: false, allow_dialog: false },
-    ShortcutDef { id: "mark_next", label_id: "Penanda berikutnya", default: "Alt+Down", key: egui::Key::ArrowDown, req_ctrl: false, req_shift: false, req_alt: true, extra_ctrl: true, extra_shift: true, extra_alt: false, needs_tab: true, allow_typing: false, allow_dialog: false },
-    ShortcutDef { id: "bookmark", label_id: "Tandai baris aktif", default: "Ctrl+B", key: egui::Key::B, req_ctrl: true, req_shift: false, req_alt: false, extra_ctrl: false, extra_shift: false, extra_alt: true, needs_tab: true, allow_typing: true, allow_dialog: false },
-    ShortcutDef { id: "marks_panel", label_id: "Panel penanda", default: "Ctrl+Shift+B", key: egui::Key::B, req_ctrl: true, req_shift: true, req_alt: false, extra_ctrl: false, extra_shift: false, extra_alt: true, needs_tab: true, allow_typing: true, allow_dialog: false },
-    ShortcutDef { id: "rename", label_id: "Ubah label penanda", default: "F2", key: egui::Key::F2, req_ctrl: false, req_shift: false, req_alt: false, extra_ctrl: true, extra_shift: true, extra_alt: true, needs_tab: true, allow_typing: true, allow_dialog: false },
-    ShortcutDef { id: "tab_next", label_id: "Pindah tab (berlaku juga saat mengetik)", default: "Ctrl+Tab", key: egui::Key::Tab, req_ctrl: true, req_shift: false, req_alt: false, extra_ctrl: false, extra_shift: true, extra_alt: false, needs_tab: false, allow_typing: true, allow_dialog: true },
-    ShortcutDef { id: "tab_prev", label_id: "Tab sebelumnya", default: "Ctrl+Shift+Tab", key: egui::Key::Tab, req_ctrl: true, req_shift: true, req_alt: false, extra_ctrl: false, extra_shift: false, extra_alt: false, needs_tab: false, allow_typing: true, allow_dialog: true },
-    ShortcutDef { id: "zoom_in", label_id: "Zoom UI", default: "Ctrl+=", key: egui::Key::Equals, req_ctrl: true, req_shift: false, req_alt: false, extra_ctrl: false, extra_shift: false, extra_alt: false, needs_tab: false, allow_typing: true, allow_dialog: false },
-    ShortcutDef { id: "zoom_out", label_id: "Perkecil", default: "Ctrl+-", key: egui::Key::Minus, req_ctrl: true, req_shift: false, req_alt: false, extra_ctrl: false, extra_shift: false, extra_alt: false, needs_tab: false, allow_typing: true, allow_dialog: false },
-    ShortcutDef { id: "zoom_reset", label_id: "Reset zoom", default: "Ctrl+0", key: egui::Key::Num0, req_ctrl: true, req_shift: false, req_alt: false, extra_ctrl: false, extra_shift: false, extra_alt: false, needs_tab: false, allow_typing: true, allow_dialog: false },
-    ShortcutDef { id: "split", label_id: "Panel belah (dual-pane hasil)", default: "Ctrl+Shift+S", key: egui::Key::S, req_ctrl: true, req_shift: true, req_alt: false, extra_ctrl: false, extra_shift: false, extra_alt: false, needs_tab: false, allow_typing: true, allow_dialog: true },
+    ShortcutDef { id: "open_file", label_id: "Buka file log", key: egui::Key::O, req_ctrl: true, req_shift: false, req_alt: false, extra_ctrl: false, extra_shift: true, extra_alt: true, needs_tab: false, allow_typing: true, allow_dialog: true },
+    ShortcutDef { id: "help", label_id: "Bantuan / daftar pintasan", key: egui::Key::F1, req_ctrl: false, req_shift: false, req_alt: false, extra_ctrl: true, extra_shift: true, extra_alt: true, needs_tab: false, allow_typing: true, allow_dialog: true },
+    ShortcutDef { id: "zen", label_id: "Mode Zen", key: egui::Key::F11, req_ctrl: false, req_shift: false, req_alt: false, extra_ctrl: true, extra_shift: true, extra_alt: true, needs_tab: false, allow_typing: true, allow_dialog: true },
+    ShortcutDef { id: "palette", label_id: "Command Palette", key: egui::Key::P, req_ctrl: true, req_shift: true, req_alt: false, extra_ctrl: false, extra_shift: false, extra_alt: true, needs_tab: false, allow_typing: true, allow_dialog: true },
+    ShortcutDef { id: "focus_search", label_id: "Fokus ke kolom Cari", key: egui::Key::F, req_ctrl: true, req_shift: false, req_alt: false, extra_ctrl: false, extra_shift: false, extra_alt: true, needs_tab: false, allow_typing: true, allow_dialog: true },
+    ShortcutDef { id: "next_hit", label_id: "Hasil berikutnya", key: egui::Key::F3, req_ctrl: false, req_shift: false, req_alt: false, extra_ctrl: true, extra_shift: true, extra_alt: true, needs_tab: true, allow_typing: true, allow_dialog: false },
+    ShortcutDef { id: "prev_hit", label_id: "Hasil sebelumnya", key: egui::Key::F3, req_ctrl: false, req_shift: true, req_alt: false, extra_ctrl: true, extra_shift: false, extra_alt: true, needs_tab: true, allow_typing: true, allow_dialog: false },
+    ShortcutDef { id: "next_hit_vi", label_id: "Hasil berikut/plin (gaya vi)", key: egui::Key::N, req_ctrl: false, req_shift: false, req_alt: false, extra_ctrl: false, extra_shift: true, extra_alt: false, needs_tab: true, allow_typing: false, allow_dialog: false },
+    ShortcutDef { id: "goto", label_id: "Ke baris / persen / akhir / waktu", key: egui::Key::G, req_ctrl: true, req_shift: false, req_alt: false, extra_ctrl: false, extra_shift: true, extra_alt: true, needs_tab: true, allow_typing: true, allow_dialog: false },
+    ShortcutDef { id: "export", label_id: "Ekspor hasil pencarian", key: egui::Key::E, req_ctrl: true, req_shift: false, req_alt: false, extra_ctrl: false, extra_shift: true, extra_alt: true, needs_tab: true, allow_typing: true, allow_dialog: false },
+    ShortcutDef { id: "home", label_id: "Awal file", key: egui::Key::Home, req_ctrl: true, req_shift: false, req_alt: false, extra_ctrl: false, extra_shift: true, extra_alt: true, needs_tab: true, allow_typing: false, allow_dialog: false },
+    ShortcutDef { id: "end", label_id: "Akhir file", key: egui::Key::End, req_ctrl: true, req_shift: false, req_alt: false, extra_ctrl: false, extra_shift: true, extra_alt: true, needs_tab: true, allow_typing: false, allow_dialog: false },
+    ShortcutDef { id: "follow", label_id: "Ikuti akhir file (LIVE)", key: egui::Key::F, req_ctrl: true, req_shift: true, req_alt: false, extra_ctrl: false, extra_shift: false, extra_alt: true, needs_tab: true, allow_typing: false, allow_dialog: false },
+    ShortcutDef { id: "hist_back", label_id: "History mundur", key: egui::Key::ArrowLeft, req_ctrl: false, req_shift: false, req_alt: true, extra_ctrl: true, extra_shift: true, extra_alt: false, needs_tab: true, allow_typing: false, allow_dialog: false },
+    ShortcutDef { id: "hist_fwd", label_id: "History maju", key: egui::Key::ArrowRight, req_ctrl: false, req_shift: false, req_alt: true, extra_ctrl: true, extra_shift: true, extra_alt: false, needs_tab: true, allow_typing: false, allow_dialog: false },
+    ShortcutDef { id: "mark_prev", label_id: "Penanda sebelumnya", key: egui::Key::ArrowUp, req_ctrl: false, req_shift: false, req_alt: true, extra_ctrl: true, extra_shift: true, extra_alt: false, needs_tab: true, allow_typing: false, allow_dialog: false },
+    ShortcutDef { id: "mark_next", label_id: "Penanda berikutnya", key: egui::Key::ArrowDown, req_ctrl: false, req_shift: false, req_alt: true, extra_ctrl: true, extra_shift: true, extra_alt: false, needs_tab: true, allow_typing: false, allow_dialog: false },
+    ShortcutDef { id: "bookmark", label_id: "Tandai baris aktif", key: egui::Key::B, req_ctrl: true, req_shift: false, req_alt: false, extra_ctrl: false, extra_shift: false, extra_alt: true, needs_tab: true, allow_typing: true, allow_dialog: false },
+    ShortcutDef { id: "marks_panel", label_id: "Panel penanda", key: egui::Key::B, req_ctrl: true, req_shift: true, req_alt: false, extra_ctrl: false, extra_shift: false, extra_alt: true, needs_tab: true, allow_typing: true, allow_dialog: false },
+    ShortcutDef { id: "rename", label_id: "Ubah label penanda", key: egui::Key::F2, req_ctrl: false, req_shift: false, req_alt: false, extra_ctrl: true, extra_shift: true, extra_alt: true, needs_tab: true, allow_typing: true, allow_dialog: false },
+    ShortcutDef { id: "tab_next", label_id: "Pindah tab (berlaku juga saat mengetik)", key: egui::Key::Tab, req_ctrl: true, req_shift: false, req_alt: false, extra_ctrl: false, extra_shift: true, extra_alt: false, needs_tab: false, allow_typing: true, allow_dialog: true },
+    ShortcutDef { id: "tab_prev", label_id: "Tab sebelumnya", key: egui::Key::Tab, req_ctrl: true, req_shift: true, req_alt: false, extra_ctrl: false, extra_shift: false, extra_alt: false, needs_tab: false, allow_typing: true, allow_dialog: true },
+    ShortcutDef { id: "zoom_in", label_id: "Zoom UI", key: egui::Key::Equals, req_ctrl: true, req_shift: false, req_alt: false, extra_ctrl: false, extra_shift: false, extra_alt: false, needs_tab: false, allow_typing: true, allow_dialog: false },
+    ShortcutDef { id: "zoom_out", label_id: "Perkecil", key: egui::Key::Minus, req_ctrl: true, req_shift: false, req_alt: false, extra_ctrl: false, extra_shift: false, extra_alt: false, needs_tab: false, allow_typing: true, allow_dialog: false },
+    ShortcutDef { id: "zoom_reset", label_id: "Reset zoom", key: egui::Key::Num0, req_ctrl: true, req_shift: false, req_alt: false, extra_ctrl: false, extra_shift: false, extra_alt: false, needs_tab: false, allow_typing: true, allow_dialog: false },
+    ShortcutDef { id: "split", label_id: "Panel belah (dual-pane hasil)", key: egui::Key::S, req_ctrl: true, req_shift: true, req_alt: false, extra_ctrl: false, extra_shift: false, extra_alt: false, needs_tab: false, allow_typing: true, allow_dialog: true },
 ];
 
 /// Canonical display string for a default binding, e.g. "Ctrl+Shift+P".
@@ -306,7 +305,8 @@ pub fn key_from_name(s: &str) -> Option<egui::Key> {
 
 /// Build the runtime table: defaults, with stored overrides applied.
 /// Unknown ids and unparsable overrides are ignored (never break input).
-pub fn compile_all(overrides: &HashMap<String, String>) -> HashMap<String, ParsedBinding> {    let mut out = HashMap::new();
+pub fn compile_all(overrides: &HashMap<String, String>) -> HashMap<String, ParsedBinding> {
+    let mut out = HashMap::new();
     for def in SHORTCUTS {
         let parsed = match overrides.get(def.id) {
             Some(s) => match parse_binding(s) {
@@ -335,6 +335,54 @@ pub fn compile_all(overrides: &HashMap<String, String>) -> HashMap<String, Parse
         out.insert(def.id.to_string(), parsed);
     }
     out
+}
+
+impl AsisLogApp {
+    /// Rebuild the compiled table after load/edit/reset.
+    pub(crate) fn rebuild_shortcuts(&mut self) {
+        self.scut_compiled = compile_all(&self.scut_overrides);
+    }
+
+    /// Effective display string for an action (override or default).
+    pub(crate) fn scut_label(&self, id: &str) -> String {
+        if let Some(s) = self.scut_overrides.get(id) {
+            return s.clone();
+        }
+        SHORTCUTS
+            .iter()
+            .find(|d| d.id == id)
+            .map(default_string)
+            .unwrap_or_default()
+    }
+
+    /// True when the action's binding fires this frame AND its scope allows
+    /// the current context (tab presence, typing, dialogs). Centralizes the
+    /// legacy guard matrix so behavior cannot drift per call site.
+    pub(crate) fn scut_pressed(
+        &self,
+        ctx: &egui::Context,
+        id: &str,
+        has_tab: bool,
+        typing: bool,
+        dialog_open: bool,
+    ) -> bool {
+        let Some(def) = SHORTCUTS.iter().find(|d| d.id == id) else {
+            return false;
+        };
+        if def.needs_tab && !has_tab {
+            return false;
+        }
+        if !def.allow_typing && typing {
+            return false;
+        }
+        if !def.allow_dialog && dialog_open {
+            return false;
+        }
+        let Some(b) = self.scut_compiled.get(id) else {
+            return false; // unparsable override: unbound, input stays safe
+        };
+        binding_fired(ctx, b)
+    }
 }
 
 #[cfg(test)]
@@ -390,53 +438,5 @@ mod tests {
             assert_ne!(key_name(def.key), "?", "unnamed key for {}", def.id);
             assert_eq!(key_from_name(&key_name(def.key).to_lowercase()), Some(def.key));
         }
-    }
-}
-
-impl AsisLogApp {
-    /// Rebuild the compiled table after load/edit/reset.
-    pub(crate) fn rebuild_shortcuts(&mut self) {
-        self.scut_compiled = compile_all(&self.scut_overrides);
-    }
-
-    /// Effective display string for an action (override or default).
-    pub(crate) fn scut_label(&self, id: &str) -> String {
-        if let Some(s) = self.scut_overrides.get(id) {
-            return s.clone();
-        }
-        SHORTCUTS
-            .iter()
-            .find(|d| d.id == id)
-            .map(default_string)
-            .unwrap_or_default()
-    }
-
-    /// True when the action's binding fires this frame AND its scope allows
-    /// the current context (tab presence, typing, dialogs). Centralizes the
-    /// legacy guard matrix so behavior cannot drift per call site.
-    pub(crate) fn scut_pressed(
-        &self,
-        ctx: &egui::Context,
-        id: &str,
-        has_tab: bool,
-        typing: bool,
-        dialog_open: bool,
-    ) -> bool {
-        let Some(def) = SHORTCUTS.iter().find(|d| d.id == id) else {
-            return false;
-        };
-        if def.needs_tab && !has_tab {
-            return false;
-        }
-        if !def.allow_typing && typing {
-            return false;
-        }
-        if !def.allow_dialog && dialog_open {
-            return false;
-        }
-        let Some(b) = self.scut_compiled.get(id) else {
-            return false; // unparsable override: unbound, input stays safe
-        };
-        binding_fired(ctx, b)
     }
 }

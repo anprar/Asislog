@@ -229,6 +229,9 @@ fn search_chunk_bytes(
     hits
 }
 
+/// 8 args (clippy:too_many_arguments allowed): the worker needs the full
+/// search context and every caller passes plain values (no builder needed).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_search(
     params: SearchJobParams,
     query: String,
@@ -240,8 +243,7 @@ pub(crate) fn spawn_search(
     seek_to: Option<(u64, u64)>,
     encoding: Encoding,
     bom_len: usize,
-) {
-    std::thread::spawn(move || {
+) {    std::thread::spawn(move || {
         use std::io::Read;
         let SearchJobParams { path, gen, gen_shared, tx, cancel } = params;
         if query.trim().is_empty() {
@@ -927,13 +929,10 @@ pub(crate) fn spawn_fancy_search(
             let text = crate::engine::decode::decode_bytes(bytes, encoding);
             let ts: &str = &text;
             let mut iter = re.find_iter(ts);
-            loop {
-                let (s, e) = match iter.next() {
-                    Some(Ok(m)) => (m.start(), m.end()),
-                    // Backtrack meledak di baris ganas: lewati baris ini,
-                    // lanjutkan file (pekerja tak boleh hang).
-                    _ => break,
-                };
+            // Backtrack meledak di baris ganas: lewati baris ini,
+            // lanjutkan file (pekerja tak boleh hang).
+            while let Some(Ok(m)) = iter.next() {
+                let (s, e) = (m.start(), m.end());
                 if e == s {
                     continue;
                 }

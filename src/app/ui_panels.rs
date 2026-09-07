@@ -214,10 +214,13 @@ impl AsisLogApp {
                 // Snapshot yang sedang dilihat (None = live). Disalin keluar
                 // dulu agar pinjam tab di bawah tidak konflik.
                 let kept_view: Option<usize> = self.tabs[cur_idx].kept_view;
-                let kept_names: Vec<String> =
-                    self.tabs[cur_idx].kept.iter().map(|k| k.name.clone()).collect();
+                let kept_names: Vec<(String, String)> = self.tabs[cur_idx]
+                    .kept
+                    .iter()
+                    .map(|k| (k.name.clone(), k.query.clone()))
+                    .collect();
                 let viewing_name: Option<String> =
-                    kept_view.and_then(|i| kept_names.get(i).cloned());
+                    kept_view.and_then(|i| kept_names.get(i).map(|(n, _)| n.clone()));
                 ui.horizontal(|ui| {
                     let n = match kept_view {
                         Some(i) => self.tabs[cur_idx].kept.get(i).map(|k| k.hits.len()).unwrap_or(0),
@@ -344,8 +347,8 @@ impl AsisLogApp {
                                 {
                                     self.tabs[cur_idx].kept_view = None;
                                 }
-                                for (i, name) in kept_names.iter().enumerate() {
-                                    if ui.selectable_label(kept_view == Some(i), name).clicked() {
+                                for (i, (name, query)) in kept_names.iter().enumerate() {
+                                    if ui.selectable_label(kept_view == Some(i), name).on_hover_text(query).clicked() {
                                         self.tabs[cur_idx].kept_view = Some(i);
                                         self.tabs[cur_idx].results_collapsed = false;
                                     }
