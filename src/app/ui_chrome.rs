@@ -108,27 +108,64 @@ impl AsisLogApp {
 
 impl AsisLogApp {
     pub(crate) fn render_toolbar(&mut self, ctx: &egui::Context) {
-        // ---- bar bilah atas: sesi file ----
+        let lang = self.lang;
+        // Mode Zen (C-B1): 1 baris dinamis ramping, menghemat ~150px vertikal
+        if self.zen_mode {
+            egui::TopBottomPanel::top("zen_toolbar").show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    logo_icons::paint_logo(ui, 20.0);
+                    ui.strong("AsisLog");
+                    ui.separator();
+                    if !self.tabs.is_empty() {
+                        let cur_idx = self.current.min(self.tabs.len() - 1);
+                        ui.label(format!("Tab: {}", self.tabs[cur_idx].doc.file_name));
+                        if self.tabs.len() > 1 {
+                            ui.menu_button(lang.tr("Ganti tab v"), |ui| {
+                                for (i, t) in self.tabs.iter().enumerate() {
+                                    if ui.selectable_label(i == self.current, &t.doc.file_name).clicked() {
+                                        self.current = i;
+                                        ui.close();
+                                    }
+                                }
+                            });
+                        }
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button(lang.tr("Keluar Zen (F11)")).on_hover_text(lang.tr("Kembalikan bilah kontrol lengkap (F11)")).clicked() {
+                            self.zen_mode = false;
+                            self.cfg_dirty = true;
+                        }
+                        if ui.button(lang.tr("Cari (Ctrl+F)")).on_hover_text(lang.tr("Buka HUD pencarian melayang")).clicked() {
+                            self.zen_search_open = !self.zen_search_open;
+                        }
+                        if ui.button(lang.tr("Palet (Ctrl+Shift+P)")).clicked() {
+                            self.palette_open = true;
+                            self.palette_query.clear();
+                            self.palette_selected = 0;
+                        }
+                    });
+                });
+            });
+            return;
+        }
+
+        // ---- bar bilah atas standar: sesi file ----
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                // Logo + nama di kiri (PNG baked; fallback vektor anti-tofu).
-                if let Some(img) = logo_icons::logo_image() {
-                    ui.add(img.fit_to_exact_size(egui::vec2(26.0, 26.0)));
-                } else {
-                    logo_icons::paint_logo_fallback(ui, 26.0);
-                }
+                // Logo vektor AsisLog anti-tofu & DPI-crisp.
+                logo_icons::paint_logo(ui, 24.0);
                 ui.strong("AsisLog");
                 ui.separator();
-                if ui.button("Buka").clicked() {
+                if ui.button(lang.tr("Buka")).clicked() {
                     self.open_dialog();
                 }
                 // Riwayat file + favorit.
-                ui.menu_button("Riwayat v", |ui| {
+                ui.menu_button(lang.tr("Riwayat v"), |ui| {
                     let mut open: Option<PathBuf> = None;
                     let mut missing_recent: Option<String> = None;
                     let mut fav_toggle: Option<String> = None;
                     if !self.favorites.is_empty() {
-                        ui.label("Favorit:");
+                        ui.label(lang.tr("Favorit:"));
                         for r in self.favorites.clone() {
                             ui.horizontal(|ui| {
                                 let name = PathBuf::from(&r)
@@ -140,16 +177,13 @@ impl AsisLogApp {
                                     if p.exists() {
                                         open = Some(p);
                                     } else {
-                                        self.global_status = format!(
-                                            "File favorit tak ditemukan: {}",
-                                            r
-                                        );
+                                        self.global_status = lang.f1("File favorit tak ditemukan: {}", &r);
                                     }
                                     ui.close();
                                 }
                                 if ui
                                     .small_button("F")
-                                    .on_hover_text("Lepas favorit")
+                                    .on_hover_text(lang.tr("Lepas favorit"))
                                     .clicked()
                                 {
                                     fav_toggle = Some(r);
@@ -158,9 +192,9 @@ impl AsisLogApp {
                         }
                         ui.separator();
                     }
-                    ui.label("Terakhir dibuka:");
+                    ui.label(lang.tr("Terakhir dibuka:"));
                     if self.recent.is_empty() {
-                        ui.label("Belum ada riwayat.");
+                        ui.label(lang.tr("Belum ada riwayat."));
                     }
                     for r in self.recent.clone() {
                         ui.horizontal(|ui| {
@@ -180,7 +214,7 @@ impl AsisLogApp {
                             let is_fav = self.favorites.iter().any(|f| f == &r);
                             if ui
                                 .small_button(if is_fav { "[F]" } else { "F" })
-                                .on_hover_text("Jadikan favorit")
+                                .on_hover_text(lang.tr("Jadikan favorit"))
                                 .clicked()
                             {
                                 fav_toggle = Some(r);
@@ -191,7 +225,7 @@ impl AsisLogApp {
                         self.recent.retain(|p| p != &m);
                         self.save_config();
                         self.global_status =
-                            format!("File tidak ditemukan, dihapus dari riwayat: {}", m);
+                            lang.f1("File tidak ditemukan, dihapus dari riwayat: {}", m);
                     }
                     if let Some(f) = fav_toggle {
                         if self.favorites.iter().any(|x| x == &f) {
@@ -203,7 +237,7 @@ impl AsisLogApp {
                         self.save_config();
                     }
                     ui.separator();
-                    if ui.button("Bersihkan riwayat").clicked() {
+                    if ui.button(lang.tr("Bersihkan riwayat")).clicked() {
                         // Via modal konfirmasi (tak langsung).
                         self.confirm = Some(ConfirmAction::ClearRecent);
                         ui.close();
@@ -213,18 +247,18 @@ impl AsisLogApp {
                     }
                 });
                 // Buka dari URL / tempel teks (pekerjaan support).
-                ui.menu_button("URL/teks v", |ui| {
+                ui.menu_button(lang.tr("URL/teks v"), |ui| {
                     if ui
-                        .button("Buka URL…")
-                        .on_hover_text("Unduh http(s) ke temp lalu buka")
+                        .button(lang.tr("Buka URL…"))
+                        .on_hover_text(lang.tr("Unduh http(s) ke temp lalu buka"))
                         .clicked()
                     {
                         self.url_open = true;
                         ui.close();
                     }
                     if ui
-                        .button("Tempel teks…")
-                        .on_hover_text("Tempel teks (Ctrl+V) lalu buka sebagai file")
+                        .button(lang.tr("Tempel teks…"))
+                        .on_hover_text(lang.tr("Tempel teks (Ctrl+V) lalu buka sebagai file"))
                         .clicked()
                     {
                         self.paste_open = true;
@@ -232,10 +266,10 @@ impl AsisLogApp {
                     }
                 });
                 // Workspace produk: N log + filter + set sorotan + rentang waktu.
-                ui.menu_button("Workspace v", |ui| {
+                ui.menu_button(lang.tr("Workspace v"), |ui| {
                     if ui
-                        .button("Simpan workspace…")
-                        .on_hover_text("Simpan tab + filter + set sorotan ke 1 file JSON")
+                        .button(lang.tr("Simpan workspace…"))
+                        .on_hover_text(lang.tr("Simpan tab + filter + set sorotan ke 1 file JSON"))
                         .clicked()
                     {
                         let def = "workspace-asislog.json".to_string();
@@ -249,8 +283,8 @@ impl AsisLogApp {
                         ui.close();
                     }
                     if ui
-                        .button("Buka workspace…")
-                        .on_hover_text("Buka N log + filter + set sorotan dari file")
+                        .button(lang.tr("Buka workspace…"))
+                        .on_hover_text(lang.tr("Buka N log + filter + set sorotan dari file"))
                         .clicked()
                     {
                         if let Some(p) = rfd::FileDialog::new()
@@ -259,27 +293,55 @@ impl AsisLogApp {
                         {
                             match crate::store::load_workspace(&p) {
                                 Ok(ws) => self.open_workspace(ws),
-                                Err(e) => self.global_status = e,
+                                Err(e) => self.global_status = lang.tr_status(&e),
                             }
                         }
                         ui.close();
                     }
                 });
                 if self.tabs.is_empty() {
-                    ui.label("Belum ada file. Seret .log / .txt ke sini atau tekan Buka.");
+                    ui.label(lang.tr("Belum ada file. Seret .log / .txt ke sini atau tekan Buka."));
                 }
-                // Tema + bantuan di kanan baris sesi.
+                // Tema, bahasa, font, zen, palet, dan bantuan di kanan baris sesi.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("?").on_hover_text("Daftar pintasan (F1)").clicked() {
+                    if ui.button("?").on_hover_text(lang.tr("Daftar pintasan (F1)")).clicked() {
                         self.shortcuts_open = true;
                     }
-                    egui::ComboBox::from_label("Tema")
-                        .selected_text(self.tema.nama())
+                    if ui.button(lang.tr("Zen (F11)")).on_hover_text(lang.tr("Mode Zen: sembunyikan 5 baris kontrol ke 1 baris ramping (F11)")).clicked() {
+                        self.zen_mode = true;
+                        self.cfg_dirty = true;
+                    }
+                    if ui.button(lang.tr("Palet")).on_hover_text("Command Palette (Ctrl+Shift+P)").clicked() {
+                        self.palette_open = true;
+                        self.palette_query.clear();
+                        self.palette_selected = 0;
+                    }
+                    egui::ComboBox::from_id_salt("font_choice")
+                        .selected_text(format!("Font: {}", self.font_family))
+                        .show_ui(ui, |ui| {
+                            for f in ["Bawaan", "JetBrains Mono", "Consolas"] {
+                                if ui.selectable_label(self.font_family == f, f).clicked() {
+                                    self.font_family = f.to_string();
+                                    self.cfg_dirty = true;
+                                }
+                            }
+                        });
+                    egui::ComboBox::from_label(lang.tr("Tema"))
+                        .selected_text(self.tema.nama_in(lang))
                         .show_ui(ui, |ui| {
                             for t in Tema::semua() {
-                                if ui.selectable_label(self.tema == *t, t.nama()).clicked() {
+                                if ui.selectable_label(self.tema == *t, t.nama_in(lang)).clicked() {
                                     self.tema = *t;
                                     self.cfg_dirty = true;
+                                }
+                            }
+                        });
+                    egui::ComboBox::from_label(lang.tr("Bahasa/Language"))
+                        .selected_text(lang.label())
+                        .show_ui(ui, |ui| {
+                            for l in [crate::i18n::Lang::Id, crate::i18n::Lang::En] {
+                                if ui.selectable_label(lang == l, l.label()).clicked() {
+                                    self.set_lang(l);
                                 }
                             }
                         });

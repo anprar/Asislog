@@ -26,6 +26,7 @@ use super::*;
 
 impl AsisLogApp {
     pub(crate) fn render_panels(&mut self, ctx: &egui::Context, cur_idx: usize) {
+        let lang = self.lang;
         // Panel penanda (kiri, bisa diubah lebarnya agar tak menekan viewport)
         if self.tabs[cur_idx].show_bookmarks {
             let dark = self.tema_state.1;
@@ -35,13 +36,13 @@ impl AsisLogApp {
                 .min_width(180.0)
                 .max_width(460.0)
                 .show(ctx, |ui| {
-                    ui.heading("Penanda");
-                    ui.label("Ctrl+B tandai - F2 ubah label - Alt+Atas/Bawah pindah");
+                    ui.heading(lang.tr("Penanda"));
+                    ui.label(lang.tr("Ctrl+B tandai - F2 ubah label - Alt+Atas/Bawah pindah"));
                     let tab = &mut self.tabs[cur_idx];
                     ui.add(
                         egui::TextEdit::singleline(&mut tab.mark_query)
                             .id_source("tandai-saring")
-                            .hint_text("Saring penanda…")
+                            .hint_text(lang.tr("Saring penanda…"))
                             .desired_width(f32::INFINITY),
                     );
                     let q = tab.mark_query.to_lowercase();
@@ -58,7 +59,7 @@ impl AsisLogApp {
                         .map(|b| (b.line, b.label.clone(), b.color))
                         .collect();
                     if rows.is_empty() {
-                        ui.label("Belum ada. Klik nomor baris / Ctrl+B untuk menandai.");
+                        ui.label(lang.tr("Belum ada. Klik nomor baris / Ctrl+B untuk menandai."));
                     }
                     let mut jump: Option<u64> = None;
                     let mut rename: Option<(u64, String, BookmarkColor)> = None;
@@ -77,16 +78,16 @@ impl AsisLogApp {
                                 );
                                 if ui
                                     .button(format!("{} · {}", format_count(ln), label))
-                                    .on_hover_text(format!("Lompat ke baris {}", ln))
+                                    .on_hover_text(lang.f1("Lompat ke baris {}", ln))
                                     .clicked()
                                 {
                                     jump = Some(ln);
                                 }
-                                if ui.small_button("Ubah").on_hover_text("Ubah label (F2)").clicked()
+                                if ui.small_button(lang.tr("Ubah")).on_hover_text(lang.tr("Ubah label (F2)")).clicked()
                                 {
                                     rename = Some((ln, label.clone(), color));
                                 }
-                                if ui.small_button("×").on_hover_text("Hapus").clicked() {
+                                if ui.small_button("×").on_hover_text(lang.tr("Hapus")).clicked() {
                                     delete = Some(ln);
                                 }
                             });
@@ -124,50 +125,40 @@ impl AsisLogApp {
                                     egui::Color32::from_rgb(90, 220, 120),
                                     "LIVE",
                                 );
-                                ui.label("memantau tiap 500 ms");
+                                ui.label(lang.tr("memantau tiap 500 ms"));
                                 // Info baris baru yang segar (< 6 detik).
                                 if let Some((note, at)) = &tab.follow_note {
                                     if at.elapsed() < Duration::from_secs(6) {
-                                        ui.label(note.clone());
+                                        ui.label(lang.tr_status(note));
                                     }
                                 }
                             } else if tab.doc.follow {
-                                ui.label("LIVE dijeda - kembali ke akhir untuk melanjutkan");
+                                ui.label(lang.tr("LIVE dijeda - kembali ke akhir untuk melanjutkan"));
                             } else if !tab.doc.index.complete {
                                 // floor (bukan round): 100% hanya tepat saat selesai.
                                 let pct = (tab.doc.index.progress * 100.0).floor() as u32;
-                                ui.label(format!(
-                                    "Mengindeks {}% - {} baris terdeteksi",
-                                    pct.min(100),
-                                    format_count(tab.doc.index.total_lines),
-                                ));
+                                ui.label(lang.f2("Mengindeks {}% - {} baris terdeteksi", pct.min(100), format_count(tab.doc.index.total_lines)));
                             } else {
-                                ui.label("Siap");
+                                ui.label(lang.tr("Siap"));
                             }
                             ui.separator();
-                            ui.label(format!("File: {}", format_size(tab.doc.size)));
+                            ui.label(format!("{}: {}", lang.tr("File"), format_size(tab.doc.size)));
                             ui.separator();
                             let lines = if tab.doc.index.complete {
-                                format!("{} baris", format_count(tab.doc.index.total_lines))
+                                lang.f1("{} baris", format_count(tab.doc.index.total_lines))
                             } else {
-                                format!("~{} baris", format_count(tab.doc.line_count_estimate()))
+                                lang.f1("~{} baris", format_count(tab.doc.line_count_estimate()))
                             };
                             ui.label(lines);
                             ui.separator();
                             ui.label(tab.doc.encoding().label());
                             ui.separator();
-                            ui.label(format!(
-                                "Cari: {} hasil",
-                                format_count(tab.doc.hits.len() as u64)
-                            ));
+                            ui.label(lang.f1("Cari: {} hasil", format_count(tab.doc.hits.len() as u64)));
                             ui.separator();
                             ui.label(if tab.doc.filter_active {
-                                format!(
-                                    "Filter: aktif ({})",
-                                    format_count(tab.doc.filter_map.len())
-                                )
+                                lang.f1("Filter: aktif ({})", format_count(tab.doc.filter_map.len()))
                             } else {
-                                String::from("Filter: mati")
+                                lang.tr("Filter: mati").to_string()
                             });
                             ui.separator();
                             let total_rows = tab.total_view_rows();
@@ -182,17 +173,12 @@ impl AsisLogApp {
                             } else {
                                 0.0
                             };
-                            ui.label(format!(
-                                "Pos: baris {} ({}{:.0}%)",
-                                format_count(
+                            ui.label(lang.f3("Pos: baris {} ({}{}%)", format_count(
                                     tab.row_to_line(tab.top_row).unwrap_or(1)
-                                ),
-                                if tab.doc.index.complete { "" } else { "~" },
-                                pos.clamp(0.0, 100.0),
-                            ));
+                                ), if tab.doc.index.complete { "" } else { "~" }, format!("{:.0}", pos.clamp(0.0, 100.0))));
                             if !tab.doc.status.is_empty() {
                                 ui.separator();
-                                ui.label(tab.doc.status.clone());
+                                ui.label(lang.tr_status(&tab.doc.status.clone()));
                             }
                         });
                     });
@@ -219,25 +205,25 @@ impl AsisLogApp {
         panel.show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     let n = self.tabs[cur_idx].doc.hits.len();
-                    ui.strong(format!("Hasil ({})", format_count(n as u64)));
+                    ui.strong(lang.f1("Hasil ({})", format_count(n as u64)));
                     if let Some(c) = self.tabs[cur_idx].current_hit {
                         if n > 0 {
-                            ui.label(format!("dipilih #{}/{}", c + 1, n));
+                            ui.label(lang.f2("dipilih #{}/{}", c + 1, n));
                         }
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
                             .small_button("×")
-                            .on_hover_text("Bersihkan pencarian dan hentikan worker")
+                            .on_hover_text(lang.tr("Bersihkan pencarian dan hentikan worker"))
                             .clicked()
                         {
                             self.tabs[cur_idx].clear_search();
                         }
                         let t = &mut self.tabs[cur_idx];
                         let (icon, tip) = if t.results_collapsed {
-                            (Icon::ChevronDown, "Tampilkan panel hasil")
+                            (Icon::ChevronDown, lang.tr("Tampilkan panel hasil"))
                         } else {
-                            (Icon::ChevronUp, "Ciutkan panel hasil")
+                            (Icon::ChevronUp, lang.tr("Ciutkan panel hasil"))
                         };
                         if icon_button(ui, icon, tip).clicked() {
                             t.results_collapsed = !t.results_collapsed;
@@ -250,7 +236,7 @@ impl AsisLogApp {
                 }
                 ui.horizontal_wrapped(|ui| {
                     // konteks hasil terpilih
-                    if ui.button("Tampilkan ±20 baris").clicked() {
+                    if ui.button(lang.tr("Tampilkan ±20 baris")).clicked() {
                         let t = &mut self.tabs[cur_idx];
                         if let Some(c) = t.current_hit {
                             if let Some(h) = t.doc.hits.get(c) {
@@ -264,8 +250,8 @@ impl AsisLogApp {
                         }
                     }
                     if ui
-                        .button("Salin hasil")
-                        .on_hover_text("Salin semua hasil (maks 16 MB) ke papan klip")
+                        .button(lang.tr("Salin hasil"))
+                        .on_hover_text(lang.tr("Salin semua hasil (maks 16 MB) ke papan klip"))
                         .clicked()
                     {
                         let t = &mut self.tabs[cur_idx];
@@ -284,25 +270,25 @@ impl AsisLogApp {
                             out.push_str(&row);
                         }
                         if out.is_empty() {
-                            t.doc.status = String::from("Tidak ada hasil untuk disalin.");
+                            t.doc.status = lang.tr("Tidak ada hasil untuk disalin.").to_string();
                         } else {
                             ctx.copy_text(out);
                             t.doc.status = if over {
-                                String::from(
+                                lang.tr(
                                     "Hasil disalin sebagian (16 MB). Gunakan Ekspor untuk sisanya.",
-                                )
+                                ).to_string()
                             } else {
-                                String::from("Hasil disalin ke papan klip.")
+                                lang.tr("Hasil disalin ke papan klip.").to_string()
                             };
                         }
                     }
-                    if ui.button("Ekspor hasil…").clicked() {
+                    if ui.button(lang.tr("Ekspor hasil…")).clicked() {
                         self.tabs[cur_idx].export_open = true;
                     }
                 });
             let total = self.tabs[cur_idx].doc.hits.len();
             if total == 0 {
-                ui.label("Belum ada hasil. Ketik kata kunci di kolom Cari.");
+                ui.label(lang.tr("Belum ada hasil. Ketik kata kunci di kolom Cari."));
             } else {
                 let row_h = self.row_h();
                 egui::ScrollArea::vertical()

@@ -73,3 +73,74 @@ fn version_via_cmd_pipe() {
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stdout).contains("AsisLog"));
 }
+
+#[test]
+fn cli_count_subcommand() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("sample.log");
+    std::fs::write(&file, "Line 1\nLine 2\nLine 3\n").unwrap();
+
+    let out = Command::new(exe())
+        .args(["count", file.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .output()
+        .expect("spawn");
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("Baris: 3"), "got: {}", text);
+    assert!(text.contains("Ukuran:"), "got: {}", text);
+}
+
+#[test]
+fn cli_grep_subcommand() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("sample.log");
+    std::fs::write(&file, "2026-09-04 INFO start\n2026-09-04 ERROR disk full\n2026-09-04 INFO stop\n").unwrap();
+
+    // 1. Found: exit code 0
+    let out = Command::new(exe())
+        .args(["grep", "ERROR", file.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .output()
+        .expect("spawn");
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("ERROR disk full"), "got: {}", text);
+
+    // 2. Line number flag (-n)
+    let out_n = Command::new(exe())
+        .args(["grep", "-n", "ERROR", file.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .output()
+        .expect("spawn");
+    assert!(out_n.status.success());
+    let text_n = String::from_utf8_lossy(&out_n.stdout);
+    assert!(text_n.contains("2:2026-09-04 ERROR disk full"), "got: {}", text_n);
+
+    // 3. Count only flag (-c)
+    let out_c = Command::new(exe())
+        .args(["grep", "-c", "ERROR", file.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .output()
+        .expect("spawn");
+    assert!(out_c.status.success());
+    let text_c = String::from_utf8_lossy(&out_c.stdout);
+    assert_eq!(text_c.trim(), "1");
+
+    // 4. Not found: exit code 1
+    let out_none = Command::new(exe())
+        .args(["grep", "FATAL", file.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .output()
+        .expect("spawn");
+    assert_eq!(out_none.status.code(), Some(1));
+
+    // 5. Missing file: exit code 2
+    let out_err = Command::new(exe())
+        .args(["grep", "ERROR", "nonexistent_file_12345.log"])
+        .stdout(Stdio::piped())
+        .output()
+        .expect("spawn");
+    assert_eq!(out_err.status.code(), Some(2));
+}
+

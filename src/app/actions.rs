@@ -41,6 +41,11 @@ impl AsisLogApp {
             || self.url_open
             || self.paste_open
             || self.scratch_open
+            || self.palette_open
+            || self.zen_search_open
+            || self.hist_panel_open
+            || self.top_n_open
+            || self.hex_peek_open
             || self.confirm.is_some()
             || self.global_error.is_some()
             || self
@@ -62,16 +67,35 @@ impl AsisLogApp {
         if ctx.input(|i| i.key_pressed(egui::Key::F1)) {
             self.shortcuts_open = true;
         }
+        // F11: toggle Mode Zen (C-B1)
+        if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
+            self.zen_mode = !self.zen_mode;
+            self.cfg_dirty = true;
+            self.global_status = if self.zen_mode {
+                String::from("Mode Zen aktif (F11 untuk kembali).")
+            } else {
+                String::from("Mode Zen dinonaktifkan.")
+            };
+        }
+        // Ctrl+Shift+P: Command Palette (C-C3)
+        if ctrl && shift && ctx.input(|i| i.key_pressed(egui::Key::P)) {
+            self.palette_open = !self.palette_open;
+            self.palette_query.clear();
+            self.palette_selected = 0;
+        }
+        // Ctrl+F fokus cari: kami tandai lewat status (fokus widget di bawah via id)
+        if ctrl && !shift && ctx.input(|i| i.key_pressed(egui::Key::F)) {
+            if self.zen_mode {
+                self.zen_search_open = true;
+            }
+            ctx.memory_mut(|m| m.request_focus(egui::Id::new("cari")));
+        }
         // Angka & n/N milik editor saat mengetik di kolom teks / dialog terbuka.
         // (Dihitung SEBELUM pinjam tab: current_tab_mut meminjam seluruh self.)
         let (field_focused, dialog_open) = self.focus_state(ctx);
         let typing = field_focused || dialog_open;
         let Some(tab) = self.current_tab_mut() else { return };
         let mut sess_touch = false;
-        // Ctrl+F fokus cari: kami tandai lewat status (fokus widget di bawah via id)
-        if ctrl && ctx.input(|i| i.key_pressed(egui::Key::F)) {
-            ctx.memory_mut(|m| m.request_focus(egui::Id::new("cari")));
-        }
         // F3 / Shift+F3: boleh saat mengetik query (tangan di keyboard),
         // tapi jangan di balik dialog yang terbuka.
         if !dialog_open && ctx.input(|i| i.key_pressed(egui::Key::F3)) && !tab.doc.hits.is_empty() {
@@ -148,8 +172,18 @@ impl AsisLogApp {
                 }
             };
             if !tab_handled {
-                // Modal konfirmasi paling atas; Esc = Batal.
-                if self.confirm.is_some() {
+                // Modal konfirmasi / palet / HUD paling atas; Esc = Batal/Tutup.
+                if self.palette_open {
+                    self.palette_open = false;
+                } else if self.zen_search_open {
+                    self.zen_search_open = false;
+                } else if self.top_n_open {
+                    self.top_n_open = false;
+                } else if self.hex_peek_open {
+                    self.hex_peek_open = false;
+                } else if self.hist_panel_open {
+                    self.hist_panel_open = false;
+                } else if self.confirm.is_some() {
                     self.confirm = None;
                 } else if self.global_error.is_some() {
                     self.global_error = None;
@@ -652,6 +686,15 @@ pub(crate) fn color_name_id(key: &str) -> &'static str {
         .find(|(k, _)| *k == key)
         .map(|(_, n)| *n)
         .unwrap_or("Kuning")
+}
+
+/// Language-aware display name for a highlight color key.
+pub(crate) fn color_name_lang(key: &str, lang: crate::i18n::Lang) -> &'static str {
+    crate::store::highlight_color_names_for(lang)
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, n)| *n)
+        .unwrap_or(lang.tr("Kuning"))
 }
 
 /// Nama file aman dari nama set (ASCII saja, maks 40 char).

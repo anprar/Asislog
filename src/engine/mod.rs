@@ -18,12 +18,16 @@ pub mod mmap;
 pub mod query;
 pub mod scratch;
 pub mod search;
+pub mod sqlcols;
+pub mod top_n;
 
 pub use decode::Encoding;
 pub use filter::ParsedFilter;
 pub use index::SparseIndex;
 pub use lineset::LineSet;
 pub use search::Hit;
+pub use sqlcols::{parse_sql_cols, SqlCols};
+pub use top_n::{top_errors, top_sessions, TopItem};
 
 /// Max bytes allowed through clipboard (16 MB per spec).
 pub const COPY_CAP_BYTES: usize = 16 * 1024 * 1024;
@@ -80,14 +84,18 @@ impl BookmarkColor {
     }
 
     pub fn nama(self) -> &'static str {
-        match self {
+        self.nama_in(crate::i18n::Lang::Id)
+    }
+
+    pub fn nama_in(self, lang: crate::i18n::Lang) -> &'static str {
+        lang.tr(match self {
             BookmarkColor::Default => "Bawaan",
             BookmarkColor::Blue => "Biru",
             BookmarkColor::Green => "Hijau",
             BookmarkColor::Yellow => "Kuning",
             BookmarkColor::Red => "Merah",
             BookmarkColor::Purple => "Ungu",
-        }
+        })
     }
 
     pub fn key(self) -> &'static str {

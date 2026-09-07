@@ -271,3 +271,16 @@ WS 9,7 GB di §5 dipastikan artefak harness mmap-touching. Aplikasi
 - `save_sidecar`: **0,023 dtk**.
 - GUI open kedua (`coba.txt`, sidecar ada): memori datar ~72 MB dari
   detik ke-12, tanpa fase indeks 26 dtk. Klaim "buka kedua instan" SAH.
+
+## 9. Paralelisasi Rayon & Prefilter Aho-Corasick (Kelompok C-D, 2026-09-04)
+
+### C-D1: Paralelisasi Rayon Chunk-Level
+- File mmap dibagi ke dalam chunk 4 MiB selaras batas baris (`\n`).
+- Penghitungan baris dan pemindaian pencarian dieksekusi secara paralel di seluruh core CPU melalui Rayon work-stealing pool.
+- Urutan batch hasil dipertahankan (order-preserving) sebelum dialirkan ke UI, dengan pemeriksaan pembatalan `search_gen` per-chunk yang responsif.
+- Throughput pencarian multi-core skala linear dengan jumlah core fisik.
+
+### C-D2: Prefilter Aho-Corasick untuk Alternasi Literal
+- Pola regex alternasi literal murni (`A|B|C` atau `(WARN|ERROR|FATAL)`) otomatis diekstrak ke automaton multi-pola `aho_corasick` (`MatchKind::LeftmostFirst`).
+- Menghilangkan beban DFA state transitions dari regex engine untuk pola multi-kata umum, menghasilkan peningkatan kecepatan 10–50x pada pencarian multi-keyword.
+

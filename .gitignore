@@ -18,6 +18,8 @@ Thumbs.db
 *.profraw
 perf-*.log
 bench-data/
+# Portable release archives (rebuilt by CI release job, never commit binaries)
+*.zip
 # Scratch measurement logs at repo root (bench*.txt, mem*.txt, ...)
 bench*.txt
 mem*.txt

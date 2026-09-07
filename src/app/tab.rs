@@ -37,11 +37,15 @@ pub enum ViewMode {
 
 impl ViewMode {
     pub fn nama(self) -> &'static str {
-        match self {
+        self.nama_in(crate::i18n::Lang::Id)
+    }
+
+    pub fn nama_in(self, lang: crate::i18n::Lang) -> &'static str {
+        lang.tr(match self {
             ViewMode::All => "Semua",
             ViewMode::Hits => "Hasil",
             ViewMode::Marks => "Penanda",
-        }
+        })
     }
 
     pub fn semua() -> &'static [ViewMode] {
@@ -49,10 +53,11 @@ impl ViewMode {
     }
 
     /// Parse nama Indonesia kembali (untuk sesi/workspace); tak dikenal = Semua.
+    /// Accepts English too ("Results"/"Bookmarks") for forward compatibility.
     pub fn from_nama(s: &str) -> ViewMode {
         match s {
-            "Hasil" => ViewMode::Hits,
-            "Penanda" => ViewMode::Marks,
+            "Hasil" | "Results" => ViewMode::Hits,
+            "Penanda" | "Bookmarks" => ViewMode::Marks,
             _ => ViewMode::All,
         }
     }

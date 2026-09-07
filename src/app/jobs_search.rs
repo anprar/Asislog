@@ -23,6 +23,7 @@ use crate::ui::{
     viewer::{self, CompiledRule},
 };
 use super::*;
+use rayon::prelude::*;
 
 /// Shared plumbing for background search workers (keeps spawn_* signatures small).
 pub(crate) struct SearchJobParams {
@@ -36,6 +37,196 @@ pub(crate) struct SearchJobParams {
 /// True when the job must abort: superseded query (gen) or tab closed (cancel).
 fn job_stale(gen_shared: &Arc<AtomicU64>, gen: u64, cancel: &Arc<AtomicBool>) -> bool {
     cancel.load(Ordering::Relaxed) || gen_shared.load(Ordering::Relaxed) != gen
+}
+
+/// C-D2: Ekstrak cabang alternasi literal dari pola regex (contoh: `A|B|C` atau `(A|B|C)`).
+/// Mengembalikan `Some(Vec<String>)` jika seluruh cabang adalah literal tanpa metakarakter regex.
+pub(crate) fn extract_literal_alternations(pattern: &str) -> Option<Vec<String>> {
+    let s = pattern.trim();
+    let s = if s.starts_with('(') && s.ends_with(')') {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    };
+    if !s.contains('|') {
+        return None;
+    }
+    let parts: Vec<&str> = s.split('|').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let mut literals = Vec::new();
+    for part in parts {
+        let p = part.trim();
+        if p.is_empty() {
+            return None;
+        }
+        if p.chars().any(|c| {
+            matches!(
+                c,
+                '\\' | '^' | '$' | '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|'
+            )
+        }) {
+            return None;
+        }
+        literals.push(p.to_string());
+    }
+    Some(literals)
+}
+
+/// Pindai satu chunk biner utuh menggunakan pencocok (AC, Finder, atau Regex) dan hitung offset baris/kolom.
+#[allow(clippy::too_many_arguments)]
+fn search_chunk_bytes(
+    chunk_bytes: &[u8],
+    base_byte: u64,
+    start_line: u64,
+    finder: Option<&memchr::memmem::Finder>,
+    needle_len: usize,
+    re: Option<&regex::bytes::Regex>,
+    ac: Option<&aho_corasick::AhoCorasick>,
+    case_sensitive: bool,
+    scope: Option<(u64, u64)>,
+) -> Vec<Hit> {
+    let mut hits = Vec::new();
+    if let Some(ac) = ac {
+        // C-D2: Jalur super cepat Aho-Corasick untuk alternasi literal
+        let mut prev_s = 0usize;
+        let mut prev_line = start_line;
+        let mut prev_ls = 0usize;
+        for m in ac.find_iter(chunk_bytes) {
+            let (s, e) = (m.start(), m.end());
+            if e == s {
+                continue;
+            }
+            if let Some((ss, ee)) = scope {
+                let gp = base_byte + s as u64;
+                if gp < ss || gp >= ee {
+                    continue;
+                }
+            }
+            let gap = &chunk_bytes[prev_s..s];
+            let mut nl = 0u64;
+            let mut last_nl = 0usize;
+            for i in memchr::memchr_iter(b'\n', gap) {
+                nl += 1;
+                last_nl = i;
+            }
+            let (gline, ls) = if nl == 0 {
+                (prev_line, prev_ls)
+            } else {
+                (prev_line + nl, prev_s + last_nl + 1)
+            };
+            prev_s = s;
+            prev_line = gline;
+            prev_ls = ls;
+            let line_end = chunk_bytes[s..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .map(|k| s + k)
+                .unwrap_or(chunk_bytes.len());
+            let ce = e.min(line_end).saturating_sub(ls) as u32;
+            hits.push(Hit {
+                line: gline,
+                byte: base_byte + ls as u64,
+                col_start: s.saturating_sub(ls) as u32,
+                col_end: ce,
+            });
+            if hits.len() >= search::MAX_STORED_HITS {
+                break;
+            }
+        }
+    } else if let Some(finder) = finder {
+        let hay_owned;
+        let hay: &[u8] = if case_sensitive {
+            chunk_bytes
+        } else {
+            hay_owned = chunk_bytes.to_ascii_lowercase();
+            &hay_owned
+        };
+        let mut prev_m = 0usize;
+        let mut prev_line = start_line;
+        let mut prev_ls = 0usize;
+        for m in finder.find_iter(hay) {
+            let gap = &hay[prev_m..m];
+            let mut nl = 0u64;
+            let mut last_nl = 0usize;
+            for i in memchr::memchr_iter(b'\n', gap) {
+                nl += 1;
+                last_nl = i;
+            }
+            let (gline, ls) = if nl == 0 {
+                (prev_line, prev_ls)
+            } else {
+                (prev_line + nl, prev_m + last_nl + 1)
+            };
+            prev_m = m;
+            prev_line = gline;
+            prev_ls = ls;
+            let hit = Hit {
+                line: gline,
+                byte: base_byte + ls as u64,
+                col_start: (m - ls) as u32,
+                col_end: (m - ls + needle_len) as u32,
+            };
+            if let Some((ss, ee)) = scope {
+                let gp = base_byte + m as u64;
+                if gp < ss || gp >= ee {
+                    continue;
+                }
+            }
+            hits.push(hit);
+            if hits.len() >= search::MAX_STORED_HITS {
+                break;
+            }
+        }
+    } else if let Some(re) = re {
+        let mut prev_s = 0usize;
+        let mut prev_line = start_line;
+        let mut prev_ls = 0usize;
+        for m in re.find_iter(chunk_bytes) {
+            let (s, e) = (m.start(), m.end());
+            if e == s {
+                continue;
+            }
+            if let Some((ss, ee)) = scope {
+                let gp = base_byte + s as u64;
+                if gp < ss || gp >= ee {
+                    continue;
+                }
+            }
+            let gap = &chunk_bytes[prev_s..s];
+            let mut nl = 0u64;
+            let mut last_nl = 0usize;
+            for i in memchr::memchr_iter(b'\n', gap) {
+                nl += 1;
+                last_nl = i;
+            }
+            let (gline, ls) = if nl == 0 {
+                (prev_line, prev_ls)
+            } else {
+                (prev_line + nl, prev_s + last_nl + 1)
+            };
+            prev_s = s;
+            prev_line = gline;
+            prev_ls = ls;
+            let line_end = chunk_bytes[s..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .map(|k| s + k)
+                .unwrap_or(chunk_bytes.len());
+            let ce = e.min(line_end).saturating_sub(ls) as u32;
+            hits.push(Hit {
+                line: gline,
+                byte: base_byte + ls as u64,
+                col_start: s.saturating_sub(ls) as u32,
+                col_end: ce,
+            });
+            if hits.len() >= search::MAX_STORED_HITS {
+                break;
+            }
+        }
+    }
+    hits
 }
 
 pub(crate) fn spawn_search(
@@ -99,6 +290,171 @@ pub(crate) fn spawn_search(
         } else {
             None
         };
+
+        // C-D2: Prefilter / matcher Aho-Corasick untuk query regex berpola alternasi literal (A|B|C).
+        let pure_literal_ac = if regex_on {
+            extract_literal_alternations(&query).and_then(|lits| {
+                aho_corasick::AhoCorasick::builder()
+                    .ascii_case_insensitive(!case_sensitive)
+                    .match_kind(aho_corasick::MatchKind::LeftmostFirst)
+                    .build(&lits)
+                    .ok()
+            })
+        } else {
+            None
+        };
+
+        // C-D1: Paralelisasi Rayon untuk Chunk-Level Search via memory map
+        if let Ok(m) = crate::engine::mmap::open_mmap(&path) {
+            let total_size = m.len() as u64;
+            if total_size == 0 {
+                let _ = tx.send(SearchBatchMsg {
+                    gen,
+                    batch: Vec::new(),
+                    done: true,
+                    truncated: false,
+                    error: None,
+                    scanned: 0,
+                    total: 0,
+                });
+                return;
+            }
+
+            let (start_offset, initial_line) = match seek_to {
+                Some((sb, sl)) if sb < total_size => (sb as usize, sl.max(1)),
+                Some(_) => {
+                    let _ = tx.send(SearchBatchMsg {
+                        gen,
+                        batch: Vec::new(),
+                        done: true,
+                        truncated: false,
+                        error: None,
+                        scanned: total_size,
+                        total: total_size,
+                    });
+                    return;
+                }
+                None => (0usize, 1u64),
+            };
+
+            let slice = &m[start_offset..];
+            let chunk_target = search::SEARCH_CHUNK;
+            let mut chunk_ranges: Vec<(usize, usize)> = Vec::new();
+            let mut pos = 0;
+            while pos < slice.len() {
+                let mut next = (pos + chunk_target).min(slice.len());
+                if next < slice.len() {
+                    if let Some(nl) = memchr::memchr(b'\n', &slice[next..]) {
+                        next += nl + 1;
+                    } else {
+                        next = slice.len();
+                    }
+                }
+                chunk_ranges.push((pos, next));
+                pos = next;
+            }
+
+            // Hitung jumlah baris per chunk secara paralel untuk penomoran baris yang presisi
+            let chunk_lines: Vec<u64> = chunk_ranges
+                .par_iter()
+                .map(|&(start, end)| {
+                    memchr::memchr_iter(b'\n', &slice[start..end]).count() as u64
+                })
+                .collect();
+
+            let mut chunk_start_lines = Vec::with_capacity(chunk_ranges.len());
+            let mut cur_line = initial_line;
+            for count in chunk_lines {
+                chunk_start_lines.push(cur_line);
+                cur_line += count;
+            }
+
+            // Pindai chunk paralel dengan Rayon, mematuhi batas pembatalan search_gen
+            let finder_ref = finder.as_ref();
+            let re_ref = re.as_ref();
+            let ac_ref = pure_literal_ac.as_ref();
+            let needle_len = needle_cmp.len();
+
+            let chunk_results: Vec<Result<Vec<Hit>, ()>> = chunk_ranges
+                .par_iter()
+                .zip(chunk_start_lines.par_iter())
+                .map(|(&(start, end), &st_line)| {
+                    if job_stale(&gen_shared, gen, &cancel) {
+                        return Err(());
+                    }
+                    let chunk_bytes = &slice[start..end];
+                    let base_byte = (start_offset + start) as u64;
+                    let hits = search_chunk_bytes(
+                        chunk_bytes,
+                        base_byte,
+                        st_line,
+                        finder_ref,
+                        needle_len,
+                        re_ref,
+                        ac_ref,
+                        case_sensitive,
+                        scope,
+                    );
+                    Ok(hits)
+                })
+                .collect();
+
+            // Urutkan batch sebelum dikirim ke UI sesuai urutan chunk
+            let mut pending: Vec<Hit> = Vec::with_capacity(search::SEARCH_BATCH);
+            let mut total_found = 0usize;
+            let mut truncated = false;
+
+            for (i, res) in chunk_results.into_iter().enumerate() {
+                if job_stale(&gen_shared, gen, &cancel) {
+                    return;
+                }
+                let hits = match res {
+                    Ok(h) => h,
+                    Err(_) => return,
+                };
+                let (_, end) = chunk_ranges[i];
+                let scanned_bytes = (start_offset + end) as u64;
+
+                for hit in hits {
+                    pending.push(hit);
+                    total_found += 1;
+                    if pending.len() >= search::SEARCH_BATCH {
+                        let b = std::mem::take(&mut pending);
+                        let _ = tx.send(SearchBatchMsg {
+                            gen,
+                            batch: b,
+                            done: false,
+                            truncated: false,
+                            error: None,
+                            scanned: scanned_bytes,
+                            total: total_size,
+                        });
+                    }
+                    if total_found >= search::MAX_STORED_HITS {
+                        truncated = true;
+                        break;
+                    }
+                }
+                if truncated {
+                    break;
+                }
+            }
+
+            if job_stale(&gen_shared, gen, &cancel) {
+                return;
+            }
+            let _ = tx.send(SearchBatchMsg {
+                gen,
+                batch: pending,
+                done: true,
+                truncated,
+                error: None,
+                scanned: total_size,
+                total: total_size,
+            });
+            return;
+        }
+
         let file = match std::fs::File::open(&path) {
             Ok(f) => f,
             Err(e) => {
@@ -988,4 +1344,20 @@ mod tests {
             assert_eq!((g.line, g.byte), (w.line, w.byte));
         }
     }
+
+    #[test]
+    fn test_extract_literal_alternations() {
+        assert_eq!(
+            extract_literal_alternations("WARN|ERROR"),
+            Some(vec!["WARN".to_string(), "ERROR".to_string()])
+        );
+        assert_eq!(
+            extract_literal_alternations("(INFO|DEBUG|TRACE)"),
+            Some(vec!["INFO".to_string(), "DEBUG".to_string(), "TRACE".to_string()])
+        );
+        assert_eq!(extract_literal_alternations("foo.*bar"), None);
+        assert_eq!(extract_literal_alternations("ERROR"), None);
+        assert_eq!(extract_literal_alternations(""), None);
+    }
 }
+

@@ -73,6 +73,18 @@ pub struct Config {
     /// Isi scratchpad (dipotong 64 KB saat simpan).
     #[serde(default)]
     pub scratch: String,
+    /// Mode Zen / padat (sembunyikan 5 baris kontrol menjadi 1 baris ramping).
+    #[serde(default)]
+    pub zen_mode: bool,
+    /// Pilihan font monospace (Bawaan, JetBrains Mono, Consolas).
+    #[serde(default)]
+    pub font_family: Option<String>,
+    /// Mode tampilan kolom log transaksi / SQL.
+    #[serde(default)]
+    pub sql_cols: bool,
+    /// Bahasa UI: "id" (bawaan) / "en". None = Indonesia (kompatibel lama).
+    #[serde(default)]
+    pub lang: Option<String>,
 }
 
 fn default_zoom() -> f32 {
@@ -291,6 +303,17 @@ pub fn save_session(s: &Session) -> Result<(), String> {
 
 /// Builtin search presets (Indonesian names).
 pub fn builtin_presets() -> Vec<Preset> {
+    builtin_presets_for(crate::i18n::Lang::Id)
+}
+
+/// Builtin presets with UI language applied (query unchanged, name localized).
+pub fn builtin_presets_for(lang: crate::i18n::Lang) -> Vec<Preset> {
+    // Only "Transaksi" differs; keep queries stable across languages.
+    let transaksi = if lang == crate::i18n::Lang::En {
+        "SQL: Transaction"
+    } else {
+        "SQL: Transaksi"
+    };
     vec![
         Preset { name: "Java: ERROR".into(), query: "ERROR".into(), regex: false, case_sensitive: false },
         Preset { name: "Java: FATAL".into(), query: "FATAL".into(), regex: false, case_sensitive: false },
@@ -299,7 +322,7 @@ pub fn builtin_presets() -> Vec<Preset> {
         Preset { name: "Java: Connection refused".into(), query: "Connection refused".into(), regex: false, case_sensitive: false },
         Preset { name: "Java: timeout".into(), query: "timeout".into(), regex: false, case_sensitive: false },
         Preset { name: "SQL: Checkpoint".into(), query: "CHECKPOINT".into(), regex: false, case_sensitive: false },
-        Preset { name: "SQL: Transaksi".into(), query: "TRANSACTION".into(), regex: false, case_sensitive: false },
+        Preset { name: transaksi.into(), query: "TRANSACTION".into(), regex: false, case_sensitive: false },
         Preset { name: "SQL: Rollback".into(), query: "ROLLBACK".into(), regex: false, case_sensitive: false },
         Preset { name: "SQL: Commit".into(), query: "COMMIT".into(), regex: false, case_sensitive: false },
         Preset { name: "SQL: INSERT INTO".into(), query: "INSERT INTO".into(), regex: false, case_sensitive: false },
@@ -333,6 +356,25 @@ pub fn highlight_color_names() -> &'static [(&'static str, &'static str)] {
         ("pink", "Pink"),
         ("brown", "Cokelat"),
     ]
+}
+
+/// Language-aware color names (keys stable, display localized).
+pub fn highlight_color_names_for(lang: crate::i18n::Lang) -> &'static [(&'static str, &'static str)] {
+    if lang == crate::i18n::Lang::En {
+        &[
+            ("red", "Red"),
+            ("orange", "Orange"),
+            ("green", "Green"),
+            ("blue", "Blue"),
+            ("purple", "Purple"),
+            ("yellow", "Yellow"),
+            ("teal", "Teal"),
+            ("pink", "Pink"),
+            ("brown", "Brown"),
+        ]
+    } else {
+        highlight_color_names()
+    }
 }
 
 /// Sembilan warna label cepat (tombol 1-9).
@@ -422,6 +464,10 @@ mod tests {
             history: vec![HistEntry { query: "q".into(), regex: false, case_sensitive: false }],
             zoom: 1.2,
             scratch: String::new(),
+            zen_mode: false,
+            font_family: Some("JetBrains Mono".into()),
+            sql_cols: false,
+            lang: Some("en".into()),
         };
         let s = serde_json::to_string(&cfg).unwrap();
         let back: Config = serde_json::from_str(&s).unwrap();
@@ -431,6 +477,11 @@ mod tests {
         assert_eq!(back.history, cfg.history);
         assert_eq!(back.favorites, cfg.favorites);
         assert_eq!(back.zoom, 1.2);
+        assert_eq!(back.lang.as_deref(), Some("en"));
+        // Old config without lang still loads (backward compatible).
+        let old = r#"{"zoom":1.0}"#;
+        let old_cfg: Config = serde_json::from_str(old).unwrap();
+        assert!(old_cfg.lang.is_none());
     }
 
     #[test]

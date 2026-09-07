@@ -42,7 +42,13 @@ impl Tema {
 
     /// Nama Indonesia untuk UI.
     pub fn nama(self) -> &'static str {
-        match self {
+        self.nama_in(crate::i18n::Lang::Id)
+    }
+
+    /// Language-aware display name (keys stable for config).
+    pub fn nama_in(self, lang: crate::i18n::Lang) -> &'static str {
+        // Reuse the central dictionary so ID/EN stay in sync.
+        lang.tr(match self {
             Tema::Sistem => "Sistem (otomatis)",
             Tema::Gelap => "Gelap",
             Tema::Terang => "Terang",
@@ -52,7 +58,7 @@ impl Tema {
             Tema::SolarGelap => "Solarized gelap",
             Tema::SolarTerang => "Solarized terang",
             Tema::Monokai => "Monokai",
-        }
+        })
     }
 
     /// Kunci config untuk persistensi.

@@ -42,13 +42,29 @@ impl eframe::App for AsisLogApp {
             return;
         }
         let cur_idx = self.current.min(self.tabs.len() - 1);
-        self.render_tools(ctx, cur_idx);
-        self.render_search(ctx, cur_idx);
+        if !self.zen_mode {
+            self.render_tools(ctx, cur_idx);
+            self.render_search(ctx, cur_idx);
+        } else if self.zen_search_open {
+            self.render_zen_search(ctx, cur_idx);
+        }
         self.render_panels(ctx, cur_idx);
         self.render_viewport(ctx, cur_idx);
         self.render_dialogs_main(ctx, cur_idx);
         self.render_highlight(ctx);
         self.render_misc(ctx, cur_idx);
+        if self.hist_panel_open {
+            self.render_histogram_panel(ctx, cur_idx);
+        }
+        if self.top_n_open {
+            self.render_top_n_panel(ctx, cur_idx);
+        }
+        if self.hex_peek_open {
+            self.render_hex_peek_panel(ctx, cur_idx);
+        }
+        if self.palette_open {
+            self.render_palette(ctx);
+        }
         // Repaint hanya saat ada yang bergerak: indeks/search/filter/marker
         // latar, debounce tertunda, follow aktif, unduhan, atau catatan
         // follow yang harus kedaluwarsa. Idle = tanpa repaint paksa

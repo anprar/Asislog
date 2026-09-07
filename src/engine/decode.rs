@@ -127,9 +127,52 @@ pub fn strip_cr(mut s: String) -> String {
     s
 }
 
+/// Format a slice of raw bytes into classic hex view rows (C-C5: hex peek):
+/// [offset (8 hex)]: 16 hex bytes with mid-space | 16 ascii chars (dots for non-printable)
+pub fn format_hex_lines(bytes: &[u8], start_offset: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for (chunk_idx, chunk) in bytes.chunks(16).enumerate() {
+        let offset = start_offset + chunk_idx * 16;
+        let mut hex_part = String::with_capacity(50);
+        let mut ascii_part = String::with_capacity(18);
+        for (i, &b) in chunk.iter().enumerate() {
+            if i == 8 {
+                hex_part.push(' ');
+            }
+            use std::fmt::Write;
+            let _ = write!(hex_part, "{:02x} ", b);
+            if b.is_ascii_graphic() || b == b' ' {
+                ascii_part.push(b as char);
+            } else {
+                ascii_part.push('.');
+            }
+        }
+        if chunk.len() < 16 {
+            let missing = 16 - chunk.len();
+            for i in 0..missing {
+                if chunk.len() + i == 8 {
+                    hex_part.push(' ');
+                }
+                hex_part.push_str("   ");
+            }
+        }
+        out.push(format!("{:08x}: {} |{}|", offset, hex_part, ascii_part));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hex_lines_format() {
+        let raw = b"Hello, World!\x00\x01\x02";
+        let lines = format_hex_lines(raw, 0);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with("00000000: 48 65 6c 6c 6f 2c 20 57"));
+        assert!(lines[0].ends_with("|Hello, World!...|"));
+    }
 
     #[test]
     fn bom_detection() {

@@ -17,9 +17,12 @@ pub(crate) mod ui_chrome;
 pub(crate) mod ui_dialogs;
 pub(crate) mod ui_highlight;
 pub(crate) mod ui_misc;
+pub(crate) mod ui_histogram;
+pub(crate) mod ui_palette;
 pub(crate) mod ui_panels;
 pub(crate) mod ui_search;
 pub(crate) mod ui_tools;
+pub(crate) mod ui_tools_investigation;
 pub(crate) mod ui_viewport;
 
 // ---------- background messages ----------

@@ -26,30 +26,31 @@ use super::*;
 
 impl AsisLogApp {
     pub(crate) fn render_dialogs_main(&mut self, ctx: &egui::Context, cur_idx: usize) {
+        let lang = self.lang;
         // ---- dialog Ke… ----
         if self.tabs[cur_idx].goto_open {
             let mut do_go = false;
             let mut do_close = false;
             let mut goto_all = self.goto_all;
-            egui::Window::new("Ke baris / persen / waktu (Ctrl+G)")
+            egui::Window::new(lang.tr("Ke baris / persen / waktu (Ctrl+G)"))
                 .collapsible(false)
                 .show(ctx, |ui| {
                     let tab = &mut self.tabs[cur_idx];
-                    ui.label("Contoh: 38166903 · 50% · akhir · 2026-09-03 13:41:02");
+                    ui.label(lang.tr("Contoh: 38166903 · 50% · akhir · 2026-09-03 13:41:02"));
                     let r = ui.text_edit_singleline(&mut tab.goto_input);
                     // fokus awal
                     if tab.goto_input.is_empty() {
                         r.request_focus();
                     }
                     if !tab.goto_msg.is_empty() {
-                        ui.colored_label(egui::Color32::RED, &tab.goto_msg);
+                        ui.colored_label(egui::Color32::RED, lang.tr_status(&tab.goto_msg.clone()));
                     }
-                    ui.checkbox(&mut goto_all, "Semua tab (korelasi waktu/baris)");
+                    ui.checkbox(&mut goto_all, lang.tr("Semua tab (korelasi waktu/baris)"));
                     ui.horizontal(|ui| {
-                        if ui.button("Pergi").clicked() {
+                        if ui.button(lang.tr("Pergi")).clicked() {
                             do_go = true;
                         }
-                        if ui.button("Batal").clicked() {
+                        if ui.button(lang.tr("Batal")).clicked() {
                             do_close = true;
                         }
                     });
@@ -72,41 +73,43 @@ impl AsisLogApp {
             let mut do_ticket: Option<usize> = None;
             let mut do_close = false;
             let mut do_cancel = false;
-            egui::Window::new("Simpan hasil ke file…")
+            egui::Window::new(lang.tr("Simpan hasil ke file…"))
                 .collapsible(false)
                 .show(ctx, |ui| {
                     let tab = &mut self.tabs[cur_idx];
-                    ui.label(format!("{} hasil.", tab.doc.hits.len()));
+                    ui.label(lang.f1("{} hasil.", tab.doc.hits.len()));
                     ui.horizontal(|ui| {
-                        ui.label("Konteks (baris sekitar):");
+                        ui.label(lang.tr("Konteks (baris sekitar):"));
                         ui.add(egui::DragValue::new(&mut tab.export_context).range(0..=100));
                     });
                     if tab.export_rx.is_some() {
                         ui.label(
-                            tab.doc
+                            lang.tr_status(
+                                &tab.doc
                                 .status
                                 .clone(),
+                            ),
                         );
-                        ui.label("Ekspor berjalan di latar; dialog boleh ditutup.");
-                        if ui.button("Batalkan ekspor").clicked() {
+                        ui.label(lang.tr("Ekspor berjalan di latar; dialog boleh ditutup."));
+                        if ui.button(lang.tr("Batalkan ekspor")).clicked() {
                             do_cancel = true;
                         }
                     }
                     ui.horizontal(|ui| {
-                        if ui.button("Hanya hasil").clicked() {
+                        if ui.button(lang.tr("Hanya hasil")).clicked() {
                             do_export = Some(0);
                         }
-                        if ui.button("Hasil + konteks").clicked() {
+                        if ui.button(lang.tr("Hasil + konteks")).clicked() {
                             do_export = Some(tab.export_context);
                         }
-                        if ui.button("Batal").clicked() {
+                        if ui.button(lang.tr("Batal")).clicked() {
                             do_close = true;
                         }
                     });
                     ui.horizontal(|ui| {
                         if ui
-                            .button("Tiket Markdown (Jira)")
-                            .on_hover_text("Hasil + konteks sebagai Markdown siap paste")
+                            .button(lang.tr("Tiket Markdown (Jira)"))
+                            .on_hover_text(lang.tr("Hasil + konteks sebagai Markdown siap paste"))
                             .clicked()
                         {
                             do_ticket = Some(tab.export_context);
@@ -134,7 +137,7 @@ impl AsisLogApp {
                 let t = &mut self.tabs[cur_idx];
                 t.export_cancel.store(true, Ordering::Relaxed);
                 t.export_rx = None;
-                t.doc.status = String::from("Ekspor dibatalkan.");
+                t.doc.status = lang.tr("Ekspor dibatalkan.").to_string();
                 t.export_open = false;
             }
             if do_close {
@@ -147,28 +150,28 @@ impl AsisLogApp {
             let mut do_apply = false;
             let mut do_clear = false;
             let mut do_close = false;
-            egui::Window::new("Cakupan pencarian (baris)")
+            egui::Window::new(lang.tr("Cakupan pencarian (baris)"))
                 .collapsible(false)
                 .show(ctx, |ui| {
                     let tab = &mut self.tabs[cur_idx];
-                    ui.label("Cari hanya dalam rentang baris ini. Hemat untuk file besar.");
+                    ui.label(lang.tr("Cari hanya dalam rentang baris ini. Hemat untuk file besar."));
                     ui.horizontal_wrapped(|ui| {
-                        ui.label("Dari");
+                        ui.label(lang.tr("Dari"));
                         ui.text_edit_singleline(&mut tab.scope_a);
-                        ui.label("Sampai");
+                        ui.label(lang.tr("Sampai"));
                         ui.text_edit_singleline(&mut tab.scope_b);
                     });
                     if !tab.scope_msg.is_empty() {
-                        ui.colored_label(egui::Color32::RED, tab.scope_msg.clone());
+                        ui.colored_label(egui::Color32::RED, lang.tr_status(&tab.scope_msg));
                     }
                     ui.horizontal(|ui| {
-                        if ui.button("Terapkan").clicked() {
+                        if ui.button(lang.tr("Terapkan")).clicked() {
                             do_apply = true;
                         }
-                        if ui.button("Bersihkan").clicked() {
+                        if ui.button(lang.tr("Bersihkan")).clicked() {
                             do_clear = true;
                         }
-                        if ui.button("Batal").clicked() {
+                        if ui.button(lang.tr("Batal")).clicked() {
                             do_close = true;
                         }
                     });
@@ -187,16 +190,12 @@ impl AsisLogApp {
                             tab.debounce_at =
                                 Some(Instant::now() + Duration::from_millis(150));
                         } else {
-                            tab.doc.status = format!(
-                                "Cakupan {}-{} aktif; ketik query untuk mencari.",
-                                format_count(a),
-                                format_count(b)
-                            );
+                            tab.doc.status = lang.f2("Cakupan {}-{} aktif; ketik query untuk mencari.", format_count(a), format_count(b));
                         }
                     }
                     _ => {
                         self.tabs[cur_idx].scope_msg =
-                            String::from("Rentang tidak valid. Contoh: 1000000 sampai 2000000.");
+                            lang.tr("Rentang tidak valid. Contoh: 1000000 sampai 2000000.").to_string();
                     }
                 }
             }
@@ -220,16 +219,16 @@ impl AsisLogApp {
         if self.preset_save_open {
             let mut do_save = false;
             let mut do_close = false;
-            egui::Window::new("Simpan pencarian sebagai preset")
+            egui::Window::new(lang.tr("Simpan pencarian sebagai preset"))
                 .collapsible(false)
                 .show(ctx, |ui| {
-                    ui.label("Nama preset:");
+                    ui.label(lang.tr("Nama preset:"));
                     ui.text_edit_singleline(&mut self.preset_save_name);
                     ui.horizontal(|ui| {
-                        if ui.button("Simpan").clicked() {
+                        if ui.button(lang.tr("Simpan")).clicked() {
                             do_save = true;
                         }
-                        if ui.button("Batal").clicked() {
+                        if ui.button(lang.tr("Batal")).clicked() {
                             do_close = true;
                         }
                     });
@@ -237,7 +236,7 @@ impl AsisLogApp {
             if do_save {
                 let name = self.preset_save_name.trim().to_string();
                 if name.is_empty() {
-                    self.global_status = String::from("Nama preset tidak boleh kosong.");
+                    self.global_status = lang.tr("Nama preset tidak boleh kosong.").to_string();
                 } else {
                     let t = &self.tabs[cur_idx];
                     if let Some(p) =

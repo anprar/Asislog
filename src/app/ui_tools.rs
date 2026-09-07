@@ -26,20 +26,21 @@ use super::*;
 
 impl AsisLogApp {
     pub(crate) fn render_empty(&mut self, ctx: &egui::Context) {
+            let lang = self.lang;
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.add_space(60.0);
                     ui.heading("AsisLog");
-                    ui.label("Buka file log…");
-                    ui.label("Penampil portabel untuk file .log / .txt / .out yang sangat besar.");
+                    ui.label(lang.tr("Buka file log…"));
+                    ui.label(lang.tr("Penampil portabel untuk file .log / .txt / .out yang sangat besar."));
                     ui.add_space(12.0);
-                    if ui.button("Buka file log…").clicked() {
+                    if ui.button(lang.tr("Buka file log…")).clicked() {
                         self.open_dialog();
                     }
-                    if let Some(e) = &self.global_error {
-                        ui.colored_label(egui::Color32::RED, e);
+                    if let Some(e) = &self.global_error.clone() {
+                        ui.colored_label(egui::Color32::RED, lang.tr_status(e));
                     }
-                    ui.label(&self.global_status);
+                    ui.label(lang.tr_status(&self.global_status.clone()));
                 });
             });
     }
@@ -48,6 +49,7 @@ impl AsisLogApp {
 impl AsisLogApp {
     pub(crate) fn render_tools(&mut self, ctx: &egui::Context, cur_idx: usize) {
         // ---- Baris 1: file & navigasi ----
+        let lang = self.lang;
         let mut sess_touch = false;
         egui::TopBottomPanel::top("tools").show(ctx, |ui| {
             let tab = &mut self.tabs[cur_idx];
@@ -57,7 +59,7 @@ impl AsisLogApp {
                     .selected_text(tab.doc.encoding().label())
                     .show_ui(ui, |ui| {
                         if ui
-                            .selectable_label(tab.doc.encoding_override.is_none(), "Otomatis")
+                            .selectable_label(tab.doc.encoding_override.is_none(), lang.tr("Otomatis"))
                             .clicked()
                         {
                             tab.doc.set_encoding_override(None);
@@ -78,46 +80,46 @@ impl AsisLogApp {
                         }
                     })
                     .response
-                    .on_hover_text("Encoding file (Otomatis = deteksi BOM + sampel)");
+                    .on_hover_text(lang.tr("Encoding file (Otomatis = deteksi BOM + sampel)"));
                 if ui
-                    .button("Ke baris…")
-                    .on_hover_text("Ke nomor baris, persen, akhir, atau cap waktu (Ctrl+G)")
+                    .button(lang.tr("Ke baris…"))
+                    .on_hover_text(lang.tr("Ke nomor baris, persen, akhir, atau cap waktu (Ctrl+G)"))
                     .clicked()
                 {
                     tab.goto_open = true;
                 }
-                if icon_button(ui, Icon::ChevronLeft, "Kembali ke lokasi sebelumnya (Alt+Left)")
+                if icon_button(ui, Icon::ChevronLeft, lang.tr("Kembali ke lokasi sebelumnya (Alt+Left)"))
                     .clicked()
                     && !tab.go_hist(true)
                 {
-                    tab.doc.status = String::from("Tidak ada lokasi sebelumnya.");
+                    tab.doc.status = lang.tr("Tidak ada lokasi sebelumnya.").to_string();
                 }
-                if icon_button(ui, Icon::ChevronRight, "Maju ke lokasi berikutnya (Alt+Right)")
+                if icon_button(ui, Icon::ChevronRight, lang.tr("Maju ke lokasi berikutnya (Alt+Right)"))
                     .clicked()
                     && !tab.go_hist(false)
                 {
-                    tab.doc.status = String::from("Tidak ada lokasi berikutnya.");
+                    tab.doc.status = lang.tr("Tidak ada lokasi berikutnya.").to_string();
                 }
-                if ui.button("Penanda").clicked() {
+                if ui.button(lang.tr("Penanda")).clicked() {
                     tab.show_bookmarks = !tab.show_bookmarks;
                 }
                 if ui
-                    .button("Ekspor hasil…")
-                    .on_hover_text("Simpan hasil pencarian ke file baru")
+                    .button(lang.tr("Ekspor hasil…"))
+                    .on_hover_text(lang.tr("Simpan hasil pencarian ke file baru"))
                     .clicked()
                 {
                     tab.export_open = true;
                 }
                 if ui
-                    .button("Sorotan…")
-                    .on_hover_text("Aturan highlight kustom (hanya viewport)")
+                    .button(lang.tr("Sorotan…"))
+                    .on_hover_text(lang.tr("Aturan highlight kustom (hanya viewport)"))
                     .clicked()
                 {
                     self.hl_open = true;
                 }
                 if ui
-                    .button("Catatan")
-                    .on_hover_text("Scratchpad: catatan + base64/JWT/JSON/SQL")
+                    .button(lang.tr("Catatan"))
+                    .on_hover_text(lang.tr("Scratchpad: catatan + base64/JWT/JSON/SQL"))
                     .clicked()
                 {
                     self.scratch_open = true;
@@ -128,14 +130,14 @@ impl AsisLogApp {
                     let stuck = tab.doc.follow && tab.doc.stick_bottom;
                     let paused = tab.doc.follow && !tab.doc.stick_bottom;
                     let (label, tip) = if stuck {
-                        ("LIVE", "Mengikuti ekor file (klik untuk berhenti)")
+                        ("LIVE", lang.tr("Mengikuti ekor file (klik untuk berhenti)"))
                     } else if paused {
                         (
-                            "LIVE jeda",
-                            "Terjeda karena menggulir ke atas (klik untuk kembali ke ekor)",
+                            lang.tr("LIVE jeda"),
+                            lang.tr("Terjeda karena menggulir ke atas (klik untuk kembali ke ekor)"),
                         )
                     } else {
-                        ("Ikuti akhir file", "Pantau akhir file / tail (Ctrl+Shift+F)")
+                        (lang.tr("Ikuti akhir file"), lang.tr("Pantau akhir file / tail (Ctrl+Shift+F)"))
                     };
                     if ui
                         .add(egui::Button::selectable(stuck, label))

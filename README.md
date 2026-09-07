@@ -51,20 +51,35 @@ upx --lzma --best .\target\release\asislog.exe
 Compress-Archive .\target\release\asislog.exe asislog-windows.zip -Force
 ```
 
-Verifikasi keaslian unduhan (penting bila antivirus bertanya):
+Verifikasi keaslian unduhan & Mitigasi Antivirus (Windows Defender SmartScreen / WDSI):
 
-```powershell
-# Windows: cocokkan dengan SHA256SUMS.txt di halaman Rilis
-CertUtil -hashfile asislog-windows.exe SHA256
+> [!NOTE]
+> Biner rilis portabel dikompresi menggunakan UPX dan dirilis tanpa sertifikat penandatangan kode (code-signing certificate EV) berbayar. Karena itu, Windows Defender SmartScreen mungkin menampilkan peringatan heuristik *"Windows protected your PC"* atau *"Unknown Publisher"*. Ini adalah false-positive umum pada utilitas open-source baru.
+
+1. **Verifikasi Hash SHA-256**:
+   Cocokkan hash biner dengan file `SHA256SUMS.txt` resmi pada rilis GitHub:
+   ```powershell
+   # Windows (PowerShell / Command Prompt)
+   CertUtil -hashfile asislog.exe SHA256
+   ```
+   ```sh
+   # Linux
+   sha256sum -c SHA256SUMS.txt
+   ```
+2. **Menjalankan jika dicegat SmartScreen**:
+   - Pada dialog SmartScreen, klik **"More info"** / **"Info selengkapnya"**, lalu klik **"Run anyway"** / **"Tetap jalankan"**.
+   - Atau lewat PowerShell: `Unblock-File .\asislog.exe`.
+3. **Pelaporan False-Positive (WDSI)**:
+   Pengembang dan pengguna dapat melaporkan deteksi keliru secara resmi ke portal [Microsoft Security Intelligence (WDSI) File Submission](https://www.microsoft.com/en-us/wdsi/filesubmission) dengan memilih kategori *"Incorrectly detected as malware / false positive"*.
+
+CLI & Subcommand:
+```text
+asislog [FILE]...                  buka file log langsung sebagai tab
+asislog grep [-n] [-c] <POLA> <F>  cari pola dalam file log secara instan (exit code 0 jika cocok, 1 jika nihil)
+asislog count <FILE>               hitung total baris dan ukuran file instan menggunakan sparse indexer
+asislog --version                  tampilkan versi lalu keluar
+asislog --help                     tampilkan bantuan ringkas
 ```
-
-```sh
-# Linux
-sha256sum -c SHA256SUMS.txt
-```
-
-CLI: `asislog [FILE]...` membuka file langsung sebagai tab;
-`asislog --version` / `--help` tanpa membuka GUI.
 
 ## Penggunaan singkat
 
@@ -180,6 +195,13 @@ CLI: `asislog [FILE]...` membuka file langsung sebagai tab;
   ada kotak tofu di Windows/Linux mana pun.
   Panel hasil dan penanda bisa diubah ukurannya dengan menyeret pembatasnya;
   baris log yang panjang digulir mendatar agar tidak terpotong.
+- **Mode Zen (`F11`)**: Memadatkan seluruh bilah toolbar dan header 5-baris menjadi 1-baris ramping (22px) untuk memaksimalkan ruang baca log. Menekan `Ctrl+F` di mode Zen memunculkan jendela pencarian HUD melayang (floating search bar).
+- **Command Palette (`Ctrl+Shift+P`)**: Akses cepat ke seluruh fitur aplikasi melalui dialog pencarian fuzzy keyboard-first (buka file, simpan workspace, ganti tema, toggle Zen, ekspor, goto baris, scratchpad).
+- **Histogram Waktu ERROR**: Panel interaktif di bawah viewport yang memetakan lonjakan frekuensi ERROR per menit. Klik pada bar histogram mana pun untuk melompatkan viewport langsung ke rentang waktu tersebut.
+- **Investigasi Top-N**: 1-klik untuk mengagregasi 10 error atau ID sesi/thread paling sering muncul dengan memori terkendali (< 20 MB). Tombol *Saring* instan mengubah error terpilih menjadi filter pencarian.
+- **Hex Peek**: Mode inspeksi biner aman untuk file log korup atau file non-teks, menampilkan alamat offset, 16 hex byte, dan karakter ASCII yang aman.
+- **Kolom SQL**: Pengurai otomatis struktur log query (Waktu, Sesi/Thread, Aksi SQL, Perintah Query) menjadi kolom tabel yang rapi dan mudah diinspeksi.
+- **Peek Preview Peta**: Arahkan kursor (hover) pada strip peta kepadatan di tepi kanan layar untuk melihat tooltip cuplikan baris asli secara instan.
 - **Zoom**: `Ctrl+=` / `Ctrl+-` / `Ctrl+0` (tersimpan di config).
 - **Scratchpad**: tombol **Catatan** — tab catatan + transform
   (JSON rapi, Base64 decode, JWT decode, SQL rapi); isi tersimpan di config.

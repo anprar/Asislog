@@ -117,6 +117,12 @@ pub fn logo_shapes(size: f32) -> (LogoSegments, LogoSegments) {
     (legs, bars)
 }
 
+/// Primary vector logo: dark rounded tile + white A + teal bars.
+/// Zero-allocation, sharp at any DPI, never triggers broken image fallback.
+pub fn paint_logo(ui: &mut egui::Ui, size: f32) {
+    paint_logo_fallback(ui, size);
+}
+
 /// Vector fallback logo: dark rounded tile + white A + teal bars.
 /// Used only when the baked PNG cannot be decoded.
 pub fn paint_logo_fallback(ui: &mut egui::Ui, size: f32) {

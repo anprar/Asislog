@@ -13,6 +13,7 @@ use crate::engine::follow::{check_follow, load_identity, FollowEvent};
 use crate::engine::index::{self, SparseIndex};
 use crate::engine::search::{self, CacheKey, FileRev, Hit, SearchCache};
 use crate::engine::{format_count, format_size, BlockKind, BookmarkColor, Doc};
+use crate::i18n::Lang;
 use crate::store::{HighlightRule, HighlightSet, HistEntry, Preset};
 use crate::ui::{
     dialogs::parse_goto,
@@ -96,6 +97,27 @@ pub struct AsisLogApp {
     /// Konfirmasi hapus tertunda (modal): eksekusi hanya bila pengguna
     /// menekan "Ya".
     pub(crate) confirm: Option<ConfirmAction>,
+    /// Mode Zen / padat (C-B1: sembunyikan 5 baris kontrol menjadi 1 baris ramping).
+    pub(crate) zen_mode: bool,
+    /// Floating search HUD saat di Zen mode (Ctrl+F).
+    pub(crate) zen_search_open: bool,
+    /// Pilihan font monospace (C-B3: Bawaan, JetBrains Mono, Consolas).
+    pub(crate) font_family: String,
+    /// Mode tampilan kolom log transaksi / SQL (C-B5).
+    pub(crate) sql_cols_enabled: bool,
+    /// Command Palette (C-C3: Ctrl+Shift+P).
+    pub(crate) palette_open: bool,
+    pub(crate) palette_query: String,
+    pub(crate) palette_selected: usize,
+    /// Panel histogram ERROR/menit interaktif (C-C4).
+    pub(crate) hist_panel_open: bool,
+    /// Agregasi Top-N (C-C1).
+    pub(crate) top_n_open: bool,
+    pub(crate) top_n_results: Vec<(String, usize)>,
+    /// Mode Hex Peek file biner (C-C5).
+    pub(crate) hex_peek_open: bool,
+    /// Bahasa UI (ID bawaan, EN opsional). Persisted in config.json.
+    pub(crate) lang: Lang,
 }
 
 /// Aksi destruktif yang menunggu konfirmasi modal.
@@ -109,20 +131,25 @@ pub(crate) enum ConfirmAction {
 
 impl ConfirmAction {
     pub(crate) fn title(&self) -> &'static str {
-        match self {
+        self.title_in(Lang::Id)
+    }
+
+    pub(crate) fn title_in(&self, lang: Lang) -> &'static str {
+        lang.tr(match self {
             ConfirmAction::DeleteMark(_) => "Hapus penanda?",
             ConfirmAction::ClearRecent => "Bersihkan riwayat?",
-        }
+        })
     }
 
     pub(crate) fn message(&self) -> String {
+        self.message_in(Lang::Id)
+    }
+
+    pub(crate) fn message_in(&self, lang: Lang) -> String {
         match self {
-            ConfirmAction::DeleteMark(ln) => format!(
-                "Penanda baris {} akan dihapus permanen (tak bisa dibatalkan).",
-                crate::engine::format_count(*ln)
-            ),
+            ConfirmAction::DeleteMark(ln) => lang.f1("Penanda baris {} akan dihapus permanen (tak bisa dibatalkan).", crate::engine::format_count(*ln)),
             ConfirmAction::ClearRecent => {
-                String::from("Seluruh riwayat file dibuka akan dikosongkan.")
+                lang.tr("Seluruh riwayat file dibuka akan dikosongkan.").to_string()
             }
         }
     }
@@ -133,6 +160,7 @@ impl AsisLogApp {
         // Config global (preset, sorotan, tema, riwayat); abaikan bila belum ada.
         let mut cfg = crate::store::load();
         crate::store::migrate_sets(&mut cfg);
+        let lang = cfg.lang.as_deref().map(Lang::from_key).unwrap_or_default();
         let tema = cfg
             .tema
             .as_deref()
@@ -148,7 +176,7 @@ impl AsisLogApp {
             tabs: Vec::new(),
             current: 0,
             global_error: None,
-            global_status: String::from("Siap. Buka file log untuk mulai."),
+            global_status: lang.tr("Siap. Buka file log untuk mulai.").to_string(),
             tema,
             // Paksa terapkan sekali pada frame pertama (termasuk baca tema OS).
             tema_state: (Tema::Gelap, true),
@@ -193,9 +221,23 @@ impl AsisLogApp {
             paste_text: String::new(),
             goto_all: false,
             confirm: None,
+            zen_mode: cfg.zen_mode,
+            zen_search_open: false,
+            font_family: cfg.font_family.unwrap_or_else(|| "Bawaan".to_string()),
+            sql_cols_enabled: cfg.sql_cols,
+            palette_open: false,
+            palette_query: String::new(),
+            palette_selected: 0,
+            hist_panel_open: false,
+            top_n_open: false,
+            top_n_results: Vec::new(),
+            hex_peek_open: false,
+            lang,
         };
         app.rebuild_highlights();
         app.restore_session();
+        // Translate a restored Indonesian session status to the active language.
+        app.global_status = app.lang.tr_status(&app.global_status.clone());
         app
     }
 
@@ -227,9 +269,9 @@ impl AsisLogApp {
         ctx.set_style(style);
     }
 
-    /// Tinggi baris viewport mengikuti zoom.
+    /// Tinggi baris viewport mengikuti zoom dan line-height proporsional (C-B3).
     pub(crate) fn row_h(&self) -> f32 {
-        (viewer::ROW_H * self.zoom).round().max(14.0)
+        (14.0 * self.zoom * 1.45).round().max(16.0)
     }
 
     pub(crate) fn bump_zoom(&mut self, ctx: &egui::Context, next: f32) {
@@ -256,11 +298,32 @@ impl AsisLogApp {
             history: self.history.clone(),
             zoom: self.zoom,
             scratch,
+            zen_mode: self.zen_mode,
+            font_family: Some(self.font_family.clone()),
+            sql_cols: self.sql_cols_enabled,
+            lang: Some(self.lang.key().to_string()),
         };
         if let Err(e) = crate::store::save(&cfg) {
             self.global_status = e;
         }
         self.cfg_dirty = false;
+    }
+
+    /// Switch UI language (persisted to config.json, portable unchanged).
+    pub(crate) fn set_lang(&mut self, lang: Lang) {
+        if self.lang == lang {
+            return;
+        }
+        self.lang = lang;
+        self.cfg_dirty = true;
+        self.save_config();
+        self.global_status = lang
+            .tr(if lang == Lang::En {
+                "Bahasa diganti ke English. / Language switched to English."
+            } else {
+                "Bahasa diganti ke Indonesia. / Language switched to Indonesian."
+            })
+            .to_string();
     }
 
     /// Aturan efektif = aturan enabled milik set aktif.
@@ -312,7 +375,7 @@ impl AsisLogApp {
     pub(crate) fn save_workspace_to(&mut self, path: &std::path::Path) {
         use crate::store::{Workspace, WorkspaceFile};
         if self.tabs.is_empty() {
-            self.global_status = String::from("Tidak ada tab untuk disimpan.");
+            self.global_status = self.lang.tr("Tidak ada tab untuk disimpan.").to_string();
             return;
         }
         let cur = &self.tabs[self.current.min(self.tabs.len() - 1)];
@@ -350,9 +413,9 @@ impl AsisLogApp {
         match crate::store::save_workspace(path, &ws) {
             Ok(()) => {
                 self.global_status =
-                    format!("Workspace disimpan ke {}.", path.display());
+                    self.lang.f1("Workspace disimpan ke {}.", path.display());
             }
-            Err(e) => self.global_status = e,
+            Err(e) => self.global_status = self.lang.tr_status(&e),
         }
     }
 
@@ -436,16 +499,12 @@ impl AsisLogApp {
         if opened > 0 {
             self.current = base;
         }
-        self.global_status = format!(
-            "Workspace '{}': {} dibuka{}.",
-            ws.name,
-            opened,
-            if missing > 0 {
-                format!(", {} file hilang, dilewati", missing)
-            } else {
-                String::new()
-            }
-        );
+        let missing_part = if missing > 0 {
+            self.lang.f1(", {} file hilang, dilewati", missing)
+        } else {
+            String::new()
+        };
+        self.global_status = self.lang.f3("Workspace '{}': {} dibuka{}.", ws.name, opened, missing_part);
         self.session_dirty = true;
     }
 
@@ -536,15 +595,12 @@ impl AsisLogApp {
             self.current = sess.current.min(self.tabs.len() - 1);
         }
         if opened > 0 {
-            self.global_status = format!(
-                "Sesi dipulihkan: {} tab{}.",
-                opened,
-                if missing > 0 {
-                    format!(", {} file tak ditemukan, dilewati", missing)
-                } else {
-                    String::new()
-                }
-            );
+            let missing_part = if missing > 0 {
+                self.lang.f1(", {} file tak ditemukan, dilewati", missing)
+            } else {
+                String::new()
+            };
+            self.global_status = self.lang.f2("Sesi dipulihkan: {} tab{}.", opened, missing_part);
         }
     }
 
@@ -552,6 +608,7 @@ impl AsisLogApp {
     /// Sama query + tombol sama = hapus lagi. Butuh set aktif (dibuat bila kosong).
     pub(crate) fn toggle_label(&mut self, idx: usize) {
         const COLORS: [&str; 9] = crate::store::LABEL_COLORS;
+        let lang = self.lang;
         let cur = self.current;
         let (q, cs) = match self.tabs.get(cur) {
             Some(t) => (t.search_text.trim().to_string(), t.case_sensitive),
@@ -560,7 +617,7 @@ impl AsisLogApp {
         if q.is_empty() {
             if let Some(t) = self.tabs.get_mut(cur) {
                 t.doc.status =
-                    String::from("Ketik query dulu, lalu tekan 1-9 untuk label warna.");
+                    lang.tr("Ketik query dulu, lalu tekan 1-9 untuk label warna.").to_string();
             }
             return;
         }
@@ -575,11 +632,11 @@ impl AsisLogApp {
         if let Some(s) = self.sets.iter_mut().find(|s| s.name == aname) {
             if let Some(pos) = s.rules.iter().position(|r| r.name == name) {
                 s.rules.remove(pos);
-                msg = format!("Label {} dihapus.", idx + 1);
+                msg = lang.f1("Label {} dihapus.", idx + 1);
             } else if s.rules.len() >= 50 {
-                msg = String::from("Set penuh (50 aturan). Hapus dulu yang tak perlu.");
+                msg = lang.tr("Set penuh (50 aturan). Hapus dulu yang tak perlu.").to_string();
             } else {
-                let cname = crate::store::highlight_color_names()
+                let cname = crate::store::highlight_color_names_for(lang)
                     .iter()
                     .find(|(k, _)| *k == COLORS[idx])
                     .map(|(_, n)| *n)
@@ -593,13 +650,13 @@ impl AsisLogApp {
                     whole_line: false,
                     enabled: true,
                 });
-                msg = format!("Label {}: \"{}\" ({}). Tekan lagi untuk hapus.", idx + 1, short, cname);
+                msg = lang.f3("Label {}: \"{}\" ({}). Tekan lagi untuk hapus.", idx + 1, short, cname);
             }
             self.hl_dirty = true;
             self.save_config();
         }
         if let Some(t) = self.tabs.get_mut(cur) {
-            t.doc.status = msg;
+            t.doc.status = lang.tr_status(&msg);
         }
     }
 
@@ -631,7 +688,7 @@ impl AsisLogApp {
             if p.exists() {
                 self.open_file(p);
             } else {
-                self.global_status = format!("File tidak ditemukan: {}", p.display());
+                self.global_status = self.lang.f1("File tidak ditemukan: {}", p.display());
             }
         }
     }
@@ -663,23 +720,24 @@ impl AsisLogApp {
                 tab.archive_src = archive;
                 self.tabs.push(tab);
                 self.current = self.tabs.len() - 1;
-                self.global_status = format!("Membuka {}.", path.display());
+                self.global_status = self.lang.f1("Membuka {}.", path.display());
                 // Catat ke riwayat file (tetap, tersimpan di config).
                 crate::store::push_recent(&mut self.recent, &path.display().to_string());
                 self.save_config();
                 self.session_dirty = true;
             }
             Err(e) => {
-                self.global_error = Some(e);
+                self.global_error = Some(self.lang.tr_status(&e));
             }
         }
     }
 
     pub(crate) fn open_dialog(&mut self) {
+        let lang = self.lang;
         let f = rfd::FileDialog::new()
             .add_filter("Log", &["log", "txt", "out", "err"])
-            .add_filter("Arsip", &["zip", "tgz", "gz", "tar"])
-            .add_filter("Semua", &["*"])
+            .add_filter(lang.tr("Arsip"), &["zip", "tgz", "gz", "tar"])
+            .add_filter(lang.tr("Semua"), &["*"])
             .pick_file();
         if let Some(p) = f {
             self.open_file(p);

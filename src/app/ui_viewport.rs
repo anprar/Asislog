@@ -29,6 +29,7 @@ impl AsisLogApp {
         // Status fokus dihitung SEBELUM pinjam tab (navigasi keyboard di
         // bawah butuh tahu apakah caret sedang di kolom teks).
         let (field_focused, dialog_open) = self.focus_state(ctx);
+        let lang = self.lang;
         // ---- viewport utama: memakai seluruh sisa tinggi CentralPanel ----
         egui::CentralPanel::default().show(ctx, |ui| {
             let rh = self.row_h();
@@ -42,25 +43,28 @@ impl AsisLogApp {
             let log_h = (avail.y - action_h).max(60.0);
             let visible = ((log_h / rh).floor() as u64).clamp(10, 400);
             tab.last_visible = visible;
-            // Wheel: gulir per baris
-            let delta_y = ctx.input(|i| {
-                let a = i.raw_scroll_delta.y;
-                let b = i.smooth_scroll_delta.y;
-                if a != 0.0 { a } else { b }
-            });
-            if delta_y != 0.0 {
-                let step = ((delta_y.abs() / 20.0).ceil() as u64).clamp(1, 50);
-                if delta_y < 0.0 {
-                    tab.top_row = (tab.top_row + step).min(total_rows.saturating_sub(1));
-                    // di dekat bawah -> kunci bawah bila Ikuti
-                    if tab.doc.follow
-                        && tab.top_row + visible >= total_rows.saturating_sub(2)
-                    {
-                        tab.doc.stick_bottom = true;
+            // Wheel: gulir per baris — HANYA bila tidak ada dialog/palet terbuka dan kursor berada di viewport
+            let mouse_in_viewport = ui.rect_contains_pointer(ui.max_rect());
+            if !field_focused && !dialog_open && !self.palette_open && mouse_in_viewport {
+                let delta_y = ctx.input(|i| {
+                    let a = i.raw_scroll_delta.y;
+                    let b = i.smooth_scroll_delta.y;
+                    if a != 0.0 { a } else { b }
+                });
+                if delta_y != 0.0 {
+                    let step = ((delta_y.abs() / 20.0).ceil() as u64).clamp(1, 50);
+                    if delta_y < 0.0 {
+                        tab.top_row = (tab.top_row + step).min(total_rows.saturating_sub(1));
+                        // di dekat bawah -> kunci bawah bila Ikuti
+                        if tab.doc.follow
+                            && tab.top_row + visible >= total_rows.saturating_sub(2)
+                        {
+                            tab.doc.stick_bottom = true;
+                        }
+                    } else {
+                        tab.top_row = tab.top_row.saturating_sub(step);
+                        tab.doc.stick_bottom = false; // gulir ke atas melepas kunci
                     }
-                } else {
-                    tab.top_row = tab.top_row.saturating_sub(step);
-                    tab.doc.stick_bottom = false; // gulir ke atas melepas kunci
                 }
             }
             // Keyboard atas/bawah PgUp/PgDn — hanya bila fokus TIDAK di kolom
@@ -242,10 +246,47 @@ impl AsisLogApp {
                                                                 .sense(egui::Sense::click()),
                                                             );
                                                             ui.separator();
-                                                            let t = viewer::render_log_line(
-                                                                ui, &disp, kind, dark, rules,
-                                                                is_sel,
-                                                            );
+                                                            let t = if self.sql_cols_enabled {
+                                                                if let Some(cols) = crate::engine::sqlcols::parse_sql_cols(&disp) {
+                                                                    ui.label(
+                                                                        egui::RichText::new(cols.timestamp)
+                                                                            .monospace()
+                                                                            .color(egui::Color32::from_rgb(100, 180, 240)),
+                                                                    );
+                                                                    ui.separator();
+                                                                    ui.label(
+                                                                        egui::RichText::new(cols.session)
+                                                                            .monospace()
+                                                                            .color(egui::Color32::from_rgb(180, 150, 220)),
+                                                                    );
+                                                                    ui.separator();
+                                                                    let act_color = if cols.action == "ERROR" || cols.action == "ROLLBACK" {
+                                                                        egui::Color32::from_rgb(240, 80, 80)
+                                                                    } else if cols.action == "COMMIT" || cols.action == "CHECKPOINT" {
+                                                                        egui::Color32::from_rgb(60, 200, 120)
+                                                                    } else {
+                                                                        egui::Color32::from_rgb(240, 190, 60)
+                                                                    };
+                                                                    ui.label(
+                                                                        egui::RichText::new(cols.action)
+                                                                            .strong()
+                                                                            .monospace()
+                                                                            .color(act_color),
+                                                                    );
+                                                                    ui.separator();
+                                                                    viewer::render_log_line(
+                                                                        ui, cols.query, kind, dark, rules, is_sel,
+                                                                    )
+                                                                } else {
+                                                                    viewer::render_log_line(
+                                                                        ui, &disp, kind, dark, rules, is_sel,
+                                                                    )
+                                                                }
+                                                            } else {
+                                                                viewer::render_log_line(
+                                                                    ui, &disp, kind, dark, rules, is_sel,
+                                                                )
+                                                            };
                                                             RowResp { g, t }
                                                         })
                                                         .inner
@@ -390,8 +431,31 @@ impl AsisLogApp {
                                         }
                                     }
                                 }
-                                // Legenda makna warna strip.
-                                {
+                                // C-B4: Peek preview tooltip saat kursor hover di atas strip
+                                if resp.hovered() {
+                                    if let Some(pos) = resp.hover_pos() {
+                                        let f = ((pos.y - rect.top()) / rect.height()).clamp(0.0, 1.0) as f64;
+                                        let target_row = (f * total_rows as f64) as u64;
+                                        if let Some(ln) = tab.row_to_line(target_row) {
+                                            let preview = tab.doc.get_line_head(ln, 160)
+                                                .map(|(t, _, _)| t)
+                                                .unwrap_or_default();
+                                            let preview_clean = preview.trim();
+                                            resp.on_hover_ui(|ui| {
+                                                ui.horizontal(|ui| {
+                                                    ui.strong(lang.f1("Baris #{}", format_count(ln)));
+                                                    ui.label(format!("({:.1}%)", f * 100.0));
+                                                });
+                                                if !preview_clean.is_empty() {
+                                                    ui.label(egui::RichText::new(preview_clean).monospace());
+                                                }
+                                                ui.separator();
+                                                ui.small(lang.tr("Klik untuk lompat ke baris ini"));
+                                            });
+                                        }
+                                    }
+                                } else {
+                                    // Legenda makna warna strip bila tidak hover spesifik.
                                     let bits = tab.marker_bits.as_ref();
                                     let eb = bits
                                         .map(|b| b.iter().filter(|x| *x & 0x01 != 0).count())
@@ -399,13 +463,7 @@ impl AsisLogApp {
                                     let wb = bits
                                         .map(|b| b.iter().filter(|x| *x & 0x02 != 0).count())
                                         .unwrap_or(0);
-                                    resp.on_hover_text(format!(
-                                        "Teal: hasil pencarian ({})\nBiru: penanda ({})\nMerah: bucket ERROR ({} dari 512)\nKuning: bucket WARN ({} dari 512)\nArsir merah: kepadatan ERROR/menit\nHijau: hasil aktif - Putih: posisi viewport\nKlik: lompat ke posisi",
-                                        format_count(tab.doc.hits.len() as u64),
-                                        format_count(tab.doc.bookmarks.len() as u64),
-                                        eb,
-                                        wb,
-                                    ));
+                                    resp.on_hover_text(lang.f4("Teal: hasil pencarian ({})\nBiru: penanda ({})\nMerah: bucket ERROR ({} dari 512)\nKuning: bucket WARN ({} dari 512)\nArsir merah: kepadatan ERROR/menit\nHijau: hasil aktif - Putih: posisi viewport\nKlik: lompat ke posisi", format_count(tab.doc.hits.len() as u64), format_count(tab.doc.bookmarks.len() as u64), eb, wb));
                                 }
                             },
                         );
@@ -471,17 +529,12 @@ impl AsisLogApp {
                                         }
                                     }
                                 }
-                                resp.on_hover_text(format!(
-                                    "Baris {} / {} · {:.0}%",
-                                    format_count(tab.top_row + 1),
-                                    format_count(total_rows),
-                                    if total_rows > 0 {
+                                resp.on_hover_text(lang.f3("Baris {} / {} · {}%", format_count(tab.top_row + 1), format_count(total_rows), format!("{:.0}", if total_rows > 0 {
                                         tab.top_row as f64 / total_rows as f64 * 100.0
                                     } else {
                                         0.0
-                                    },
-                                ));
-                                if ui.small_button("Akhir").on_hover_text("Ke akhir file").clicked() {
+                                    })));
+                                if icon_button(ui, Icon::ChevronDown, lang.tr("Ke akhir file (Ctrl+End)")).clicked() {
                                     tab.top_row = total_rows.saturating_sub(visible);
                                     tab.doc.stick_bottom = true;
                                 }
@@ -492,39 +545,39 @@ impl AsisLogApp {
             );
             // Baris aksi bawah (setinggi action_h).
             ui.horizontal_wrapped(|ui| {
-                ui.label(format!("Baris {}", tab.selected_line));
-                ui.menu_button("Salin v", |ui| {
-                    if ui.button("Salin baris ini").clicked() {
+                ui.label(lang.f1("Baris {}", tab.selected_line));
+                ui.menu_button(lang.tr("Salin v"), |ui| {
+                    if ui.button(lang.tr("Salin baris ini")).clicked() {
                         match tab.doc.copy_range_text(tab.selected_line, tab.selected_line) {
                             Ok(s) => {
                                 ctx.copy_text(s);
-                                tab.doc.status = String::from("Baris disalin ke papan klip.");
+                                tab.doc.status = lang.tr("Baris disalin ke papan klip.").to_string();
                             }
-                            Err(e) => tab.doc.status = e,
+                            Err(e) => tab.doc.status = lang.tr_status(&e),
                         }
                         ui.close();
                     }
-                    if ui.button("Salin 50 baris").clicked() {
+                    if ui.button(lang.tr("Salin 50 baris")).clicked() {
                         match tab.doc.copy_range_text(tab.selected_line, tab.selected_line + 49) {
                             Ok(s) => {
                                 ctx.copy_text(s);
-                                tab.doc.status = String::from("50 baris disalin.");
+                                tab.doc.status = lang.tr("50 baris disalin.").to_string();
                             }
-                            Err(e) => tab.doc.status = e,
+                            Err(e) => tab.doc.status = lang.tr_status(&e),
                         }
                         ui.close();
                     }
                     if ui
-                        .button("Salin + nomor (50 baris)")
-                        .on_hover_text("Format \"nomor: isi\"")
+                        .button(lang.tr("Salin + nomor (50 baris)"))
+                        .on_hover_text(lang.tr("Format \"nomor: isi\""))
                         .clicked()
                     {
                         copy_numbered(tab, ctx, 50);
                         ui.close();
                     }
                     if ui
-                        .button("Simpan 200 baris ke file…")
-                        .on_hover_text("Tulis 200 baris dari posisi ini ke file baru")
+                        .button(lang.tr("Simpan 200 baris ke file…"))
+                        .on_hover_text(lang.tr("Tulis 200 baris dari posisi ini ke file baru"))
                         .clicked()
                     {
                         let a = tab.selected_line;
@@ -534,20 +587,16 @@ impl AsisLogApp {
                         {
                             match tab.doc.export_range_to_file(&p, a, a + 199) {
                                 Ok(n) => {
-                                    tab.doc.status = format!(
-                                        "Disimpan {} baris ke {}.",
-                                        n,
-                                        p.display()
-                                    )
+                                    tab.doc.status = lang.f2("Disimpan {} baris ke {}.", n, p.display())
                                 }
-                                Err(e) => tab.doc.status = e,
+                                Err(e) => tab.doc.status = lang.tr_status(&e),
                             }
                         }
                         ui.close();
                     }
                     if ui
-                        .button("Salin sebagai path")
-                        .on_hover_text("Salin \"file:baris\" untuk referensi")
+                        .button(lang.tr("Salin sebagai path"))
+                        .on_hover_text(lang.tr("Salin \"file:baris\" untuk referensi"))
                         .clicked()
                     {
                         ctx.copy_text(format!(
@@ -555,61 +604,65 @@ impl AsisLogApp {
                             tab.doc.path.display(),
                             tab.selected_line
                         ));
-                        tab.doc.status = String::from("Path + baris disalin.");
+                        tab.doc.status = lang.tr("Path + baris disalin.").to_string();
                         ui.close();
                     }
                 });
-                ui.menu_button("Salin blok v", |ui| {
+                ui.menu_button(lang.tr("Salin blok v"), |ui| {
                     if ui
-                        .button("Salin blok SQL")
-                        .on_hover_text("Statement --INSERT-…/INSERT INTO… s.d. go")
+                        .button(lang.tr("Salin blok SQL"))
+                        .on_hover_text(lang.tr("Statement --INSERT-…/INSERT INTO… s.d. go"))
                         .clicked()
                     {
                         copy_block(tab, ctx, 0);
                         ui.close();
                     }
                     if ui
-                        .button("Salin blok transaksi")
-                        .on_hover_text("BEGIN TRANSACTION s.d. COMMIT/ROLLBACK/go")
+                        .button(lang.tr("Salin blok transaksi"))
+                        .on_hover_text(lang.tr("BEGIN TRANSACTION s.d. COMMIT/ROLLBACK/go"))
                         .clicked()
                     {
                         copy_block(tab, ctx, 1);
                         ui.close();
                     }
                     if ui
-                        .button("Salin blok checkpoint")
-                        .on_hover_text("--START CHECKPOINT s.d. --FINISH CHECKPOINT")
+                        .button(lang.tr("Salin blok checkpoint"))
+                        .on_hover_text(lang.tr("--START CHECKPOINT s.d. --FINISH CHECKPOINT"))
                         .clicked()
                     {
                         copy_block(tab, ctx, 2);
                         ui.close();
                     }
                     ui.separator();
-                    if ui.button("Ekspor blok SQL…").clicked() {
+                    if ui.button(lang.tr("Ekspor blok SQL…")).clicked() {
                         export_block(tab, 0, "asislog-blok.sql");
                         ui.close();
                     }
-                    if ui.button("Ekspor blok transaksi…").clicked() {
+                    if ui.button(lang.tr("Ekspor blok transaksi…")).clicked() {
                         export_block(tab, 1, "asislog-transaksi.sql");
                         ui.close();
                     }
-                    if ui.button("Ekspor blok checkpoint…").clicked() {
+                    if ui.button(lang.tr("Ekspor blok checkpoint…")).clicked() {
                         export_block(tab, 2, "asislog-checkpoint.txt");
                         ui.close();
                     }
                 });
+                ui.separator();
+                if ui
+                    .selectable_label(self.sql_cols_enabled, lang.tr("Kolom SQL"))
+                    .on_hover_text(lang.tr("Tampilan Kolom SQL: pisahkan Timestamp / Sesi / Aksi / Kueri secara terstruktur"))
+                    .clicked()
+                {
+                    self.sql_cols_enabled = !self.sql_cols_enabled;
+                    self.cfg_dirty = true;
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let pos = if total_rows > 0 {
                         (tab.top_row as f64 / total_rows as f64 * 100.0).clamp(0.0, 100.0)
                     } else {
                         0.0
                     };
-                    ui.label(format!(
-                        "{}/{} · {:.0}%",
-                        format_count(tab.top_row + 1),
-                        format_count(total_rows),
-                        pos,
-                    ));
+                    ui.label(lang.f3("{}/{} · {}%", format_count(tab.top_row + 1), format_count(total_rows), format!("{:.0}", pos)));
                 });
             });
         });

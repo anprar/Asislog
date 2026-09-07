@@ -383,6 +383,82 @@ impl Query {
     }
 }
 
+/// Convert a parsed boolean query to exact filter syntax ("Jadikan filter").
+/// Succeeds only when the meaning is preserved 1:1; otherwise returns the
+/// Indonesian reason so the UI can warn instead of silently changing meaning.
+/// Mapping (polarity-aware, De Morgan for negated OR):
+/// Term -> include token; Not(Term) -> `-token`; And -> space-joined;
+/// Not(Or(..)) -> AND of negations. Everything else (Or, Not(And),
+/// quoted phrases with spaces, `kunci=nilai`, lone `-`) is rejected:
+/// OR has no filter counterpart, spaces would split tokens, and `=`
+/// means a JSON field predicate in filter (different semantics from a
+/// substring on plain logs).
+pub fn to_filter_string(q: &Query) -> Result<String, String> {
+    fn token(t: &str) -> Result<String, String> {
+        if t.contains(char::is_whitespace) {
+            return Err(String::from(
+                "frasa kutip (ber-spasi) tak punya padanan token filter.",
+            ));
+        }
+        if t.contains('=') {
+            return Err(String::from(
+                "kunci=nilai berarti predikat JSON di filter, bukan substring.",
+            ));
+        }
+        if t == "-" {
+            return Err(String::from("tanda - tunggal diabaikan oleh filter."));
+        }
+        Ok(t.to_string())
+    }
+    fn go(q: &Query, neg: bool, out: &mut Vec<String>) -> Result<(), String> {
+        match q {
+            Query::Term(t) => {
+                let mut tok = token(t)?;
+                if neg {
+                    tok.insert(0, '-');
+                }
+                out.push(tok);
+                Ok(())
+            }
+            Query::Not(inner) => go(inner, !neg, out),
+            Query::And(qs) => {
+                if neg {
+                    return Err(String::from(
+                        "bentuk ini setara OR (De Morgan) yang tak ada di filter.",
+                    ));
+                }
+                if qs.is_empty() {
+                    return Err(String::from("konjungsi kosong."));
+                }
+                for c in qs {
+                    go(c, false, out)?;
+                }
+                Ok(())
+            }
+            Query::Or(qs) => {
+                if !neg {
+                    return Err(String::from(
+                        "OR tak punya padanan di filter (filter selalu AND).",
+                    ));
+                }
+                if qs.is_empty() {
+                    return Err(String::from("disjungsi kosong."));
+                }
+                for c in qs {
+                    go(c, true, out)?;
+                }
+                Ok(())
+            }
+        }
+    }
+    let mut out = Vec::new();
+    go(q, false, &mut out)?;
+    if out.is_empty() {
+        return Err(String::from("tak ada token yang bisa dibawa."));
+    }
+    Ok(out.join(" "))
+}
+
 /// Top-level display spans for the chip builder: (text, byte_start, byte_end).
 /// Returns None for complex expressions (OR/parens/quotes at top level);
 /// the UI then shows one summary chip instead of per-term chips.
@@ -599,5 +675,59 @@ mod tests {
             parse_query("NOT NOT x").unwrap().required_terms(),
             vec!["x"]
         );
+    }
+
+    fn conv(q: &str) -> Result<String, String> {
+        to_filter_string(&parse_query(q).unwrap())
+    }
+
+    #[test]
+    fn filter_conversion_exact_shapes() {
+        assert_eq!(conv("err timeout").unwrap(), "err timeout");
+        assert_eq!(conv("err -debug").unwrap(), "err -debug");
+        assert_eq!(conv("-debug").unwrap(), "-debug");
+        assert_eq!(conv("NOT (a OR b)").unwrap(), "-a -b");
+        assert_eq!(conv("(a b) c").unwrap(), "a b c");
+        assert_eq!(conv("NOT NOT x").unwrap(), "x");
+    }
+
+    #[test]
+    fn filter_conversion_rejects_with_reason() {
+        // OR / negated-AND change meaning under AND-only filter.
+        assert!(conv("a OR b").is_err());
+        assert!(conv("NOT (a b)").is_err());
+        assert!(conv("(a OR b) c").is_err());
+        // Quoted phrase would split into tokens.
+        assert!(conv("\"order service\"").is_err());
+        assert!(conv("\"a b\" c").is_err());
+        // `=` is a JSON field predicate in filter, substring in search.
+        assert!(conv("level=ERROR").is_err());
+        assert!(conv("id=1 -debug").is_err());
+    }
+
+    #[test]
+    fn filter_conversion_agrees_with_both_engines() {
+        use crate::engine::filter::{line_matches, parse_filter};
+        // Differential: converted filter decides exactly like the AST.
+        let lines = [
+            "ERROR timeout x",
+            "ERROR debug y",
+            "INFO timeout z",
+            "debug only",
+            "nothing",
+        ];
+        for q in ["err timeout", "err -debug", "-debug", "NOT (a OR b)"] {
+            let ast = parse_query(q).unwrap();
+            let f = parse_filter(&conv(q).unwrap(), false);
+            for ln in lines {
+                assert_eq!(
+                    ast.matches(ln, false),
+                    line_matches(ln, &f),
+                    "query {:?} vs filter on {:?}",
+                    q,
+                    ln
+                );
+            }
+        }
     }
 }
