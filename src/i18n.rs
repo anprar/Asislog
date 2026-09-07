@@ -680,6 +680,7 @@ impl Lang {
             "Solarized terang" => "Solarized light",
             // ---- bookmark colors ----
             "Bawaan" => "Default",
+            "Sistem" => "System",
             "Biru" => "Blue",
             "Hijau" => "Green",
             "Kuning" => "Yellow",

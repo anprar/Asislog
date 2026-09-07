@@ -335,6 +335,21 @@ impl AsisLogApp {
                             for f in ["Bawaan", "JetBrains Mono", "Consolas"] {
                                 if ui.selectable_label(self.font_family == f, lang.font_name(f)).clicked() {
                                     self.font_family = f.to_string();
+                                    self.apply_fonts(ctx);
+                                    self.cfg_dirty = true;
+                                }
+                            }
+                        });
+                    egui::ComboBox::from_id_salt("ui_font_choice")
+                        .selected_text(format!(
+                            "UI: {}",
+                            if self.ui_font == "default" { lang.tr("Bawaan") } else { lang.tr("Sistem") }
+                        ))
+                        .show_ui(ui, |ui| {
+                            for (key, label) in [("system", lang.tr("Sistem")), ("default", lang.tr("Bawaan"))] {
+                                if ui.selectable_label(self.ui_font == key, label).clicked() {
+                                    self.ui_font = key.to_string();
+                                    self.apply_fonts(ctx);
                                     self.cfg_dirty = true;
                                 }
                             }

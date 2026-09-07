@@ -113,6 +113,8 @@ pub struct AsisLogApp {
     pub(crate) zen_search_open: bool,
     /// Pilihan font monospace (C-B3: Bawaan, JetBrains Mono, Consolas).
     pub(crate) font_family: String,
+    /// UI font choice: "system" (OS font) or "default" (embedded).
+    pub(crate) ui_font: String,
     /// Mode tampilan kolom log transaksi / SQL (C-B5).
     pub(crate) sql_cols_enabled: bool,
     /// Command Palette (C-C3: Ctrl+Shift+P).
@@ -245,6 +247,7 @@ impl AsisLogApp {
             split_view: cfg.split_view,
             zen_search_open: false,
             font_family: cfg.font_family.unwrap_or_else(|| "Bawaan".to_string()),
+            ui_font: cfg.ui_font.unwrap_or_else(|| "system".to_string()),
             sql_cols_enabled: cfg.sql_cols,
             palette_open: false,
             palette_query: String::new(),
@@ -302,6 +305,13 @@ impl AsisLogApp {
         self.global_status = format!("Zoom {}%.", (self.zoom * 100.0).round() as u32);
     }
 
+    /// Install OS fonts per current choices (called at startup and whenever
+    /// a font combo changes). Never fails: missing files fall back silent.
+    /// Public: the binary entry point calls it once before first paint.
+    pub fn apply_fonts(&self, ctx: &egui::Context) {
+        crate::ui::fonts::install_fonts(ctx, self.ui_font != "default", &self.font_family);
+    }
+
     /// Tulis config global. Galat di status; scratch dipotong 64 KB.
     pub(crate) fn save_config(&mut self) {
         let mut scratch = self.scratch_text.clone();
@@ -322,6 +332,7 @@ impl AsisLogApp {
             zen_mode: self.zen_mode,
             split_view: self.split_view,
             font_family: Some(self.font_family.clone()),
+            ui_font: Some(self.ui_font.clone()),
               sql_cols: self.sql_cols_enabled,
               lang: Some(self.lang.key().to_string()),
               shortcuts: self.scut_overrides.clone(),
@@ -333,8 +344,7 @@ impl AsisLogApp {
     }
 
     /// Switch UI language (persisted to config.json, portable unchanged).
-    pub(crate) fn set_lang(&mut self, lang: Lang) {
-        if self.lang == lang {
+    pub(crate) fn set_lang(&mut self, lang: Lang) {        if self.lang == lang {
             return;
         }
         self.lang = lang;

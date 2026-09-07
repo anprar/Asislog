@@ -304,6 +304,8 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             let mut app = AsisLogApp::new(cc);
+            // Native feel from the first frame: OS UI font + chosen mono.
+            app.apply_fonts(&cc.egui_ctx);
             app.open_files(files);
             Ok(Box::new(app))
         }),

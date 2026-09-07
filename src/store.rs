@@ -99,6 +99,10 @@ pub struct Config {
     /// Shortcut overrides: action id -> "Ctrl+Shift+P". Absent = default.
     #[serde(default)]
     pub shortcuts: std::collections::HashMap<String, String>,
+    /// UI font: "system" (OS font, native feel) or "default" (embedded).
+    /// None = system (best first impression, silent fallback).
+    #[serde(default)]
+    pub ui_font: Option<String>,
 }
 
 fn default_zoom() -> f32 {
@@ -486,6 +490,7 @@ mod tests {
             sql_cols: false,
             lang: Some("en".into()),
             shortcuts: [("goto".to_string(), "Alt+G".to_string())].into_iter().collect(),
+            ui_font: Some("system".into()),
         };
         let s = serde_json::to_string(&cfg).unwrap();
         let back: Config = serde_json::from_str(&s).unwrap();
@@ -498,6 +503,7 @@ mod tests {
         assert_eq!(back.lang.as_deref(), Some("en"));
         assert!(back.split_view);
         assert_eq!(back.shortcuts.get("goto").map(String::as_str), Some("Alt+G"));
+        assert_eq!(back.ui_font.as_deref(), Some("system"));
         // Old config without lang still loads (backward compatible).
         let old = r#"{"zoom":1.0}"#;
         let old_cfg: Config = serde_json::from_str(old).unwrap();
