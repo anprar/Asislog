@@ -32,6 +32,27 @@ impl Lang {
         }
     }
 
+    /// Name for an auto-created quick-label highlight set.
+    /// Stored in config as ordinary data; old configs may hold either
+    /// language's name, so callers must accept both (see toggle_label).
+    pub fn quick_set_name(self) -> &'static str {
+        match self {
+            Lang::Id => "Cepat",
+            Lang::En => "Quick",
+        }
+    }
+
+    /// Display name for a stored monospace-font choice.
+    /// Storage stays stable (`Bawaan` from old configs); only display
+    /// is localized, in both directions.
+    pub fn font_name(self, stored: &str) -> &str {
+        match (self, stored) {
+            (Lang::En, "Bawaan") => "Default",
+            (Lang::Id, "Default") => "Bawaan",
+            _ => stored,
+        }
+    }
+
     /// Format a translated template with `{}` placeholders.
     /// Use instead of `format!(lang.tr(..), ..)` (which Rust rejects:
     /// format string must be a literal). Replaces `{}` left-to-right.
@@ -337,6 +358,33 @@ impl Lang {
             "Rentang tidak valid. Contoh: 1000000 sampai 2000000." => {
                 "Invalid range. Example: 1000000 to 2000000."
             }
+            "Rentang baris tidak valid." => "Invalid line range.",
+            "Rentang kosong pada file ini." => "Empty range in this file.",
+            "Waktu awal tidak valid. Contoh: 2026-08-24 13:00:00" => {
+                "Invalid start time. Example: 2026-08-24 13:00:00"
+            }
+            "Waktu akhir tidak valid." => "Invalid end time.",
+            "Waktu akhir harus setelah waktu awal." => "End time must be after start time.",
+            "Tidak ditemukan." => "Not found.",
+            "Indeks sisi dimuat." => "Sidecar index loaded.",
+            "Zip kosong." => "Empty zip.",
+            "Tar kosong / tanpa file teks." => "Empty tar / no text files.",
+            "Entri tar tidak ditemukan." => "Tar entry not found.",
+            "Filter dikosongkan — menampilkan semua baris." => {
+                "Filter cleared — showing all lines."
+            }
+            "Filter: memindai baris baru…" => "Filter: scanning new lines…",
+            "Ekspor masih berjalan; tunggu selesai atau Batalkan." => {
+                "Export still running; wait or Cancel."
+            }
+            "Memfilter…" => "Filtering…",
+            "Membuka… mengindeks latar." => "Opening… indexing in background.",
+            " (dibatasi 2 jt)" => " (capped at 2M)",
+            "Persen harus 0–100." => "Percent must be 0–100.",
+            "Nomor baris minimal 1." => "Line number must be at least 1.",
+            "Tiket disimpan ({} hasil): {}" => "Ticket saved ({} results): {}",
+            "Kunci {}: {}" => "Key {}: {}",
+            "Impor" => "Import",
             "Simpan pencarian sebagai preset" => "Save search as preset",
             "Nama preset:" => "Preset name:",
             "Simpan" => "Save",
@@ -616,7 +664,10 @@ impl Lang {
     }
 
     /// Translate an already-formatted status line (engine messages).
-    /// Prefix-based so `format!` values survive. Falls back to input.
+    /// Order: exact key → prefix → full-template match → fallback.
+    /// Templates let formatted messages (`format!` values baked in) translate
+    /// without threading UI language into the engine: literals must match
+    /// exactly, gaps (`{}`) capture free text in order.
     pub fn tr_status(self, msg: &str) -> String {
         if self == Lang::Id {
             return msg.to_string();
@@ -627,23 +678,18 @@ impl Lang {
             return exact.to_string();
         }
         const PREFIXES: &[(&str, &str)] = &[
+            // NOTE: no prefix here may shadow a TEMPLATE_PAIRS shape with a
+            // worse partial translation (locked by test). Prefix rests must
+            // already be language-neutral (paths, numbers, English IO errors).
             ("Membuka ", "Opening "),
-            ("Sesi dipulihkan: ", "Session restored: "),
-            ("Workspace disimpan ke ", "Workspace saved to "),
-            ("Workspace '", "Workspace '"),
-            ("File tidak ditemukan", "File not found"),
             ("File favorit tak ditemukan", "Favorite file not found"),
             ("Gagal ", "Failed "),
             ("Tidak ada ", "No "),
             ("Belum ada ", "No "),
-            ("Penanda baris ", "Bookmark on line "),
-            ("Label ", "Label "),
             ("Hasil disalin", "Results copied"),
             ("Baris disalin", "Line copied"),
             ("50 baris disalin", "50 lines copied"),
-            ("Disimpan ", "Saved "),
             ("Filter diterapkan: ", "Filter applied: "),
-            ("Cakupan ", "Scope "),
             ("Rentang tidak valid", "Invalid range"),
             ("Pencarian dibatalkan", "Search cancelled"),
             ("Ekspor dibatalkan", "Export cancelled"),
@@ -656,13 +702,8 @@ impl Lang {
             ("Mode Zen aktif", "Zen mode on"),
             ("Mode Zen dinonaktifkan", "Zen mode off"),
             ("Zoom ", "Zoom "),
-            ("Set '", "Set '"),
-            ("Indeks selesai: ", "Index finished: "),
             ("File dipotong/dirotasi", "File truncated/rotated"),
             ("File bertambah", "File grew"),
-            ("Tiket (", "Ticket ("),
-            ("Tiket disimpan", "Ticket saved"),
-            ("Diekspor ", "Exported "),
             ("Disalin ", "Copied "),
             ("Ketik query dulu", "Type a query first"),
             ("Kembali ke lokasi", "Back to location"),
@@ -699,19 +740,106 @@ impl Lang {
             ("Pilihan melebihi 16 MB", "Selection exceeds 16 MB"),
             ("Hasil dari cache", "Results from cache"),
             ("Lompat ke baris", "Jump to line"),
-            ("Lompat ke semua tab", "Jump in all tabs"),
             ("Pos: baris", "Pos: line"),
             ("Cari: ", "Search: "),
-            ("Filter: ", "Filter: "),
-            ("File: ", "File: "),
         ];
         for (id_pre, en_pre) in PREFIXES {
             if let Some(rest) = msg.strip_prefix(id_pre) {
                 return format!("{}{}", en_pre, rest);
             }
         }
+        if let Some(out) = match_template(msg) {
+            return out;
+        }
         msg.to_string()
     }
+}
+
+/// Formatted status templates (ID → EN), most-specific first.
+/// Used by `tr_status` when neither exact key nor prefix matches, so
+/// engine/app-core `format!` messages translate without threading
+/// language into the engine. Gaps capture free text (numbers, paths,
+/// queries) left-to-right. ORDER MATTERS: longer shapes before their
+/// prefixes (locked by test).
+const TEMPLATE_PAIRS: &[(&str, &str)] = &[
+    ("Dari {}: {} ({} entri)", "From {}: {} ({} entries)"),
+    ("Dari {}: {}", "From {}: {}"),
+    ("Filter: {} baris cocok (+{} baru).", "Filter: {} lines match (+{} new)."),
+    ("Filter aktif: {} baris cocok.", "Active filter: {} matching lines."),
+    ("Sesi dipulihkan: {} tab{}.", "Session restored: {} tab(s){}."),
+    ("Workspace '{}': {} dibuka{}.", "Workspace '{}': {} opened{}."),
+    ("Workspace disimpan ke {}.", "Workspace saved to {}."),
+    ("Membuka {}.", "Opening {}."),
+    ("File tidak ditemukan: {}", "File not found: {}"),
+    ("File favorit tak ditemukan: {}", "Favorite file not found: {}"),
+    ("File tidak ditemukan, dihapus dari riwayat: {}", "File not found, removed from history: {}"),
+    (", {} file hilang, dilewati", ", {} missing files skipped"),
+    (", {} file tak ditemukan, dilewati", ", {} files not found, skipped"),
+    ("Cakupan {}-{} aktif; ketik query untuk mencari.", "Scope {}-{} active; type a query to search."),
+    ("Cakupan: {}-{}", "Scope: {}-{}"),
+    ("Set '{}' diekspor ke {}.", "Set '{}' exported to {}."),
+    ("Set '{}' diimpor{}.", "Set '{}' imported{}."),
+    (", {} aturan salah dilewati", ", {} invalid rules skipped"),
+    ("Bukan file: '{}'", "Not a file: '{}'"),
+    ("Baris melebihi {} baris.", "Line exceeds {} lines."),
+    ("Rentang waktu: {} baris{}.", "Time range: {} lines{}."),
+    ("Penanda baris {} diperbarui.", "Bookmark on line {} updated."),
+    ("Penanda baris {} dihapus.", "Bookmark on line {} deleted."),
+    ("Lompat ke semua tab: {} ok, {} gagal.", "Jump in all tabs: {} ok, {} failed."),
+    ("Tiket ({} baris konteks) disimpan ke {}.", "Ticket ({} lines of context) saved to {}."),
+    ("Diekspor {} baris ke {}.", "Exported {} lines to {}."),
+    ("Disimpan {} baris ke {}.", "Saved {} lines to {}."),
+    ("Indeks selesai: {} baris.", "Index finished: {} lines."),
+    ("Filter diterapkan: {}", "Filter applied: {}"),
+    ("Label {} dihapus.", "Label {} removed."),
+    ("Label {}: \"{}\" ({}). Tekan lagi untuk hapus.", "Label {}: \"{}\" ({}). Press again to remove."),
+    ("Kunci {}: {}", "Key {}: {}"),
+    ("+{} baris baru", "+{} new lines"),
+    ("Zip tidak valid: {}", "Invalid zip: {}"),
+    ("Tar tidak valid: {}", "Invalid tar: {}"),
+    ("Mengekspor {} / {} hasil…", "Exporting {} / {} results…"),
+    ("Penanda baris {} akan dihapus permanen (tak bisa dibatalkan).",
+     "Bookmark on line {} will be permanently deleted (cannot be undone)."),
+    ("Penanda ditambahkan di baris {}.", "Bookmark added on line {}."),
+    ("Tiket disimpan ({} hasil): {}", "Ticket saved ({} results): {}"),
+];
+
+/// Match `msg` against one ID template; on success rebuild the EN
+/// template with captures in order. Literals match exactly (anchored).
+fn try_template(id_tpl: &str, en_tpl: &str, msg: &str) -> Option<String> {
+    let re = template_regex(id_tpl);
+    let caps = re.captures(msg)?;
+    if caps.len() - 1 != en_tpl.matches("{}").count() {
+        return None;
+    }
+    let mut out = en_tpl.to_string();
+    for i in 1..caps.len() {
+        out = out.replacen("{}", &caps[i], 1);
+    }
+    Some(out)
+}
+
+fn template_regex(id_tpl: &str) -> regex::Regex {
+    let mut pat = String::from("^");
+    let mut first = true;
+    for part in id_tpl.split("{}") {
+        if !first {
+            pat.push_str("(.*?)");
+        }
+        first = false;
+        pat.push_str(&regex::escape(part));
+    }
+    pat.push('$');
+    regex::Regex::new(&pat).expect("valid template regex")
+}
+
+fn match_template(msg: &str) -> Option<String> {
+    for (id_tpl, en_tpl) in TEMPLATE_PAIRS {
+        if let Some(out) = try_template(id_tpl, en_tpl, msg) {
+            return Some(out);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -766,5 +894,457 @@ mod tests {
         assert!(en.tr_status("Gagal menulis sesi: x").starts_with("Failed "));
         // Unknown passes through untouched.
         assert_eq!(en.tr_status("XYZ-unik-123"), "XYZ-unik-123");
+    }
+
+    #[test]
+    fn quick_set_and_font_names() {
+        assert_eq!(Lang::Id.quick_set_name(), "Cepat");
+        assert_eq!(Lang::En.quick_set_name(), "Quick");
+        // Quick-label rule names round-trip per language.
+        assert_eq!(Lang::Id.f2("Kunci {}: {}", 1, "ERROR"), "Kunci 1: ERROR");
+        assert_eq!(Lang::En.f2("Kunci {}: {}", 1, "ERROR"), "Key 1: ERROR");
+        // Font storage stable, display localized both ways.
+        assert_eq!(Lang::En.font_name("Bawaan"), "Default");
+        assert_eq!(Lang::Id.font_name("Bawaan"), "Bawaan");
+        assert_eq!(Lang::Id.font_name("Default"), "Bawaan");
+        assert_eq!(Lang::En.font_name("Consolas"), "Consolas");
+    }
+
+    #[test]
+    fn template_table_translates_samples() {
+        let en = Lang::En;
+        assert_eq!(
+            en.tr_status("Filter aktif: 1.234 baris cocok."),
+            "Active filter: 1.234 matching lines."
+        );
+        assert_eq!(
+            en.tr_status("Filter: 5 baris cocok (+3 baru)."),
+            "Filter: 5 lines match (+3 new)."
+        );
+        assert_eq!(
+            en.tr_status("Dari zip: catalina.out (3 entri)"),
+            "From zip: catalina.out (3 entries)"
+        );
+        assert_eq!(en.tr_status("Dari gzip: /tmp/a.log"), "From gzip: /tmp/a.log");
+        assert_eq!(en.tr_status("Sesi dipulihkan: 2 tab."), "Session restored: 2 tab(s).");
+        assert_eq!(
+            en.tr_status("Rentang waktu: 5.000 baris (dibatasi 2 jt)."),
+            "Time range: 5.000 lines (dibatasi 2 jt)."
+        );
+        assert_eq!(en.tr_status("+128 baris baru"), "+128 new lines");
+        assert_eq!(en.tr_status("Zip kosong."), "Empty zip.");
+        assert_eq!(en.tr_status("Memfilter…"), "Filtering…");
+        // ID mode is identity, even for templates.
+        assert_eq!(Lang::Id.tr_status("Filter aktif: 1.234 baris cocok."), "Filter aktif: 1.234 baris cocok.");
+    }
+
+    #[test]
+    fn template_table_first_match_wins_in_order() {        // Lock pair ordering: every template must resolve via ITSELF,
+        // never shadowed by an earlier pair (e.g. 3-slot "Dari … entri"
+        // must win over 2-slot "Dari …"). Arity ID==EN is enforced too.
+        for (idx, (id_tpl, en_tpl)) in TEMPLATE_PAIRS.iter().enumerate() {
+            assert_eq!(
+                id_tpl.matches("{}").count(),
+                en_tpl.matches("{}").count(),
+                "arity drift in pair {}: {:?}",
+                idx,
+                id_tpl
+            );
+            let got = match_template(id_tpl)
+                .unwrap_or_else(|| panic!("pair {} cannot match itself: {:?}", idx, id_tpl));
+            assert_eq!(got, *en_tpl, "pair {} self-match", idx);
+        }
+        // Explicit shadowing probes for the risky overlaps.
+        assert_eq!(
+            match_template("Dari zip: catalina.out (3 entri)").as_deref(),
+            Some("From zip: catalina.out (3 entries)")
+        );
+        assert_eq!(
+            match_template("Dari gzip: /tmp/a.log").as_deref(),
+            Some("From gzip: /tmp/a.log")
+        );
+        assert_eq!(
+            match_template("Filter: 5 baris cocok (+3 baru).").as_deref(),
+            Some("Filter: 5 lines match (+3 new).")
+        );
+    }
+
+    #[test]
+    fn every_template_wins_end_to_end_via_tr_status() {
+        // The real invariant: no PREFIX may shadow a template with a worse
+        // partial translation. Substitute every slot with "9" and require
+        // the full EN rebuild through the public path.
+        let en = Lang::En;
+        for (id_tpl, en_tpl) in TEMPLATE_PAIRS {
+            let slots = id_tpl.matches("{}").count();
+            let mut sample = id_tpl.to_string();
+            for _ in 0..slots {
+                sample = sample.replacen("{}", "9", 1);
+            }
+            let mut expect = en_tpl.to_string();
+            for _ in 0..slots {
+                expect = expect.replacen("{}", "9", 1);
+            }
+            assert_eq!(en.tr_status(&sample), expect, "shadowed template: {:?}", id_tpl);
+        }
+    }
+
+    /// Source files whose string literals can surface in the status bar,
+    /// dialogs, or other user-visible chrome (via `tr`/`tr_status`/`fN`
+    /// at render). `main.rs` is excluded: its CLI branches are bilingual
+    /// by construction (ID branch intentionally Indonesian).
+    const SURFACE_FILES: &[&str] = &[
+        "src/engine/mod.rs",
+        "src/engine/archive.rs",
+        "src/engine/marks.rs",
+        "src/engine/scratch.rs",
+        "src/engine/query.rs",
+        "src/engine/decode.rs",
+        "src/engine/follow.rs",
+        "src/store.rs",
+        "src/app/actions.rs",
+        "src/app/tab.rs",
+        "src/app/jobs_index.rs",
+        "src/app/jobs_search.rs",
+        "src/app/state.rs",
+        "src/app/ui.rs",
+        "src/app/ui_chrome.rs",
+        "src/app/ui_dialogs.rs",
+        "src/app/ui_highlight.rs",
+        "src/app/ui_histogram.rs",
+        "src/app/ui_misc.rs",
+        "src/app/ui_palette.rs",
+        "src/app/ui_panels.rs",
+        "src/app/ui_search.rs",
+        "src/app/ui_tools.rs",
+        "src/app/ui_tools_investigation.rs",
+        "src/app/ui_viewport.rs",
+        "src/ui/dialogs.rs",
+        "src/ui/results.rs",
+        "src/ui/status.rs",
+    ];
+
+    /// Indonesian markers: any literal containing one of these is assumed
+    /// user-visible and must resolve in EN (exact key or prefix).
+    const ID_MARKERS: &[&str] = &[
+        "Gagal", "Tidak", "Belum", "Berhasil", "Sesi", "Workspace", "Penanda",
+        "Filter", "Ekspor", "Disalin", "Disimpan", "Tiket", "Indeks", "Membuka",
+        "Mencari", "Memfilter", "Mengindeks", "Mengunduh", "Baris", "Cakupan",
+        "Rentang", "Lompat", "Label", "Kunci", "Hasil", "Saring", "Bukan",
+        "Segmen", "Sidecar", "Versi", "Ikuti", "LIVE", "Pos:", "Cari:", "File:",
+        "Dari ", "Zip", "Tar", "Bz", "Xz", "7z", "Entri", "Direktori",
+        "Cap waktu", "Nomor", "Persen", "Masukkan", "Pola", "Pilihan", "Contoh",
+        "Arsip", "Aktif", "Mati", "Siap", "Ditemukan", "Dibatasi", "Terbatas",
+        "Mode ", "Set ", "Tambah", "Ubah", "Warna", "Nama", "Peka", "Konteks",
+        "Histogram", "Agregasi", "Pintasan", "Galat", "URL", "Tempel", "Unduh",
+        "Buka", "Cari", "Riwayat", "Preset", "Sorotan", "Hapus", "Batal",
+        "Simpan", "Tutup", "Tampil", "Kolom", "Pergi", "Terapkan", "Bersihkan",
+        "Saring", "Ganti", "Keluar", "Font", "Bahasa", "Semua", "Logika",
+        "Favorit", "Otomatis", "Akhir", "Awal", "Sampai", "dipilih", "memantau",
+    ];
+
+    /// Literals that are deliberately NOT translated (with reasons).
+    /// Keep this list minimal; every entry is user-visible by design.
+    /// NOTE: words identical in EN ("Filter", "LIVE", …) can never pass a
+    /// `tr_status(x) != x` check by construction — they are listed here
+    /// instead of the dictionary, where they would be dead arms.
+    const COVERAGE_ALLOW: &[&str] = &[
+        // Ticket export content: stable format across languages so tickets
+        // stay greppable/shareable regardless of the author's UI language.
+        "## Baris {} {{#{}}}",
+        "- Konteks: +-{} baris",
+        "- File:",
+        "- Hasil:",
+        // Identical in English: direct-rendered, never via tr_status.
+        "Workspace",
+        "LIVE",
+        "Filter",
+        "Label:",
+        "Font: {}",
+        "Tab: {}",
+    ];
+
+    /// Extract `"..."` string literals from Rust source, skipping comments,
+    /// char literals, lifetimes and `#[cfg(test)]` modules (test data is
+    /// not user-visible). Byte-safe for multi-byte UTF-8 (`…`, `·`, `±`).
+    fn source_literals(src: &str) -> Vec<String> {
+        // Cut test modules: first #[cfg(test)] starts non-shipped code.
+        let src = match src.find("#[cfg(test)]") {
+            Some(i) => &src[..i],
+            None => src,
+        };
+        let b = src.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            let c = b[i] as char;
+            if c == '/' && i + 1 < b.len() && b[i + 1] == b'/' {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            if c == '/' && i + 1 < b.len() && b[i + 1] == b'*' {
+                i += 2;
+                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += 2;
+                continue;
+            }
+            // Raw strings r".." / r#".."# (byte strings b".." handled below).
+            if (c == 'r' || c == 'b')
+                && i + 1 < b.len()
+                && (b[i + 1] == b'"' || b[i + 1] == b'#')
+            {
+                let is_byte = c == 'b';
+                let mut j = i + 1;
+                let mut hashes = 0;
+                while j < b.len() && b[j] == b'#' {
+                    hashes += 1;
+                    j += 1;
+                }
+                if j < b.len() && b[j] == b'"' && !(is_byte && hashes > 0) {
+                    j += 1;
+                    let start = j;
+                    if hashes == 0 {
+                        while j < b.len() && b[j] != b'"' {
+                            if b[j] == b'\\' {
+                                j += 1;
+                            }
+                            j += 1;
+                        }
+                        out.push(String::from_utf8_lossy(&b[start..j]).into_owned());
+                        i = j + 1;
+                        continue;
+                    } else {
+                        let closer: Vec<u8> =
+                            std::iter::once(b'"').chain(std::iter::repeat(b'#').take(hashes)).collect();
+                        let mut k = j;
+                        let mut found = None;
+                        while k + closer.len() <= b.len() {
+                            if &b[k..k + closer.len()] == closer.as_slice() {
+                                found = Some(k);
+                                break;
+                            }
+                            k += 1;
+                        }
+                        if let Some(k) = found {
+                            out.push(String::from_utf8_lossy(&b[start..k]).into_owned());
+                            i = k + closer.len();
+                            continue;
+                        }
+                    }
+                }
+            }
+            if c == '"' {
+                let start = i + 1;
+                let mut j = i + 1;
+                while j < b.len() && b[j] != b'"' {
+                    if b[j] == b'\\' {
+                        j += 1;
+                    }
+                    j += 1;
+                }
+                out.push(String::from_utf8_lossy(&b[start..j]).into_owned());
+                i = j + 1;
+                continue;
+            }
+            if c == '\'' {
+                // Char literal 'x' / '\n' vs lifetime 'static: only the
+                // former is quote-closed within 4 chars.
+                let mut j = i + 1;
+                if j < b.len() && b[j] == b'\\' {
+                    j += 1;
+                }
+                j += 1; // the char itself
+                if j < b.len() && b[j] == b'\'' {
+                    i = j + 1; // real char literal, skip
+                } else {
+                    i += 1; // lifetime or stray quote, ignore
+                }
+                continue;
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// Resolve Rust escape/continuation sequences the way the compiler
+    /// does for the compared value: `\`-newline eats the newline AND the
+    /// next line's leading whitespace; then `\"`, `\n`, `\t`, `\\`.
+    fn unescape(s: &str) -> String {
+        let mut t = String::with_capacity(s.len());
+        let mut it = s.chars().peekable();
+        while let Some(c) = it.next() {
+            if c == '\\' {
+                match it.peek() {
+                    Some('\r') | Some('\n') => {
+                        if it.peek() == Some(&'\r') {
+                            it.next();
+                        }
+                        if it.peek() == Some(&'\n') {
+                            it.next();
+                        }
+                        while matches!(it.peek(), Some(' ' | '\t')) {
+                            it.next();
+                        }
+                        continue;
+                    }
+                    _ => t.push(c),
+                }
+            } else {
+                t.push(c);
+            }
+        }
+        t.replace("\\\"", "\"")
+            .replace("\\n", "\n")
+            .replace("\\t", "\t")
+            .replace("\\r", "\r")
+            .replace("\\\\", "\\")
+    }
+
+    /// Guard: every Indonesian user-surface literal resolves in EN.
+    /// Add a dictionary key or a `tr_status` prefix — never extend the
+    /// allowlist for chrome/status text.
+    #[test]
+    fn all_user_surface_templates_covered_in_english() {
+        let en = Lang::En;
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut misses: Vec<String> = Vec::new();
+        for rel in SURFACE_FILES {
+            let text = std::fs::read_to_string(root.join(rel))
+                .unwrap_or_else(|_| panic!("cannot read {}", rel));
+            for lit in source_literals(&text) {
+                let lit = unescape(&lit);
+                if lit.chars().count() < 4 {
+                    continue;
+                }
+                if !ID_MARKERS.iter().any(|m| lit.contains(m)) {
+                    continue;
+                }
+                if COVERAGE_ALLOW.iter().any(|a| lit.contains(a)) {
+                    continue;
+                }
+                if en.tr_status(&lit) == lit {
+                    misses.push(format!("{}: {:?}", rel, lit));
+                }
+            }
+        }
+        assert!(
+            misses.is_empty(),
+            "Indonesian literals without EN coverage (add dict key/prefix):\n{}",
+            misses.join("\n")
+        );
+    }
+
+    /// Guard: every `lang.fN("template", …)` call site passes exactly as
+    /// many args as the template (ID and EN) has `{}` slots. A mismatch
+    /// would render a raw `{}` to the user instead of failing to compile.
+    /// Templates identical in EN live in IDENTITY_TEMPLATES (reviewed).
+    #[test]
+    fn format_call_templates_match_arity() {
+        const IDENTITY_TEMPLATES: &[&str] = &[
+            // Pure numbers/symbols: nothing to translate.
+            "{}/{} · {}%",
+        ];
+        let en = Lang::En;
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let src_root = root.join("src");
+        let mut bad: Vec<String> = Vec::new();
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        let mut stack = vec![src_root];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(d).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().map(|x| x == "rs").unwrap_or(false) {
+                    files.push(p);
+                }
+            }
+        }
+        files.sort();
+        for path in files {
+            let text = std::fs::read_to_string(&path).unwrap();
+            let text = match text.find("#[cfg(test)]") {
+                Some(i) => text[..i].to_string(),
+                None => text,
+            };
+            let b = text.as_bytes();
+            let mut i = 0;
+            while i + 4 < b.len() {
+                if b[i] == b'.'
+                    && b[i + 1] == b'f'
+                    && b[i + 2].is_ascii_digit()
+                    && b[i + 2] >= b'1'
+                    && b[i + 2] <= b'4'
+                    && b[i + 3] == b'('
+                {
+                    let n = (b[i + 2] - b'0') as usize;
+                    let mut j = i + 4;
+                    while j < b.len() && (b[j] == b' ' || b[j] == b'\n' || b[j] == b'\r' || b[j] == b'\t') {
+                        j += 1;
+                    }
+                    if j < b.len() && b[j] == b'"' {
+                        // Byte ranges + lossy decode: pushing bytes as chars
+                        // would split multi-byte UTF-8 (… · ±).
+                        let start = j + 1;
+                        j += 1;
+                        while j < b.len() && b[j] != b'"' {
+                            if b[j] == b'\\' {
+                                j += 1;
+                            }
+                            j += 1;
+                        }
+                        let tpl = unescape(&String::from_utf8_lossy(&b[start..j]));
+                        // Skip i18n's own fN definitions (fn f1/f2/.. match
+                        // the same shape but carry no template).
+                        let ctx_start = text[..i].rfind("fn f").map(|k| k + 4).unwrap_or(0);
+                        let is_def = text[ctx_start..i].trim().is_empty()
+                            && text[..i].trim_end().ends_with("fn");
+                        if !is_def {
+                            let id_count = tpl.matches("{}").count();
+                            if id_count != n {
+                                bad.push(format!(
+                                    "{}: f{} has {} slots: {:?}",
+                                    path.strip_prefix(&root).unwrap().display(),
+                                    n,
+                                    id_count,
+                                    tpl
+                                ));
+                            } else if en.tr(&tpl) == tpl && !IDENTITY_TEMPLATES.contains(&tpl.as_str()) {
+                                // No dictionary arm: EN direct-render would
+                                // leak Indonesian (fallback is silent).
+                                bad.push(format!(
+                                    "{}: f{} template has no EN arm: {:?}",
+                                    path.strip_prefix(&root).unwrap().display(),
+                                    n,
+                                    tpl
+                                ));
+                            } else {
+                                let ent = en.tr(&tpl);
+                                if ent != tpl && ent.matches("{}").count() != n {
+                                    bad.push(format!(
+                                        "{}: EN translation arity drift: {:?} -> {:?}",
+                                        path.strip_prefix(&root).unwrap().display(),
+                                        tpl,
+                                        ent
+                                    ));
+                                }
+                            }
+                        }
+                        i = j + 1;
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "fN/template arity mismatches (raw {{}} would reach the user):\n{}",
+            bad.join("\n")
+        );
     }
 }

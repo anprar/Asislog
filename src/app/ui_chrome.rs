@@ -317,10 +317,10 @@ impl AsisLogApp {
                         self.palette_selected = 0;
                     }
                     egui::ComboBox::from_id_salt("font_choice")
-                        .selected_text(format!("Font: {}", self.font_family))
+                        .selected_text(format!("Font: {}", lang.font_name(&self.font_family)))
                         .show_ui(ui, |ui| {
                             for f in ["Bawaan", "JetBrains Mono", "Consolas"] {
-                                if ui.selectable_label(self.font_family == f, f).clicked() {
+                                if ui.selectable_label(self.font_family == f, lang.font_name(f)).clicked() {
                                     self.font_family = f.to_string();
                                     self.cfg_dirty = true;
                                 }

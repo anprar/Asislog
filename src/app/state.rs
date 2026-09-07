@@ -622,15 +622,27 @@ impl AsisLogApp {
             return;
         }
         if self.active_set.is_none() {
-            self.sets.push(HighlightSet { name: "Cepat".to_string(), rules: Vec::new() });
-            self.active_set = Some("Cepat".to_string());
+            // Reuse a legacy quick set from an old config regardless of its
+            // language, otherwise create one named in the active language.
+            // Toggle-off below accepts generated names in both languages.
+            if let Some(legacy) = self.sets.iter().find(|s| s.name == "Cepat" || s.name == "Quick").map(|s| s.name.clone()) {
+                self.active_set = Some(legacy);
+            } else {
+                let name = lang.quick_set_name().to_string();
+                self.sets.push(HighlightSet { name: name.clone(), rules: Vec::new() });
+                self.active_set = Some(name);
+            }
         }
         let short: String = q.chars().take(40).collect();
-        let name = format!("Kunci {}: {}", idx + 1, short);
+        let name = lang.f2("Kunci {}: {}", idx + 1, &short);
+        // Toggle-off must also find rules generated under the OTHER language
+        // (user switched mid-session), but must never touch the user's own
+        // rules: match generated names only, in both languages.
+        let other = if lang == Lang::En { Lang::Id } else { Lang::En }.f2("Kunci {}: {}", idx + 1, &short);
         let aname = self.active_set.clone().unwrap_or_default();
         let mut msg = String::new();
         if let Some(s) = self.sets.iter_mut().find(|s| s.name == aname) {
-            if let Some(pos) = s.rules.iter().position(|r| r.name == name) {
+            if let Some(pos) = s.rules.iter().position(|r| r.name == name || r.name == other) {
                 s.rules.remove(pos);
                 msg = lang.f1("Label {} dihapus.", idx + 1);
             } else if s.rules.len() >= 50 {

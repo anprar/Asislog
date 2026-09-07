@@ -183,7 +183,7 @@ impl AsisLogApp {
                 if let Some(tab) = self.current_tab_mut() {
                     let path = std::env::temp_dir().join(format!("tiket-jira-{}.md", std::process::id()));
                     match tab.doc.export_ticket_to_file(&path, &tab.search_text, 10) {
-                        Ok(n) => tab.doc.status = format!("Tiket ({}): {} ({} {})", n, path.display(), n, lang.tr("hasil")),
+                        Ok(n) => tab.doc.status = lang.f2("Tiket disimpan ({} hasil): {}", n, path.display()),
                         Err(e) => tab.doc.status = lang.tr_status(&e),
                     }
                 }

@@ -230,7 +230,7 @@ impl AsisLogApp {
                                                 .file_stem()
                                                 .map(|s| s.to_string_lossy().into_owned())
                                                 .unwrap_or_else(|| {
-                                                    String::from("Impor")
+                                                    lang.tr("Impor").to_string()
                                                 }),
                                             rules,
                                         })
