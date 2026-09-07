@@ -401,6 +401,8 @@ impl Lang {
             "Zip kosong." => "Empty zip.",
             "Tar kosong / tanpa file teks." => "Empty tar / no text files.",
             "Entri tar tidak ditemukan." => "Tar entry not found.",
+            "7z kosong / tanpa file teks." => "Empty 7z / no text files.",
+            "7z butuh kata sandi (tidak didukung)." => "7z needs a password (unsupported).",
             "Filter dikosongkan — menampilkan semua baris." => {
                 "Filter cleared — showing all lines."
             }
@@ -828,6 +830,9 @@ const TEMPLATE_PAIRS: &[(&str, &str)] = &[
     ("+{} baris baru", "+{} new lines"),
     ("Zip tidak valid: {}", "Invalid zip: {}"),
     ("Tar tidak valid: {}", "Invalid tar: {}"),
+    ("Bz2 tidak valid: {}", "Invalid bz2: {}"),
+    ("Xz tidak valid: {}", "Invalid xz: {}"),
+    ("7z tidak valid: {}", "Invalid 7z: {}"),
     ("Mengekspor {} / {} hasil…", "Exporting {} / {} results…"),
     ("Penanda baris {} akan dihapus permanen (tak bisa dibatalkan).",
      "Bookmark on line {} will be permanently deleted (cannot be undone)."),
@@ -1134,6 +1139,8 @@ mod tests {
         // Self-bilingual palette title: shown as-is, found by typing
         // either "bahasa" or "language" (fuzzy matches both halves).
         "Ganti bahasa / Switch language",
+        // Internal temp-dir fragment, never displayed.
+        "{}-7z",
     ];
 
     /// Extract `"..."` string literals from Rust source, skipping comments,
@@ -1164,19 +1171,31 @@ mod tests {
                 i += 2;
                 continue;
             }
-            // Raw strings r".." / r#".."# (byte strings b".." handled below).
-            if (c == 'r' || c == 'b')
+            // Byte strings b".." are never UI text: skip entirely
+            // (this also keeps magic constants like b"7z\xBC.." out).
+            if c == 'b' && i + 1 < b.len() && b[i + 1] == b'"' {
+                let mut j = i + 2;
+                while j < b.len() && b[j] != b'"' {
+                    if b[j] == b'\\' {
+                        j += 1;
+                    }
+                    j += 1;
+                }
+                i = j + 1;
+                continue;
+            }
+            // Raw strings r".." / r#".."# (may hold UI text with backslashes).
+            if c == 'r'
                 && i + 1 < b.len()
                 && (b[i + 1] == b'"' || b[i + 1] == b'#')
             {
-                let is_byte = c == 'b';
                 let mut j = i + 1;
                 let mut hashes = 0;
                 while j < b.len() && b[j] == b'#' {
                     hashes += 1;
                     j += 1;
                 }
-                if j < b.len() && b[j] == b'"' && !(is_byte && hashes > 0) {
+                if j < b.len() && b[j] == b'"' {
                     j += 1;
                     let start = j;
                     if hashes == 0 {
@@ -1191,7 +1210,7 @@ mod tests {
                         continue;
                     } else {
                         let closer: Vec<u8> =
-                            std::iter::once(b'"').chain(std::iter::repeat(b'#').take(hashes)).collect();
+                            std::iter::once(b'"').chain(std::iter::repeat_n(b'#', hashes)).collect();
                         let mut k = j;
                         let mut found = None;
                         while k + closer.len() <= b.len() {

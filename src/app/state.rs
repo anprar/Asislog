@@ -753,7 +753,7 @@ impl AsisLogApp {
         let lang = self.lang;
         let f = rfd::FileDialog::new()
             .add_filter("Log", &["log", "txt", "out", "err"])
-            .add_filter(lang.tr("Arsip"), &["zip", "tgz", "gz", "tar"])
+            .add_filter(lang.tr("Arsip"), &["zip", "tgz", "gz", "tar", "bz2", "tbz2", "tbz", "xz", "txz", "7z"])
             .add_filter(lang.tr("Semua"), &["*"])
             .pick_file();
         if let Some(p) = f {

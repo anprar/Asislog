@@ -87,7 +87,8 @@ asislog --help                     tampilkan bantuan ringkas
   Menu **Riwayat v** berisi file terakhir + **favorit** (tombol F per baris).
   `Ctrl+Tab` / `Ctrl+Shift+Tab` pindah tab (berlaku juga saat mengetik
   di kolom teks, seperti peramban).
-  Arsip `.zip`/`.tar.gz`/`.tgz`/`.tar`/`.gz` dibuka otomatis
+  Arsip `.zip`/`.tar.gz`/`.tgz`/`.tar`/`.gz`/`.bz2`/`.tbz2`/`.xz`/`.txz`/`.7z`
+  dibuka otomatis
   (entri teks terbesar diekstrak ke temp; dibersihkan saat tab ditutup).
   Menu **URL/teks v**: **Buka URL…** (unduh http(s) ke temp) dan
   **Tempel teks…** (Ctrl+V di dialog, buka sebagai file temp).

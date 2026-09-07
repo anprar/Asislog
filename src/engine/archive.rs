@@ -1,5 +1,6 @@
-// English comments: open archives (zip/tar/tar.gz/gz) by extracting the
-// most relevant text entry to temp, then viewing it like a plain file.
+// English comments: open archives (zip/tar/tar.gz/gz/bz2/xz/7z and the
+// tar+bz2 / tar+xz combos) by extracting the most relevant text entry to
+// temp, then viewing it like a plain file.
 // Pure-Rust decoders only (portable, no system libraries).
 
 use std::path::{Path, PathBuf};
@@ -10,22 +11,81 @@ pub enum ArchiveKind {
     TarGz,
     Tar,
     Gzip,
+    Bzip2,
+    TarBz2,
+    Xz,
+    TarXz,
+    SevenZ,
 }
 
-/// Detect by extension (case-insensitive).
+/// Detect by extension (case-insensitive), falling back to magic bytes so
+/// misnamed/extensionless archives still open (klogg parity). Extension
+/// wins when present: only the magic path cannot tell `.tar.gz` apart
+/// from plain `.gz` (same gzip magic), so an extensionless tar.gz opens
+/// as the raw tar stream instead — rename to `.tgz` for entry picking.
 pub fn detect(path: &Path) -> Option<ArchiveKind> {
     let name = path.file_name()?.to_string_lossy().to_ascii_lowercase();
     if name.ends_with(".zip") {
         Some(ArchiveKind::Zip)
     } else if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
         Some(ArchiveKind::TarGz)
+    } else if name.ends_with(".tar.bz2") || name.ends_with(".tbz2") || name.ends_with(".tbz") {
+        Some(ArchiveKind::TarBz2)
+    } else if name.ends_with(".tar.xz") || name.ends_with(".txz") || name.ends_with(".tlz") {
+        Some(ArchiveKind::TarXz)
     } else if name.ends_with(".tar") {
         Some(ArchiveKind::Tar)
     } else if name.ends_with(".gz") {
         Some(ArchiveKind::Gzip)
+    } else if name.ends_with(".bz2") || name.ends_with(".bz") {
+        Some(ArchiveKind::Bzip2)
+    } else if name.ends_with(".xz") {
+        Some(ArchiveKind::Xz)
+    } else if name.ends_with(".7z") {
+        Some(ArchiveKind::SevenZ)
     } else {
-        None
+        detect_magic(path)
     }
+}
+
+/// Magic-byte sniffing for extensionless/misnamed files. Reads at most the
+/// first 512 bytes (tar's ustar marker lives at offset 257).
+fn detect_magic(path: &Path) -> Option<ArchiveKind> {
+    let mut buf = [0u8; 512];
+    let n = std::fs::File::open(path)
+        .ok()
+        .map(|mut f| {
+            use std::io::Read;
+            let mut total = 0;
+            while total < buf.len() {
+                match f.read(&mut buf[total..]) {
+                    Ok(0) => break,
+                    Ok(k) => total += k,
+                    Err(_) => break,
+                }
+            }
+            total
+        })
+        .unwrap_or(0);
+    if n >= 4 && buf[0] == b'P' && buf[1] == b'K' && buf[2] == 3 && buf[3] == 4 {
+        return Some(ArchiveKind::Zip);
+    }
+    if n >= 2 && buf[0] == 0x1f && buf[1] == 0x8b {
+        return Some(ArchiveKind::Gzip);
+    }
+    if n >= 3 && buf[0] == b'B' && buf[1] == b'Z' && buf[2] == b'h' {
+        return Some(ArchiveKind::Bzip2);
+    }
+    if n >= 6 && buf[0] == 0xFD && &buf[1..6] == b"7zXZ\0" {
+        return Some(ArchiveKind::Xz);
+    }
+    if n >= 6 && &buf[0..6] == b"7z\xBC\xAF\x27\x1C" {
+        return Some(ArchiveKind::SevenZ);
+    }
+    if n >= 262 && &buf[257..262] == b"ustar" {
+        return Some(ArchiveKind::Tar);
+    }
+    None
 }
 
 pub struct OpenedFile {
@@ -38,15 +98,22 @@ pub struct OpenedFile {
 }
 
 fn temp_dir_for(stem: &str) -> Result<PathBuf, String> {
+    // Uniqueness must NOT rely on wall-clock millis alone: two tabs (or two
+    // tests) extracting same-stem archives within one millisecond would
+    // share a dir AND output filename and corrupt each other. pid + an
+    // atomic sequence make collisions impossible in-process and across runs.
+    static ARC_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let mut d = std::env::temp_dir();
     d.push("asislog-arc");
     d.push(format!(
-        "{}-{}",
+        "{}-{}-{}-{}",
         sanitize(stem),
+        std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|t| t.as_millis())
-            .unwrap_or(0)
+            .unwrap_or(0),
+        ARC_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     ));
     std::fs::create_dir_all(&d).map_err(|e| format!("Gagal membuat temp: {}", e))?;
     Ok(d)
@@ -100,11 +167,37 @@ pub fn open_maybe_archive(path: &Path) -> Result<OpenedFile, String> {
                 .map_err(|e| format!("Gagal mengekstrak: {}", e))?;
             std::io::copy(&mut dec, &mut w)
                 .map_err(|e| format!("Gagal mengekstrak gzip: {}", e))?;
-            Ok(OpenedFile {
-                path: out.clone(),
-                temp: Some(out),
-                note: format!("Dari gzip: {}", path.display()),
-            })
+            let note = format!("Dari gzip: {}", path.display());
+            redirect_tar_if_needed(&out, &note)
+        }
+        ArchiveKind::Bzip2 => {
+            let f = std::fs::File::open(path)
+                .map_err(|e| format!("Gagal membuka bz2: {}", e))?;
+            let mut dec = bzip2::read::BzDecoder::new(f);
+            let dir = temp_dir_for(&stem)?;
+            // a.tar.bz2 -> file_stem "a.tar" -> strip to "a".
+            let base = stem.strip_suffix(".tar").unwrap_or(&stem);
+            let out = dir.join(sanitize(base));
+            let mut w = std::fs::File::create(&out)
+                .map_err(|e| format!("Gagal mengekstrak: {}", e))?;
+            std::io::copy(&mut dec, &mut w)
+                .map_err(|e| format!("Bz2 tidak valid: {}", e))?;
+            let note = format!("Dari bz2: {}", path.display());
+            redirect_tar_if_needed(&out, &note)
+        }
+        ArchiveKind::Xz => {
+            let f = std::fs::File::open(path)
+                .map_err(|e| format!("Gagal membuka xz: {}", e))?;
+            let mut rdr = std::io::BufReader::new(f);
+            let dir = temp_dir_for(&stem)?;
+            let base = stem.strip_suffix(".tar").unwrap_or(&stem);
+            let out = dir.join(sanitize(base));
+            let mut w = std::fs::File::create(&out)
+                .map_err(|e| format!("Gagal mengekstrak: {}", e))?;
+            lzma_rs::xz_decompress(&mut rdr, &mut w)
+                .map_err(|e| format!("Xz tidak valid: {}", e))?;
+            let note = format!("Dari xz: {}", path.display());
+            redirect_tar_if_needed(&out, &note)
         }
         ArchiveKind::Zip => {
             let f = std::fs::File::open(path)
@@ -148,52 +241,74 @@ pub fn open_maybe_archive(path: &Path) -> Result<OpenedFile, String> {
                 .map_err(|e| format!("Gagal mengekstrak: {}", e))?;
             Ok(OpenedFile { path: out.clone(), temp: Some(out), note })
         }
-        ArchiveKind::Tar | ArchiveKind::TarGz => {
-            let f = std::fs::File::open(path)
-                .map_err(|e| format!("Gagal membuka tar: {}", e))?;
-            let mut cands: Vec<(String, u64)> = Vec::new();
-            if kind == ArchiveKind::TarGz {
-                let dec = flate2::read::GzDecoder::new(f);
-                let mut ar = tar::Archive::new(dec);
-                collect_tar(&mut ar, &mut cands)?;
-            } else {
-                let mut ar = tar::Archive::new(f);
-                collect_tar(&mut ar, &mut cands)?;
-            }
-            if cands.is_empty() {
-                return Err(String::from("Tar kosong / tanpa file teks."));
-            }
-            cands.sort_by(|a, b| {
-                entry_score(&a.0, a.1)
-                    .0
-                    .cmp(&entry_score(&b.0, b.1).0)
-                    .then(b.1.cmp(&a.1))
-            });
-            let (pick, _) = cands[0].clone();
-            let note = format!("Dari tar: {} ({} entri)", pick, cands.len());
-            // Second pass: extract the pick.
-            let f2 = std::fs::File::open(path)
-                .map_err(|e| format!("Gagal membuka tar: {}", e))?;
-            let dir = temp_dir_for(&stem)?;
-            let leaf = Path::new(&pick)
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| String::from("isi.log"));
-            let out = dir.join(sanitize(&leaf));
-            let found = if kind == ArchiveKind::TarGz {
-                let dec = flate2::read::GzDecoder::new(f2);
-                let mut ar = tar::Archive::new(dec);
-                extract_tar(&mut ar, &pick, &out)?
-            } else {
-                let mut ar = tar::Archive::new(f2);
-                extract_tar(&mut ar, &pick, &out)?
-            };
-            if !found {
-                return Err(String::from("Entri tar tidak ditemukan."));
-            }
-            Ok(OpenedFile { path: out.clone(), temp: Some(out), note })
+        ArchiveKind::Tar | ArchiveKind::TarGz | ArchiveKind::TarBz2 => {
+            open_tar_source(&stem, || {
+                let f = std::fs::File::open(path)
+                    .map_err(|e| format!("Gagal membuka tar: {}", e))?;
+                if kind == ArchiveKind::TarGz {
+                    Ok(Box::new(flate2::read::GzDecoder::new(f)) as Box<dyn std::io::Read>)
+                } else if kind == ArchiveKind::TarBz2 {
+                    Ok(Box::new(bzip2::read::BzDecoder::new(f)) as Box<dyn std::io::Read>)
+                } else {
+                    Ok(Box::new(f) as Box<dyn std::io::Read>)
+                }
+            })
         }
+        ArchiveKind::TarXz => {
+            // lzma-rs exposes no streaming Read adapter here, so decode to
+            // a temp .tar first (disk-bounded), then reuse the plain flow.
+            // The intermediate is deleted right after extraction.
+            let f = std::fs::File::open(path)
+                .map_err(|e| format!("Gagal membuka xz: {}", e))?;
+            let mut rdr = std::io::BufReader::new(f);
+            let dir = temp_dir_for(&stem)?;
+            let tmp_tar = dir.join(sanitize(&format!("{}.tar", stem)));
+            {
+                let mut w = std::fs::File::create(&tmp_tar)
+                    .map_err(|e| format!("Gagal mengekstrak: {}", e))?;
+                lzma_rs::xz_decompress(&mut rdr, &mut w)
+                    .map_err(|e| format!("Xz tidak valid: {}", e))?;
+            }
+            let opened = open_tar_source(&stem, || {
+                let f = std::fs::File::open(&tmp_tar)
+                    .map_err(|e| format!("Gagal membuka tar: {}", e))?;
+                Ok(Box::new(f) as Box<dyn std::io::Read>)
+            });
+            let _ = std::fs::remove_file(&tmp_tar);
+            opened
+        }
+        ArchiveKind::SevenZ => open_sevenz(path, &stem),
     }
+}
+
+/// Shared collect → rank → extract flow for tar sources (plain/gz/bz2).
+fn open_tar_source(
+    stem: &str,
+    open: impl Fn() -> Result<Box<dyn std::io::Read>, String>,
+) -> Result<OpenedFile, String> {
+    let mut cands: Vec<(String, u64)> = Vec::new();
+    collect_tar(&mut tar::Archive::new(open()?), &mut cands)?;
+    if cands.is_empty() {
+        return Err(String::from("Tar kosong / tanpa file teks."));
+    }
+    cands.sort_by(|a, b| {
+        entry_score(&a.0, a.1)
+            .0
+            .cmp(&entry_score(&b.0, b.1).0)
+            .then(b.1.cmp(&a.1))
+    });
+    let (pick, _) = cands[0].clone();
+    let note = format!("Dari tar: {} ({} entri)", pick, cands.len());
+    let dir = temp_dir_for(stem)?;
+    let leaf = Path::new(&pick)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| String::from("isi.log"));
+    let out = dir.join(sanitize(&leaf));
+    if !extract_tar(&mut tar::Archive::new(open()?), &pick, &out)? {
+        return Err(String::from("Entri tar tidak ditemukan."));
+    }
+    Ok(OpenedFile { path: out.clone(), temp: Some(out), note })
 }
 
 fn collect_tar<R: std::io::Read>(
@@ -209,14 +324,121 @@ fn collect_tar<R: std::io::Read>(
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default();
             // Only plausible text entries (skip obvious binaries by extension).
-            let low = name.to_ascii_lowercase();
-            if [".png", ".jpg", ".exe", ".dll", ".so", ".bin", ".gz", ".zip"]
-                .iter()
-                .any(|x| low.ends_with(x))
-            {
+            if is_skip_name(&name.to_ascii_lowercase()) {
                 continue;
             }
             out.push((name, e.size()));
+        }
+    }
+    Ok(())
+}
+
+/// Compressed-blob extensions never worth opening as the "best text entry".
+fn is_skip_name(low: &str) -> bool {
+    [
+        ".png", ".jpg", ".exe", ".dll", ".so", ".bin", ".gz", ".zip", ".bz2",
+        ".xz", ".7z", ".zst", ".lzma",
+    ]
+    .iter()
+    .any(|x| low.ends_with(x))
+}
+
+/// A decoded single stream that quacks like tar (ustar at offset 257) is
+/// really a misnamed `.tar.gz`/`.tar.bz2`/`.tar.xz`: run entry picking on
+/// the decoded file instead of showing the raw tar blob.
+fn is_tar_stream(path: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    if f.seek(SeekFrom::Start(257)).is_err() {
+        return false;
+    }
+    let mut magic = [0u8; 5];
+    matches!(f.read_exact(&mut magic), Ok(())) && &magic == b"ustar"
+}
+
+fn redirect_tar_if_needed(out: &Path, note: &str) -> Result<OpenedFile, String> {
+    if !is_tar_stream(out) {
+        return Ok(OpenedFile { path: out.to_path_buf(), temp: Some(out.to_path_buf()), note: note.to_string() });
+    }
+    let stem = out
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| String::from("arsip"));
+    let mut opened = open_tar_source(&stem, || {
+        let f = std::fs::File::open(out).map_err(|e| format!("Gagal membuka tar: {}", e))?;
+        Ok(Box::new(f) as Box<dyn std::io::Read>)
+    })?;
+    // The decoded blob served its purpose; the picked entry is tracked.
+    // Note stays the tar one ("Dari tar: …"): chaining both hops would
+    // break the "Dari {}: {}" display template with mixed languages.
+    let _ = std::fs::remove_file(out);
+    opened.temp = Some(opened.path.clone());
+    Ok(opened)
+}
+
+/// 7z archives: extract everything to a scratch dir (sevenz-rust has no
+/// entry-level streaming), rank text files like tar/zip, move the winner
+/// to a flat temp dir and wipe the scratch dir.
+fn open_sevenz(path: &Path, stem: &str) -> Result<OpenedFile, String> {
+    let dest = temp_dir_for(&format!("{}-7z", stem))?;
+    sevenz_rust::decompress_file(path, &dest).map_err(|e| {
+        let _ = std::fs::remove_dir_all(&dest);
+        let msg = format!("{e}");
+        if msg.to_ascii_lowercase().contains("password") {
+            return String::from("7z butuh kata sandi (tidak didukung).");
+        }
+        format!("7z tidak valid: {}", e)
+    })?;
+    let mut cands: Vec<(String, u64, PathBuf)> = Vec::new();
+    walk_text_files(&dest, &mut cands)
+        .inspect_err(|_| {
+            let _ = std::fs::remove_dir_all(&dest);
+        })?;
+    if cands.is_empty() {
+        let _ = std::fs::remove_dir_all(&dest);
+        return Err(String::from("7z kosong / tanpa file teks."));
+    }
+    cands.sort_by(|a, b| {
+        entry_score(&a.0, a.1)
+            .0
+            .cmp(&entry_score(&b.0, b.1).0)
+            .then(b.1.cmp(&a.1))
+    });
+    let (pick, _, full) = cands[0].clone();
+    let note = format!("Dari 7z: {} ({} entri)", pick, cands.len());
+    let dir = temp_dir_for(stem)?;
+    let leaf = Path::new(&pick)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| String::from("isi.log"));
+    let out = dir.join(sanitize(&leaf));
+    // Move (same volume: rename) else copy, then wipe the scratch dir so
+    // tab-close cleanup (one file + parent dir) stays sufficient.
+    if std::fs::rename(&full, &out).is_err() {
+        std::fs::copy(&full, &out).map_err(|e| format!("Gagal mengekstrak: {}", e))?;
+    }
+    let _ = std::fs::remove_dir_all(&dest);
+    Ok(OpenedFile { path: out.clone(), temp: Some(out), note })
+}
+
+fn walk_text_files(dir: &Path, out: &mut Vec<(String, u64, PathBuf)>) -> Result<(), String> {
+    let rd = std::fs::read_dir(dir).map_err(|e| format!("Gagal membaca 7z: {}", e))?;
+    for e in rd {
+        let e = e.map_err(|e| format!("Gagal membaca 7z: {}", e))?;
+        let p = e.path();
+        let ft = e.file_type().map_err(|e| format!("Gagal membaca 7z: {}", e))?;
+        if ft.is_dir() {
+            walk_text_files(&p, out)?;
+        } else if ft.is_file() {
+            let name = p.to_string_lossy().into_owned();
+            if is_skip_name(&name.to_ascii_lowercase()) {
+                continue;
+            }
+            let size = e.metadata().map(|m| m.len()).unwrap_or(0);
+            out.push((name, size, p));
         }
     }
     Ok(())
@@ -302,6 +524,140 @@ mod tests {
             std::fs::read_to_string(&opened.path).unwrap(),
             "hello log\n"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bz2_roundtrip() {
+        use bzip2::Compression;
+        let dir = std::env::temp_dir().join(format!("asislog-bz2test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bp = dir.join("a.log.bz2");
+        {
+            let f = std::fs::File::create(&bp).unwrap();
+            let mut e = bzip2::write::BzEncoder::new(f, Compression::new(1));
+            e.write_all(b"hello bz2\n").unwrap();
+            e.finish().unwrap();
+        }
+        let opened = open_maybe_archive(&bp).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&opened.path).unwrap(),
+            "hello bz2\n"
+        );
+        assert!(opened.note.contains("bz2"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn xz_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("asislog-xztest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let xp = dir.join("a.log.xz");
+        {
+            let f = std::fs::File::create(&xp).unwrap();
+            let mut src: &[u8] = b"hello xz\n";
+            let mut w = f;
+            lzma_rs::xz_compress(&mut src, &mut w).unwrap();
+        }
+        let opened = open_maybe_archive(&xp).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&opened.path).unwrap(),
+            "hello xz\n"
+        );
+        assert!(opened.note.contains("xz"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tar_bz2_and_tar_xz_pick_log() {
+        // Build a small tar in memory, then wrap it both ways.
+        fn make_tar_bytes() -> Vec<u8> {
+            let mut buf = Vec::new();
+            {
+                let mut ar = tar::Builder::new(&mut buf);
+                let mut h = tar::Header::new_gnu();
+                h.set_size(12);
+                h.set_mode(0o644);
+                h.set_cksum();
+                ar.append_data(&mut h, "big/catalina.out", &b"line1\nline2\n"[..]).unwrap();
+                let mut h2 = tar::Header::new_gnu();
+                h2.set_size(2);
+                h2.set_mode(0o644);
+                h2.set_cksum();
+                ar.append_data(&mut h2, "readme.txt", &b"hi"[..]).unwrap();
+                ar.finish().unwrap();
+            }
+            buf
+        }
+        let dir = std::env::temp_dir().join(format!("asislog-tartest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tar_bytes = make_tar_bytes();
+        // .tar.bz2 via streaming encoder.
+        let tbz = dir.join("a.tar.bz2");
+        {
+            use bzip2::Compression;
+            let f = std::fs::File::create(&tbz).unwrap();
+            let mut e = bzip2::write::BzEncoder::new(f, Compression::new(1));
+            e.write_all(&tar_bytes).unwrap();
+            e.finish().unwrap();
+        }
+        let opened = open_maybe_archive(&tbz).unwrap();
+        assert!(std::fs::read_to_string(&opened.path).unwrap().contains("line1"));
+        assert!(opened.note.contains("catalina.out"));
+        // .txz via temp-file decode path.
+        let txz = dir.join("a.txz");
+        {
+            let f = std::fs::File::create(&txz).unwrap();
+            let mut src: &[u8] = &tar_bytes;
+            let mut w = f;
+            lzma_rs::xz_compress(&mut src, &mut w).unwrap();
+        }
+        let opened = open_maybe_archive(&txz).unwrap();
+        assert!(std::fs::read_to_string(&opened.path).unwrap().contains("line1"));
+        assert!(opened.note.contains("catalina.out"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sevenz_roundtrip_and_invalid() {
+        let dir = std::env::temp_dir().join(format!("asislog-7ztest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("app.log");
+        std::fs::write(&src, "hello 7z\n").unwrap();
+        let zp = dir.join("a.7z");
+        sevenz_rust::compress_to_path(&src, &zp).unwrap();
+        let opened = open_maybe_archive(&zp).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&opened.path).unwrap(),
+            "hello 7z\n"
+        );
+        assert!(opened.note.contains("7z"));
+        // Garbage with a .7z name: honest error, never a panic.
+        let bad = dir.join("bad.7z");
+        std::fs::write(&bad, b"not a 7z file at all!!!!!!!!").unwrap();
+        assert!(open_maybe_archive(&bad).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detect_magic_and_new_extensions() {
+        assert_eq!(detect(Path::new("a.BZ2")), Some(ArchiveKind::Bzip2));
+        assert_eq!(detect(Path::new("a.tbz2")), Some(ArchiveKind::TarBz2));
+        assert_eq!(detect(Path::new("a.txz")), Some(ArchiveKind::TarXz));
+        assert_eq!(detect(Path::new("a.7z")), Some(ArchiveKind::SevenZ));
+        assert_eq!(detect(Path::new("a.XZ")), Some(ArchiveKind::Xz));
+        // Magic fallback for extensionless files.
+        let dir = std::env::temp_dir().join(format!("asislog-magtest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let noext = dir.join("mystery");
+        std::fs::write(&noext, b"BZh91AY&SY definitely bz2 magic").unwrap();
+        assert_eq!(detect(&noext), Some(ArchiveKind::Bzip2));
+        std::fs::write(&noext, b"7z\xBC\xAF\x27\x1C....").unwrap();
+        assert_eq!(detect(&noext), Some(ArchiveKind::SevenZ));
+        std::fs::write(&noext, b"\xFD7zXZ\x00....").unwrap();
+        assert_eq!(detect(&noext), Some(ArchiveKind::Xz));
+        std::fs::write(&noext, b"plain log line\n").unwrap();
+        assert_eq!(detect(&noext), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

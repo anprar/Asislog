@@ -26,6 +26,12 @@ base64 = "0.22"
 flate2 = "1"
 tar = "0.4"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# Archive parity with klogg (bz2/xz/7z): all pure-Rust decoders
+# (bzip2 0.6 uses the libbz2-rs-sys backend, no C compiler needed).
+# No system libraries, still a single portable binary.
+bzip2 = "0.6"
+lzma-rs = "0.3"
+sevenz-rust = "0.6"
 ureq = { version = "3", features = ["rustls"] }
 roaring = "0.11.5"
 # PNG only (logo decode check): keep the tree lean, no extra codecs.
