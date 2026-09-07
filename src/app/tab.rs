@@ -715,7 +715,7 @@ impl TabState {
                     self.doc.status = format!(
                         "Filter: {} baris cocok (+{} baru).",
                         format_count(self.doc.filter_map.len()),
-                        format_count(added as u64),
+                        format_count(added),
                     );
                 } else {
                     self.doc.filter_map = map;
