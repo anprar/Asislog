@@ -284,3 +284,47 @@ WS 9,7 GB di §5 dipastikan artefak harness mmap-touching. Aplikasi
 - Pola regex alternasi literal murni (`A|B|C` atau `(WARN|ERROR|FATAL)`) otomatis diekstrak ke automaton multi-pola `aho_corasick` (`MatchKind::LeftmostFirst`).
 - Menghilangkan beban DFA state transitions dari regex engine untuk pola multi-kata umum, menghasilkan peningkatan kecepatan 10–50x pada pencarian multi-keyword.
 
+
+## 10. Buka arsip per format (2026-09-07, debug = batas bawah)
+
+Perintah: `ASISLOG_BENCH_KEEP=<dir> cargo test -- --ignored bench_archives --nocapture`
+(ulangan di `--release` menyempitkan gap pure-Rust vs C; angka debug di bawah
+adalah batas bawah yang jujur, bukan klaim rilis).
+
+Mesin: Intel i5-10400, Windows 11. File: 8,0 MB log sintetis ala `catalina.out`
+(92.660 baris) yang sama untuk semua format. Yang diukur: `open_maybe_archive`
+penuh (decode + tulis temp + pilih entri) s.d. byte hasil terverifikasi identik.
+Jangkar netral di mesin + file sama: CPython (C: gzip/bz2/lzma) dan bsdtar.
+
+| Format | Di disk | AsisLog (debug) | Jangkar netral | Catatan jujur |
+|---|---|---|---|---|
+| gz | 0,6 MB | **0,08 dtk (100 MB/s)** | gzip-py 0,02 dtk (470 MB/s) | flate2; angka AsisLog termasuk tulis temp |
+| bz2 | 0,2 MB | **0,30 dtk (26 MB/s)** | bz2-py 0,09 dtk (88 MB/s) | backend pure-Rust; ~3,5x dari C di debug |
+| xz (framing) | 8,0 MB | 0,02 dtk (393 MB/s) | — | **BUKAN angka valid**: fixture dari `xz_compress` lzma-rs yang stored-only; hanya bukti framing. Abaikan baris ini untuk perbandingan |
+| xz nyata (LZMA2, preset 6) | 0,04 MB | **0,26 dtk (31 MB/s)** | lzma-py 0,02 dtk (399 MB/s) | decoder pure-Rust ~13x dari liblzma di debug; jalan benar (byte identik, test `xz_real_lzma2_decodes`) |
+| zip | 0,3 MB | **0,05 dtk (161 MB/s)** | Expand-Archive 0,57 dtk | AsisLog streaming entri; Expand-Archive terkenal lambat |
+| tar.gz | 0,6 MB | **0,14 dtk (59 MB/s)** | bsdtar `-xzf -O` 0,41 dtk | dua pass (koleksi + ekstrak); bsdtar termasuk spawn proses + pipe |
+| tar.bz2 nyata | 0,2 MB | **0,58 dtk (14 MB/s)** | bsdtar `-xjf -O` 0,42 dtk | **satu-satunya baris AsisLog kalah dari jangkar**: dua pass x pure-Rust debug; kandidat optimasi (satu pass + ingat offset) tercatat, belum dikerjakan |
+| tar.xz nyata | 0,04 MB | **0,27 dtk (30 MB/s)** | — (tanpa jangkar) | decode xz ke temp.tar dulu (ganda disk sementara), lalu alur tar biasa |
+| 7z nyata | 0,0 MB | **0,15 dtk (55 MB/s)** | n/a (tanpa 7z CLI) | ekstrak-semua-dulu: puncak disk seukuran uncompressed; tanpa pilih entri (beda UX vs klogg) |
+
+Kesimpulan jujur: paritas **keluasan** format vs klogg tercapai (semua terbuka,
+semua byte-identik, semua bilingual di status). Paritas **kedalaman** belum:
+tanpa pilih entri, decoder xz/bz2 pure-Rust debug 3–13x dari C (rilis menyempit,
+belum diukur), `.tar.bz2` paling lambat dan sudah ditandai untuk optimasi satu
+pass. Kolom klogg GUI per format menunggu QA manual (tidak ada CLI timing yang
+jujur untuk GUI) — sengaja dikosongkan, bukan diisi kira-kira.
+
+## 11. Filter jujur & planner prefilter (tanpa klaim kecepatan baru)
+
+- Filter: cap diam-diam 5 jt baris dihapus (`spawn_filter` menulis langsung ke
+  `LineSet`; tidak ada lagi flag truncate yang diabaikan). Bukti: 100 rb baris
+  konsekutif cocok = hitungan eksak + heap roaring < 100 KB
+  (`filter_reports_exact_count_with_roaring_heap`). Klaim `<250 MB` tak berubah.
+- Planner (`Query::prefilter_plan`): insensitif + required kini tolak dulu via
+  union AC (case-fold bawaan, tanpa alokasi) sebelum fold per baris; sensitif
+  tetap Finder saja (AC tak dibangun). **Sengaja tanpa angka**: ini perbaikan
+  mekanisme; oracle worker (`worker_bool_matches_oracle_prefiltered_and_fallback`,
+  kini mencakup keempat plan di dua mode case) mengunci himpunan hasil identik.
+  Angka menyusul di Tabel §2 bila sempat diukur; sampai saat itu klaim resmi
+  tetap "setara untuk literal, belum tentu untuk regex kompleks".

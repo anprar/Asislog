@@ -425,20 +425,33 @@ fn open_sevenz(path: &Path, stem: &str) -> Result<OpenedFile, String> {
 }
 
 fn walk_text_files(dir: &Path, out: &mut Vec<(String, u64, PathBuf)>) -> Result<(), String> {
+    walk_text_files_rel(dir, dir, out)
+}
+
+/// `display` is archive-relative ("logs/app.log"), so status notes stay
+/// short and never leak temp paths; `full` is the real file to move.
+fn walk_text_files_rel(
+    root: &Path,
+    dir: &Path,
+    out: &mut Vec<(String, u64, PathBuf)>,
+) -> Result<(), String> {
     let rd = std::fs::read_dir(dir).map_err(|e| format!("Gagal membaca 7z: {}", e))?;
     for e in rd {
         let e = e.map_err(|e| format!("Gagal membaca 7z: {}", e))?;
         let p = e.path();
         let ft = e.file_type().map_err(|e| format!("Gagal membaca 7z: {}", e))?;
         if ft.is_dir() {
-            walk_text_files(&p, out)?;
+            walk_text_files_rel(root, &p, out)?;
         } else if ft.is_file() {
-            let name = p.to_string_lossy().into_owned();
-            if is_skip_name(&name.to_ascii_lowercase()) {
+            let display = p
+                .strip_prefix(root)
+                .map(|r| r.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| p.to_string_lossy().into_owned());
+            if is_skip_name(&display.to_ascii_lowercase()) {
                 continue;
             }
             let size = e.metadata().map(|m| m.len()).unwrap_or(0);
-            out.push((name, size, p));
+            out.push((display, size, p));
         }
     }
     Ok(())
@@ -636,6 +649,52 @@ mod tests {
         let bad = dir.join("bad.7z");
         std::fs::write(&bad, b"not a 7z file at all!!!!!!!!").unwrap();
         assert!(open_maybe_archive(&bad).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+
+    // Real LZMA2/xz bytes (preset 6, generated once with CPython lzma).
+    // lzma-rs's own xz_compress is a *dumb* stored-only encoder for
+    // decoder testing, so a fixture built by it proves framing only —
+    // THESE blobs prove the read path on genuine LZMA2 ranges.
+    const REAL_XZ: &[u8] = &[253, 55, 122, 88, 90, 0, 0, 4, 230, 214, 180, 70, 2, 0, 33, 1, 22, 0, 0, 0, 116, 47, 229, 163, 224, 10, 45, 0, 198, 93, 0, 25, 12, 2, 146, 178, 169, 82, 53, 123, 9, 153, 233, 7, 110, 234, 190, 3, 19, 133, 249, 97, 11, 99, 21, 64, 1, 154, 232, 88, 127, 20, 186, 214, 107, 243, 84, 17, 236, 57, 148, 250, 105, 250, 160, 162, 148, 173, 97, 130, 46, 100, 238, 128, 208, 56, 209, 99, 158, 113, 3, 41, 191, 68, 81, 216, 8, 30, 161, 57, 1, 3, 45, 55, 43, 18, 245, 121, 103, 29, 55, 48, 121, 49, 50, 7, 54, 37, 224, 129, 27, 72, 128, 227, 127, 46, 144, 32, 28, 195, 71, 115, 253, 192, 40, 116, 227, 152, 118, 43, 221, 87, 122, 145, 129, 99, 200, 76, 61, 69, 132, 151, 182, 122, 89, 183, 237, 156, 188, 115, 71, 44, 1, 129, 70, 37, 170, 106, 211, 201, 101, 141, 5, 74, 231, 214, 188, 221, 15, 223, 5, 68, 247, 103, 232, 18, 239, 165, 143, 6, 16, 188, 2, 230, 140, 136, 142, 7, 166, 188, 222, 75, 61, 23, 226, 42, 33, 50, 24, 12, 4, 254, 164, 182, 199, 36, 118, 228, 156, 202, 173, 21, 109, 51, 114, 70, 205, 125, 128, 0, 0, 0, 164, 251, 95, 237, 23, 107, 33, 166, 0, 1, 226, 1, 174, 20, 0, 0, 126, 34, 34, 19, 177, 196, 103, 251, 2, 0, 0, 0, 0, 4, 89, 90];
+    const REAL_TXZ: &[u8] = &[253, 55, 122, 88, 90, 0, 0, 4, 230, 214, 180, 70, 2, 0, 33, 1, 22, 0, 0, 0, 116, 47, 229, 163, 224, 39, 255, 0, 138, 93, 0, 49, 26, 73, 21, 156, 34, 98, 32, 2, 96, 209, 114, 4, 231, 83, 239, 238, 235, 47, 20, 149, 144, 172, 112, 166, 43, 3, 184, 58, 66, 159, 238, 159, 231, 91, 132, 74, 186, 195, 237, 10, 0, 231, 143, 254, 113, 255, 80, 72, 173, 6, 214, 22, 41, 228, 30, 177, 97, 132, 15, 63, 15, 26, 58, 140, 172, 172, 41, 113, 84, 166, 252, 68, 8, 162, 204, 214, 26, 73, 167, 106, 98, 113, 166, 183, 241, 159, 141, 46, 47, 126, 105, 171, 19, 188, 18, 31, 160, 176, 160, 12, 101, 8, 152, 69, 190, 152, 195, 8, 252, 134, 160, 164, 8, 83, 94, 235, 140, 88, 108, 12, 26, 255, 12, 164, 53, 172, 55, 104, 249, 140, 100, 4, 32, 114, 132, 77, 71, 0, 0, 0, 255, 168, 159, 193, 4, 243, 217, 214, 0, 1, 166, 1, 128, 80, 0, 0, 21, 151, 149, 176, 177, 196, 103, 251, 2, 0, 0, 0, 0, 4, 89, 90];
+
+    fn real_xz_log_text() -> String {
+        let mut s = String::new();
+        for i in 0..30 {
+            if i % 10 == 0 {
+                s.push_str(&format!(
+                    "2026-09-04 10:00:01 ERROR OrderService - timeout on request id={} after 30000ms\n", i));
+            } else {
+                s.push_str(&format!(
+                    "2026-09-04 10:00:01 INFO  OrderService - request id={} user=andi total=125000 status=OK\n", i));
+            }
+        }
+        s
+    }
+
+    #[test]
+    fn xz_real_lzma2_decodes() {
+        let dir = std::env::temp_dir().join(format!("asislog-xzreal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let xp = dir.join("real.log.xz");
+        std::fs::write(&xp, REAL_XZ).unwrap();
+        let opened = open_maybe_archive(&xp).unwrap();
+        assert_eq!(std::fs::read_to_string(&opened.path).unwrap(), real_xz_log_text());
+        assert!(opened.note.contains("xz"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tar_xz_real_decodes_and_picks_log() {
+        let dir = std::env::temp_dir().join(format!("asislog-txzreal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tp = dir.join("real.txz");
+        std::fs::write(&tp, REAL_TXZ).unwrap();
+        let opened = open_maybe_archive(&tp).unwrap();
+        assert_eq!(std::fs::read_to_string(&opened.path).unwrap(), "line1\nline2\n");
+        assert!(opened.note.contains("catalina.out"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
