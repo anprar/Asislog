@@ -1064,7 +1064,7 @@ pub(crate) fn show_in_explorer(path: &std::path::Path, status: &mut String, lang
     }
     #[cfg(all(not(windows), not(target_os = "macos")))]
     {
-        let out = std::process::Command::new("xdg-open").arg(dir).spawn();
+        let out = std::process::Command::new("xdg-open").arg(_dir).spawn();
         match out {
             Ok(_) => *status = lang.tr("Folder dibuka.").to_string(),
             Err(e) => *status = lang.f1("Gagal membuka folder: {}", e),
