@@ -49,14 +49,15 @@ jobs:
       - name: Stage artifact
         shell: bash
         run: |
+          mkdir -p dist
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            cp "target/${{ matrix.target }}/release/asislog.exe" "${{ matrix.out }}"
+            cp "target/${{ matrix.target }}/release/asislog.exe" "dist/${{ matrix.out }}"
           else
-            cp "target/${{ matrix.target }}/release/asislog" "${{ matrix.out }}"
+            cp "target/${{ matrix.target }}/release/asislog" "dist/${{ matrix.out }}"
           fi
       - name: Smoke test (--version must print and exit 0)
         shell: bash
-        run: ./"${{ matrix.out }}" --version | grep "AsisLog"
+        run: ./dist/"${{ matrix.out }}" --version | grep "AsisLog"
       - name: Install UPX (Windows)
         if: matrix.os == 'windows-latest'
         run: choco install upx -y
@@ -65,31 +66,31 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y upx-ucl
       - name: Compress with UPX (--lzma)
         shell: bash
-        run: upx --lzma --best "${{ matrix.out }}"
+        run: upx --lzma --best "dist/${{ matrix.out }}"
       - name: Size guard (catch profile regressions)
         shell: bash
         run: |
-          size=$(stat -c%s "${{ matrix.out }}")
+          size=$(stat -c%s "dist/${{ matrix.out }}")
           echo "packed bytes: $size"
           test "$size" -lt 6291456 || (echo "packed binary exceeds 6 MB budget" && exit 1)
       - name: Pack ZIP (Windows)
         if: matrix.os == 'windows-latest'
         shell: powershell
-        run: Compress-Archive -Path "${{ matrix.out }}" -DestinationPath "${{ matrix.zip }}" -Force
+        run: Compress-Archive -Path "dist/${{ matrix.out }}" -DestinationPath "dist/${{ matrix.zip }}" -Force
       - name: Pack ZIP (Linux)
         if: matrix.os == 'ubuntu-latest'
         shell: bash
-        run: zip -j "${{ matrix.zip }}" "${{ matrix.out }}"
+        run: zip -j "dist/${{ matrix.zip }}" "dist/${{ matrix.out }}"
       - name: Write SHA-256 (Defender/AV verification)
         shell: bash
-        run: sha256sum "${{ matrix.out }}" "${{ matrix.zip }}" > SHA256SUMS.txt
+        run: cd dist && sha256sum "${{ matrix.out }}" "${{ matrix.zip }}" > SHA256SUMS.txt
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.out }}
           path: |
-            ${{ matrix.out }}
-            ${{ matrix.zip }}
-            SHA256SUMS.txt
+            dist/${{ matrix.out }}
+            dist/${{ matrix.zip }}
+            dist/SHA256SUMS.txt
           if-no-files-found: error
 
   # Attach binaries to the GitHub Release when triggered by a v* tag.

@@ -34,7 +34,49 @@ impl SparseIndex {
 
 /// Build a complete index synchronously (used by tests and small files).
 /// `data` is the full mapped bytes, `bom_len` is skipped (line 1 starts there).
+/// Narrow encodings over [`PARALLEL_MIN_BYTES`] go through the rayon
+/// parallel path ([`build_parallel`]); everything else uses the scalar
+/// core. Both share identical checkpoint/trailing-newline semantics.
 pub fn build_full(data: &[u8], encoding: Encoding, bom_len: usize) -> SparseIndex {
+    build_parallel(data, encoding, bom_len, None)
+}
+
+/// Minimum size for the rayon parallel index path. Below this the thread
+/// fan-out costs more than it saves (unit tests still exercise the merge
+/// logic via a single chunk).
+pub const PARALLEL_MIN_BYTES: usize = 16 * 1024 * 1024;
+/// Target bytes per rayon index chunk (clamped by CPU count).
+pub const PARALLEL_CHUNK_TARGET: usize = 8 * 1024 * 1024;
+
+/// Parallel narrow index over line-aligned chunks (rayon + SIMD memchr).
+/// `progress(0.0..=1.0)` is invoked as chunks complete (any order); pass
+/// `None` for a silent build. Wide encodings keep the scalar core (rare +
+/// alignment-sensitive); small inputs skip fan-out.
+pub fn build_parallel(
+    data: &[u8],
+    encoding: Encoding,
+    bom_len: usize,
+    progress: Option<&(dyn Fn(f32) + Sync)>,
+) -> SparseIndex {
+    let total_bytes = data.len() as u64;
+    if data.is_empty() || (data.len() as u64) <= bom_len as u64 {
+        return SparseIndex {
+            checkpoints: Vec::new(),
+            total_lines: 0,
+            total_bytes,
+            complete: true,
+            progress: 1.0,
+        };
+    }
+    if encoding.is_wide() || data.len() < PARALLEL_MIN_BYTES {
+        return build_scalar(data, encoding, bom_len);
+    }
+    build_parallel_narrow(data, bom_len, progress)
+}
+
+/// Scalar core: the original single-threaded scan, kept for wide
+/// encodings, small files, and as the parallel-path oracle in tests.
+fn build_scalar(data: &[u8], encoding: Encoding, bom_len: usize) -> SparseIndex {
     let total_bytes = data.len() as u64;
     if data.is_empty() || (data.len() as u64) <= bom_len as u64 {
         return SparseIndex {
@@ -119,6 +161,130 @@ pub fn build_full(data: &[u8], encoding: Encoding, bom_len: usize) -> SparseInde
 
     // Empty file edge already handled; file with only BOM has 0 lines.
     let total_lines = if total_bytes as usize <= bom_len { 0 } else { line };
+
+    SparseIndex {
+        checkpoints,
+        total_lines,
+        total_bytes,
+        complete: true,
+        progress: 1.0,
+    }
+}
+
+/// Split bytes into line-aligned chunks for rayon fan-out: chunk 0
+/// starts at `bom_len`, later chunks start right after the next '\n'
+/// at/after their raw split point, so every chunk holds whole lines.
+/// Returns boundary offsets (len = chunks + 1). Shared by the parallel
+/// indexer and the parallel CLI grep (one tested splitter, two users).
+pub fn line_chunks(
+    data: &[u8],
+    bom_len: usize,
+    target: usize,
+    max_chunks: Option<usize>,
+) -> Vec<usize> {
+    let len = data.len();
+    let ncpu = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(1, 32);
+    let cap = max_chunks.unwrap_or(ncpu * 4).max(1);
+    let nchunks = ((len / target.max(1)).max(1)).min(cap);
+    let mut bounds = Vec::with_capacity(nchunks + 1);
+    bounds.push(bom_len.min(len));
+    for i in 1..nchunks {
+        let raw = (len as u64 * i as u64 / nchunks as u64) as usize;
+        let raw = raw.max(bom_len).min(len);
+        let next = memchr::memchr(b'\n', &data[raw..])
+            .map(|r| raw + r + 1)
+            .unwrap_or(len);
+        bounds.push(next);
+    }
+    bounds.push(len);
+    bounds
+}
+
+/// Rayon parallel narrow index. Chunk boundaries snap to line starts so
+/// every chunk holds whole lines; per-chunk relative checkpoints merge by
+/// prefix-summed line bases. The checkpoint rule (1024 lines / 64 KiB) and
+/// the trailing-newline trim match [`build_scalar`] exactly.
+fn build_parallel_narrow(
+    data: &[u8],
+    bom_len: usize,
+    progress: Option<&(dyn Fn(f32) + Sync)>,
+) -> SparseIndex {
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let len = data.len();
+    let total_bytes = len as u64;
+    let bounds = line_chunks(data, bom_len, PARALLEL_CHUNK_TARGET, None);
+    let nchunks = bounds.len().saturating_sub(1).max(1);
+
+    let done = AtomicUsize::new(0);
+    // Per chunk: (newline count, relative checkpoints (rel_line, byte)).
+    let parts: Vec<(u64, Vec<(u64, u64)>)> = (0..nchunks)
+        .into_par_iter()
+        .map(|i| {
+            let (s, e) = (bounds[i], bounds[i + 1]);
+            let mut cps: Vec<(u64, u64)> = Vec::new();
+            if s >= e {
+                if let Some(p) = &progress {
+                    let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    p((d as f32 / nchunks as f32).clamp(0.0, 1.0));
+                }
+                return (0u64, cps);
+            }
+            let mut rel: u64 = 1;
+            let mut last_cp_line: u64 = 1;
+            let mut last_cp_byte: u64 = s as u64;
+            let mut nls: u64 = 0;
+            for r in memchr::memchr_iter(b'\n', &data[s..e]) {
+                let abs_next = (s + r + 1) as u64;
+                rel += 1;
+                nls += 1;
+                // Same rule as scalar (which also refuses offsets == len).
+                if abs_next < len as u64
+                    && (rel - last_cp_line >= CHECKPOINT_LINES
+                        || abs_next - last_cp_byte >= CHECKPOINT_BYTES)
+                {
+                    cps.push((rel, abs_next));
+                    last_cp_line = rel;
+                    last_cp_byte = abs_next;
+                }
+            }
+            if let Some(p) = &progress {
+                let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                p((d as f32 / nchunks as f32).clamp(0.0, 1.0));
+            }
+            (nls, cps)
+        })
+        .collect();
+    if let Some(p) = &progress {
+        p(1.0);
+    }
+
+    // Merge: prefix-sum line bases, adjust relative lines, dedupe
+    // boundary-equal offsets. First entry is always (1, bom_len).
+    let mut checkpoints = vec![(1u64, bom_len as u64)];
+    let mut base: u64 = 1;
+    let mut total_nl: u64 = 0;
+    for (nls, cps) in &parts {
+        for (rel, byte) in cps {
+            let gline = base + rel - 1;
+            if *byte > checkpoints.last().map(|&(_, b)| b).unwrap_or(0) {
+                checkpoints.push((gline, *byte));
+            }
+        }
+        base += *nls;
+        total_nl += *nls;
+    }
+    // Lines = newlines, plus the unterminated tail line when the file
+    // does not end with '\n' (scalar parity: "a\nb\n"->2, "a\nb"->2).
+    let total_lines = if data.last() == Some(&b'\n') {
+        total_nl
+    } else {
+        total_nl + 1
+    };
 
     SparseIndex {
         checkpoints,
@@ -462,8 +628,7 @@ mod tests {
     }
 
     #[test]
-    fn goto_line_via_checkpoints() {
-        let mut data = Vec::new();
+    fn goto_line_via_checkpoints() {        let mut data = Vec::new();
         for i in 0..5000 {
             data.extend_from_slice(format!("line {}\n", i).as_bytes());
         }
@@ -473,5 +638,62 @@ mod tests {
         // line 2500 must resolve and start with expected text
         let (s, e) = line_byte_range(&data, &idx.checkpoints, 2500, Encoding::Utf8, 0).unwrap();
         assert!(data[s as usize..e as usize].starts_with(b"line 2499"));
+    }
+
+    /// Parallel narrow index must match the scalar core exactly: totals,
+    /// checkpoints, and byte resolution of sampled lines.
+    #[test]
+    fn parallel_matches_scalar_oracle() {
+        fn check(data: &[u8], bom: usize) {
+            let a = build_scalar(data, Encoding::Utf8, bom);
+            let b = build_parallel(data, Encoding::Utf8, bom, None);
+            assert_eq!(a.total_lines, b.total_lines, "lines len={}", data.len());
+            assert_eq!(a.total_bytes, b.total_bytes);
+            assert_eq!(a.checkpoints, b.checkpoints, "cps len={}", data.len());
+            // Every checkpoint line must resolve to its recorded offset.
+            for (l, off) in &b.checkpoints {
+                let got = byte_offset_of_line(data, &b.checkpoints, *l, Encoding::Utf8, bom);
+                assert_eq!(got, Some(*off), "line {}", l);
+            }
+            // Spot-check first/middle/last line ranges.
+            if b.total_lines > 0 {
+                for l in [1, b.total_lines / 2 + 1, b.total_lines] {
+                    let (s, e) = line_byte_range(data, &b.checkpoints, l, Encoding::Utf8, bom)
+                        .unwrap_or_else(|| panic!("range {}", l));
+                    assert!(s <= e && (e as usize) <= data.len());
+                }
+            }
+        }
+        check(b"", 0);
+        check(b"\n", 0);
+        check(b"a\nb\n", 0);
+        check(b"a\nb", 0);
+        check(b"no trailing", 0);
+        // Mixed lengths incl. empty lines and a giant line.
+        let mut v = Vec::new();
+        for i in 0..3000u64 {
+            if i == 1500 {
+                v.extend(vec![b'x'; 200_000]);
+                v.push(b'\n');
+            } else if i % 7 == 0 {
+                v.push(b'\n');
+            } else {
+                v.extend_from_slice(format!("baris {} pad pad\n", i).as_bytes());
+            }
+        }
+        check(&v, 0);
+        // Multi-MB fixture to force the real parallel fan-out.
+        let mut big = Vec::with_capacity(3 * 1024 * 1024);
+        for i in 0..60_000u64 {
+            big.extend_from_slice(format!("2026-09-04 INFO id={:08} ok\n", i).as_bytes());
+        }
+        // Below PARALLEL_MIN_BYTES this still runs build_parallel's
+        // dispatch; force the narrow parallel core directly for merge
+        // coverage regardless of CPU count.
+        let a = build_scalar(&big, Encoding::Utf8, 0);
+        let b = build_parallel_narrow(&big, 0, None);
+        assert_eq!(a.total_lines, b.total_lines);
+        assert_eq!(a.checkpoints, b.checkpoints);
+        check(&big, 0);
     }
 }

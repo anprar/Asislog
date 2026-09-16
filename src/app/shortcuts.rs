@@ -49,7 +49,7 @@ pub struct ShortcutDef {
 pub const SHORTCUTS: &[ShortcutDef] = &[
     ShortcutDef { id: "open_file", label_id: "Buka file log", key: egui::Key::O, req_ctrl: true, req_shift: false, req_alt: false, extra_ctrl: false, extra_shift: true, extra_alt: true, needs_tab: false, allow_typing: true, allow_dialog: true },
     ShortcutDef { id: "help", label_id: "Bantuan / daftar pintasan", key: egui::Key::F1, req_ctrl: false, req_shift: false, req_alt: false, extra_ctrl: true, extra_shift: true, extra_alt: true, needs_tab: false, allow_typing: true, allow_dialog: true },
-    ShortcutDef { id: "zen", label_id: "Mode Zen", key: egui::Key::F11, req_ctrl: false, req_shift: false, req_alt: false, extra_ctrl: true, extra_shift: true, extra_alt: true, needs_tab: false, allow_typing: true, allow_dialog: true },
+    ShortcutDef { id: "zen", label_id: "Layar Penuh", key: egui::Key::F11, req_ctrl: false, req_shift: false, req_alt: false, extra_ctrl: true, extra_shift: true, extra_alt: true, needs_tab: false, allow_typing: true, allow_dialog: true },
     ShortcutDef { id: "palette", label_id: "Command Palette", key: egui::Key::P, req_ctrl: true, req_shift: true, req_alt: false, extra_ctrl: false, extra_shift: false, extra_alt: true, needs_tab: false, allow_typing: true, allow_dialog: true },
     ShortcutDef { id: "focus_search", label_id: "Fokus ke kolom Cari", key: egui::Key::F, req_ctrl: true, req_shift: false, req_alt: false, extra_ctrl: false, extra_shift: false, extra_alt: true, needs_tab: false, allow_typing: true, allow_dialog: true },
     ShortcutDef { id: "next_hit", label_id: "Hasil berikutnya", key: egui::Key::F3, req_ctrl: false, req_shift: false, req_alt: false, extra_ctrl: true, extra_shift: true, extra_alt: true, needs_tab: true, allow_typing: true, allow_dialog: false },
@@ -73,6 +73,37 @@ pub const SHORTCUTS: &[ShortcutDef] = &[
     ShortcutDef { id: "zoom_out", label_id: "Perkecil", key: egui::Key::Minus, req_ctrl: true, req_shift: false, req_alt: false, extra_ctrl: false, extra_shift: false, extra_alt: false, needs_tab: false, allow_typing: true, allow_dialog: false },
     ShortcutDef { id: "zoom_reset", label_id: "Reset zoom", key: egui::Key::Num0, req_ctrl: true, req_shift: false, req_alt: false, extra_ctrl: false, extra_shift: false, extra_alt: false, needs_tab: false, allow_typing: true, allow_dialog: false },
     ShortcutDef { id: "split", label_id: "Panel belah (dual-pane hasil)", key: egui::Key::S, req_ctrl: true, req_shift: true, req_alt: false, extra_ctrl: false, extra_shift: false, extra_alt: false, needs_tab: false, allow_typing: true, allow_dialog: true },
+    // P0/P1 additions: quickfind, extend-search, wrap, select-all, tabs,
+    // close-tab, options, open-folder.
+    ShortcutDef { id: "quickfind", label_id: "Cari cepat (QuickFind)", key: egui::Key::Slash, req_ctrl: false, req_shift: false, req_alt: false, extra_ctrl: false, extra_shift: false, extra_alt: false, needs_tab: true, allow_typing: false, allow_dialog: false },
+    ShortcutDef { id: "extend_add", label_id: "Tambah seleksi ke pencarian (OR)", key: egui::Key::A, req_ctrl: false, req_shift: true, req_alt: false, extra_ctrl: false, extra_shift: false, extra_alt: false, needs_tab: true, allow_typing: false, allow_dialog: false },
+    ShortcutDef { id: "extend_exclude", label_id: "Kecualikan seleksi dari pencarian", key: egui::Key::E, req_ctrl: false, req_shift: true, req_alt: false, extra_ctrl: false, extra_shift: false, extra_alt: false, needs_tab: true, allow_typing: false, allow_dialog: false },
+    ShortcutDef { id: "extend_replace", label_id: "Ganti pencarian dengan seleksi", key: egui::Key::R, req_ctrl: false, req_shift: true, req_alt: false, extra_ctrl: false, extra_shift: false, extra_alt: false, needs_tab: true, allow_typing: false, allow_dialog: false },
+    ShortcutDef { id: "toggle_wrap", label_id: "Lipat baris (word wrap)", key: egui::Key::W, req_ctrl: false, req_shift: false, req_alt: false, extra_ctrl: false, extra_shift: false, extra_alt: false, needs_tab: true, allow_typing: false, allow_dialog: false },
+    ShortcutDef { id: "select_all", label_id: "Pilih semua baris", key: egui::Key::A, req_ctrl: true, req_shift: false, req_alt: false, extra_ctrl: false, extra_shift: false, extra_alt: false, needs_tab: true, allow_typing: false, allow_dialog: false },
+    ShortcutDef { id: "tab_1", label_id: "Tab 1", key: egui::Key::Num1, req_ctrl: true, req_shift: false, req_alt: false, extra_ctrl: false, extra_shift: false, extra_alt: false, needs_tab: false, allow_typing: false, allow_dialog: false },
+    ShortcutDef { id: "tab_2", label_id: "Tab 2", key: egui::Key::Num2, req_ctrl: true, req_shift: false, req_alt: false, extra_ctrl: false, extra_shift: false, extra_alt: false, needs_tab: false, allow_typing: false, allow_dialog: false },
+    ShortcutDef { id: "tab_3", label_id: "Tab 3", key: egui::Key::Num3, req_ctrl: true, req_shift: false, req_alt: false, extra_ctrl: false, extra_shift: false, extra_alt: false, needs_tab: false, allow_typing: false, allow_dialog: false },
+    ShortcutDef { id: "tab_4", label_id: "Tab 4", key: egui::Key::Num4, req_ctrl: true, req_shift: false, req_alt: false, extra_ctrl: false, extra_shift: false, extra_alt: false, needs_tab: false, allow_typing: false, allow_dialog: false },
+    ShortcutDef { id: "tab_5", label_id: "Tab 5", key: egui::Key::Num5, req_ctrl: true, req_shift: false, req_alt: false, extra_ctrl: false, extra_shift: false, extra_alt: false, needs_tab: false, allow_typing: false, allow_dialog: false },
+    ShortcutDef { id: "tab_6", label_id: "Tab 6", key: egui::Key::Num6, req_ctrl: true, req_shift: false, req_alt: false, extra_ctrl: false, extra_shift: false, extra_alt: false, needs_tab: false, allow_typing: false, allow_dialog: false },
+    ShortcutDef { id: "tab_7", label_id: "Tab 7", key: egui::Key::Num7, req_ctrl: true, req_shift: false, req_alt: false, extra_ctrl: false, extra_shift: false, extra_alt: false, needs_tab: false, allow_typing: false, allow_dialog: false },
+    ShortcutDef { id: "tab_8", label_id: "Tab 8", key: egui::Key::Num8, req_ctrl: true, req_shift: false, req_alt: false, extra_ctrl: false, extra_shift: false, extra_alt: false, needs_tab: false, allow_typing: false, allow_dialog: false },
+    ShortcutDef { id: "tab_9", label_id: "Tab terakhir", key: egui::Key::Num9, req_ctrl: true, req_shift: false, req_alt: false, extra_ctrl: false, extra_shift: false, extra_alt: false, needs_tab: false, allow_typing: false, allow_dialog: false },
+    ShortcutDef { id: "close_tab", label_id: "Tutup tab kini", key: egui::Key::W, req_ctrl: true, req_shift: false, req_alt: false, extra_ctrl: false, extra_shift: false, extra_alt: false, needs_tab: false, allow_typing: true, allow_dialog: false },
+    ShortcutDef { id: "options", label_id: "Pengaturan…", key: egui::Key::Comma, req_ctrl: true, req_shift: false, req_alt: false, extra_ctrl: false, extra_shift: false, extra_alt: false, needs_tab: false, allow_typing: true, allow_dialog: true },
+    // Kelengkapan standar: case/regex toggle (dulu hanya hover), quit,
+    // reload, navigasi tanpa-Ctrl, paging spasi, alias tab browser-style.
+    ShortcutDef { id: "toggle_case", label_id: "Peka huruf besar/kecil", key: egui::Key::C, req_ctrl: false, req_shift: false, req_alt: true, extra_ctrl: false, extra_shift: true, extra_alt: false, needs_tab: true, allow_typing: true, allow_dialog: false },
+    ShortcutDef { id: "toggle_regex", label_id: "Mode regex", key: egui::Key::R, req_ctrl: false, req_shift: false, req_alt: true, extra_ctrl: false, extra_shift: true, extra_alt: false, needs_tab: true, allow_typing: true, allow_dialog: false },
+    ShortcutDef { id: "quit", label_id: "Keluar aplikasi", key: egui::Key::Q, req_ctrl: true, req_shift: false, req_alt: false, extra_ctrl: false, extra_shift: true, extra_alt: true, needs_tab: false, allow_typing: true, allow_dialog: true },
+    ShortcutDef { id: "reload", label_id: "Muat ulang file", key: egui::Key::F5, req_ctrl: false, req_shift: false, req_alt: false, extra_ctrl: true, extra_shift: true, extra_alt: true, needs_tab: true, allow_typing: true, allow_dialog: false },
+    ShortcutDef { id: "home_plain", label_id: "Awal file (tanpa Ctrl)", key: egui::Key::Home, req_ctrl: false, req_shift: false, req_alt: false, extra_ctrl: false, extra_shift: false, extra_alt: false, needs_tab: true, allow_typing: false, allow_dialog: false },
+    ShortcutDef { id: "end_plain", label_id: "Akhir file (tanpa Ctrl)", key: egui::Key::End, req_ctrl: false, req_shift: false, req_alt: false, extra_ctrl: false, extra_shift: false, extra_alt: false, needs_tab: true, allow_typing: false, allow_dialog: false },
+    ShortcutDef { id: "page_down", label_id: "Satu layar ke bawah (Spasi)", key: egui::Key::Space, req_ctrl: false, req_shift: false, req_alt: false, extra_ctrl: false, extra_shift: false, extra_alt: false, needs_tab: true, allow_typing: false, allow_dialog: false },
+    ShortcutDef { id: "page_up", label_id: "Satu layar ke atas (Shift+Spasi)", key: egui::Key::Space, req_ctrl: false, req_shift: true, req_alt: false, extra_ctrl: false, extra_shift: false, extra_alt: false, needs_tab: true, allow_typing: false, allow_dialog: false },
+    ShortcutDef { id: "tab_next_pg", label_id: "Tab berikut (Ctrl+PgDn)", key: egui::Key::PageDown, req_ctrl: true, req_shift: false, req_alt: false, extra_ctrl: false, extra_shift: true, extra_alt: false, needs_tab: false, allow_typing: true, allow_dialog: true },
+    ShortcutDef { id: "tab_prev_pg", label_id: "Tab sebelum (Ctrl+PgUp)", key: egui::Key::PageUp, req_ctrl: true, req_shift: false, req_alt: false, extra_ctrl: false, extra_shift: true, extra_alt: false, needs_tab: false, allow_typing: true, allow_dialog: true },
 ];
 
 /// Canonical display string for a default binding, e.g. "Ctrl+Shift+P".
@@ -230,6 +261,8 @@ pub fn key_name(k: egui::Key) -> &'static str {
         egui::Key::PageDown => "PgDn",
         egui::Key::Equals => "=",
         egui::Key::Minus => "-",
+        egui::Key::Comma => ",",
+        egui::Key::Slash => "/",
         _ => "?",
     }
 }
@@ -299,6 +332,8 @@ pub fn key_from_name(s: &str) -> Option<egui::Key> {
         "pgdn" | "pagedown" => egui::Key::PageDown,
         "=" | "equals" | "plus" => egui::Key::Equals,
         "-" | "minus" => egui::Key::Minus,
+        "," | "comma" => egui::Key::Comma,
+        "/" | "slash" => egui::Key::Slash,
         _ => return None,
     })
 }
@@ -335,6 +370,76 @@ pub fn compile_all(overrides: &HashMap<String, String>) -> HashMap<String, Parse
         out.insert(def.id.to_string(), parsed);
     }
     out
+}
+
+/// P1-11: find duplicate bindings across actions (config state, not live
+/// input). Returns (action_id, binding_string) pairs that collide; caller
+/// highlights them red in the editor and blocks OK (klogg parity).
+pub fn find_conflicts(
+    overrides: &HashMap<String, String>,
+) -> Vec<(String, String)> {
+    // Effective binding string per action id.
+    let mut eff: Vec<(&str, String)> = SHORTCUTS
+        .iter()
+        .map(|def| {
+            let s = overrides
+                .get(def.id)
+                .cloned()
+                .unwrap_or_else(|| default_string(def));
+            (def.id, s)
+        })
+        .collect();
+    eff.sort_by(|a, b| a.1.cmp(&b.1));
+    let mut conflicts: Vec<(String, String)> = Vec::new();
+    let mut i = 0;
+    while i < eff.len() {
+        let mut j = i + 1;
+        let mut dup = false;
+        while j < eff.len() && eff[j].1 == eff[i].1 {
+            conflicts.push((eff[j].0.to_string(), eff[j].1.clone()));
+            dup = true;
+            j += 1;
+        }
+        if dup {
+            conflicts.push((eff[i].0.to_string(), eff[i].1.clone()));
+        }
+        i = j;
+    }
+    // Interpreted duplicates (different strings, same binding, e.g.
+    // "Control+P" vs "Ctrl+P") — normalize via parse before compare.
+    let mut norm: Vec<(&str, String)> = SHORTCUTS
+        .iter()
+        .filter_map(|def| {
+            let raw = overrides.get(def.id).cloned().unwrap_or_else(|| default_string(def));
+            let norm = parse_binding(&raw).map(|(k, m)| binding_string(k, m))?;
+            Some((def.id, norm))
+        })
+        .collect();
+    norm.sort_by(|a, b| a.1.cmp(&b.1));
+    let mut seen: Vec<(String, String)> = Vec::new();
+    let mut k = 0;
+    while k < norm.len() {
+        let mut j = k + 1;
+        let mut dup = false;
+        while j < norm.len() && norm[j].1 == norm[k].1 {
+            if !seen.iter().any(|(id, _)| id == norm[j].0) {
+                seen.push((norm[j].0.to_string(), norm[j].1.clone()));
+            }
+            dup = true;
+            j += 1;
+        }
+        if dup && !seen.iter().any(|(id, _)| id == norm[k].0) {
+            seen.push((norm[k].0.to_string(), norm[k].1.clone()));
+        }
+        k = j;
+    }
+    // Merge: exact-string conflicts plus normalized ones (dedup).
+    for (id, b) in seen {
+        if !conflicts.iter().any(|(i2, b2)| i2 == &id && b2 == &b) {
+            conflicts.push((id, b));
+        }
+    }
+    conflicts
 }
 
 impl AsisLogApp {
@@ -438,5 +543,62 @@ mod tests {
             assert_ne!(key_name(def.key), "?", "unnamed key for {}", def.id);
             assert_eq!(key_from_name(&key_name(def.key).to_lowercase()), Some(def.key));
         }
+    }
+
+    #[test]
+    fn conflict_detection_finds_duplicates() {
+        // Default table: F3 fires both prev (Shift+F3) and next (F3 extra
+        // shift-tolerant) by design — normalized compare groups them only
+        // when strings are EQUAL after parse; defaults differ, so no
+        // conflict here unless the user binds two actions identically.
+        let mut over = HashMap::new();
+        over.insert("goto".to_string(), "Alt+G".to_string());
+        over.insert("rename".to_string(), "Alt+G".to_string());
+        let c = find_conflicts(&over);
+        assert!(
+            c.iter().any(|(id, _)| id == "goto") && c.iter().any(|(id, _)| id == "rename"),
+            "duplicate binding must be flagged, got {:?}",
+            c
+        );
+        // No conflicts on a clean override set.
+        let mut clean = HashMap::new();
+        clean.insert("goto".to_string(), "Alt+G".to_string());
+        assert!(find_conflicts(&clean).is_empty());
+    }
+
+    #[test]
+    fn test_search_focus_id() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::TopBottomPanel::top("search").show(ctx, |ui| {
+                let mut s = String::new();
+                let resp = ui.add(egui::TextEdit::singleline(&mut s).id(egui::Id::new("cari")));
+                assert_eq!(resp.id, egui::Id::new("cari"), "resp.id = {:?}, Id::new('cari') = {:?}", resp.id, egui::Id::new("cari"));
+            });
+        });
+    }
+
+    #[test]
+    fn test_ctrl_f_binding_fired() {
+        let ctx = egui::Context::default();
+        let mut raw = egui::RawInput::default();
+        raw.modifiers.ctrl = true;
+        raw.modifiers.command = true;
+        raw.events.push(egui::Event::Key {
+            key: egui::Key::F,
+            physical_key: Some(egui::Key::F),
+            pressed: true,
+            repeat: false,
+            modifiers: raw.modifiers,
+        });
+
+        let _ = ctx.run(raw, |ctx| {
+            let parsed = ParsedBinding {
+                key: egui::Key::F,
+                req: Mods { ctrl: true, shift: false, alt: false },
+                extra: Mods { ctrl: false, shift: false, alt: true },
+            };
+            assert!(binding_fired(ctx, &parsed));
+        });
     }
 }

@@ -63,6 +63,39 @@ impl ViewMode {
     }
 }
 
+/// Status pencarian per-tab (klogg parity: NoSearch / Static / Auto-refreshing
+/// / Truncated + Searching + Error). Single source of truth untuk chip status
+/// dan indikator redup; diturunkan dari flag worker yang sudah ada.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum SearchState {
+    /// Belum ada query (kolom cari kosong).
+    #[default]
+    NoSearch,
+    /// Worker berjalan (pencarian manual penuh).
+    Searching,
+    /// Ekor follow menggabung diam-diam (LIVE + query aktif).
+    AutoRefreshing,
+    /// Selesai, hasil statis lengkap.
+    Static,
+    /// Selesai tapi dipangkas batas (200 rb default / Options).
+    Truncated,
+    /// Query/worker galat.
+    Error,
+}
+
+impl SearchState {
+    pub fn label_in(self, lang: crate::i18n::Lang) -> &'static str {
+        lang.tr(match self {
+            SearchState::NoSearch => "Siap",
+            SearchState::Searching => "Mencari…",
+            SearchState::AutoRefreshing => "Auto-refresh…",
+            SearchState::Static => "Statis",
+            SearchState::Truncated => "Dibatasi",
+            SearchState::Error => "Galat",
+        })
+    }
+}
+
 // ---------- one tab ----------
 
 /// One pinned result set ("keep results", klogg parity): a frozen copy of
@@ -94,6 +127,22 @@ pub(crate) struct TabState {
     /// Progress pindaian pencarian (diperbarui per batch).
     pub(crate) search_scanned: u64,
     pub(crate) search_total: u64,
+    /// Exact in-scope match total for the current query (see
+    /// `SearchBatchMsg::grand_total`). Equals `hits.len()` unless
+    /// truncated; tail-refresh merges add onto `merge_base`.
+    pub(crate) search_grand_total: u64,
+    /// Grand-total baseline preserved across a quiet tail merge.
+    pub(crate) merge_base: u64,
+    /// View row count seen last frame (follow pin source of truth).
+    /// The bottom pin engages only while this GROWS (new rows arrived);
+    /// manual scroll-up releases it without passive re-stick.
+    pub(crate) follow_total: u64,
+    /// True while a continuation page job is in flight: batches APPEND
+    /// to existing hits, grand_total keeps the first-page exact value,
+    /// and the cache key is re-armed (a page completing the set caches).
+    pub(crate) search_page_active: bool,
+    /// Stored-hit index where the current page started (jump target).
+    pub(crate) page_base: usize,
     /// Cache hasil lengkap per query+revisi file (pola ulang = instan).
     pub(crate) search_cache: SearchCache,
     /// Kunci cache untuk pencarian yang sedang berjalan.
@@ -107,6 +156,8 @@ pub(crate) struct TabState {
     /// Arsip asal bila tab diekstrak dari zip/tar/gz (untuk sesi/workspace;
     /// doc.path menunjuk temp yang akan dihapus).
     pub(crate) archive_src: Option<PathBuf>,
+    /// Label kustom tab (None = nama file). P1-15 rename, ikut sesi.
+    pub(crate) alias: Option<String>,
     /// Mode tampil viewport + peta barisnya.
     pub(crate) view_mode: ViewMode,
     pub(crate) mode_lines: Vec<u64>,
@@ -142,10 +193,14 @@ pub(crate) struct TabState {
     pub(crate) marker_bits: Option<Vec<u8>>,
     pub(crate) marker_size: u64,
     pub(crate) marker_rx: Option<mpsc::Receiver<MarkerUpdate>>,
+    /// Cancel flag untuk marker scan latar (tab ditutup/rotasi).
+    pub(crate) marker_cancel: Arc<AtomicBool>,
     /// Histogram ERROR per menit (shading strip).
     pub(crate) time_hist: Option<TimeHist>,
     /// Catatan follow segar, mis. `+128 baris baru` (+ waktu).
     pub(crate) follow_note: Option<(String, Instant)>,
+    /// Interval poll follow (ms) — dari Options (P1-13).
+    pub(crate) follow_ms: u64,
     /// Jumlah baris terlihat terakhir (untuk posisi lompat 40% viewport).
     pub(crate) last_visible: u64,
     /// History navigasi (nomor baris) + posisi kini. Maks 200.
@@ -175,6 +230,31 @@ pub(crate) struct TabState {
     pub(crate) export_rx: Option<mpsc::Receiver<ExportMsg>>,
     /// Batalkan ekspor latar yang berjalan (tombol Batal / rotasi).
     pub(crate) export_cancel: Arc<AtomicBool>,
+    // ---- P0-1: word wrap ----
+    /// Toggle word-wrap viewport (per-tab, ikut sesi).
+    pub(crate) word_wrap: bool,
+    /// Cache wrap: baris -> jumlah baris visual (None = hitung ulang).
+    /// Gugur saat file berubah (rotasi/append) atau ganti encoding.
+    pub(crate) wrap_rows_cache: HashMap<u64, u32>,
+    // ---- P0-2: text selection ----
+    /// Seleksi baris (anchor, aktif) — 1-based; None = tanpa seleksi.
+    pub(crate) sel_anchor: Option<u64>,
+    pub(crate) sel_active: Option<u64>,
+    /// Seleksi sebagian baris (line, col_start, col_end) — portion select.
+    pub(crate) sel_portion: Option<(u64, u32, u32)>,
+    /// Rentang tambahan non-kontigu (Ctrl+klik): daftar (lo, hi) 1-based,
+    /// selalu ternormalisasi (terurut, tak tumpang-tindih). Bersama seleksi
+    /// primer (anchor/active) membentuk himpunan multi-seleksi klogg-parity.
+    pub(crate) sel_extra: Vec<(u64, u64)>,
+    // ---- P0-5: QuickFind ----
+    /// QuickFind bar: teks, arah (true = maju), posisi hasil kini.
+    pub(crate) qf_text: String,
+    pub(crate) qf_open: bool,
+    pub(crate) qf_forward: bool,
+    pub(crate) qf_match: Option<(u64, u32, u32)>,
+    pub(crate) qf_msg: Option<(String, Instant)>,
+    /// State interaksi baris saran riwayat pencarian (agar tidak hilang saat tombol diklik).
+    pub(crate) sug_active: bool,
 }
 
 impl TabState {
@@ -201,7 +281,12 @@ impl TabState {
             current_hit: None,
             search_scanned: 0,
             search_total: 0,
-            search_cache: SearchCache::new(8),
+            search_grand_total: 0,
+            merge_base: 0,
+            follow_total: 0,
+            search_page_active: false,
+            page_base: 0,
+            search_cache: SearchCache::new(search::effective_cache_entries()),
             pending_key: None,
             filter_text: String::new(),
             top_row: 0,
@@ -209,6 +294,7 @@ impl TabState {
             hover_line: None,
             temp_path: None,
             archive_src: None,
+            alias: None,
             view_mode: ViewMode::All,
             mode_lines: Vec::new(),
             scope: None,
@@ -234,8 +320,10 @@ impl TabState {
             marker_bits: None,
             marker_size: 0,
             marker_rx: None,
+            marker_cancel: Arc::new(AtomicBool::new(false)),
             time_hist: None,
             follow_note: None,
+            follow_ms: crate::engine::follow::FOLLOW_POLL_MS,
             last_visible: 30,
             hist: Vec::new(),
             hist_pos: 0,
@@ -251,6 +339,18 @@ impl TabState {
             filter_append: false,
             export_rx: None,
             export_cancel: Arc::new(AtomicBool::new(false)),
+            word_wrap: false,
+            wrap_rows_cache: HashMap::new(),
+            sel_anchor: None,
+            sel_active: None,
+            sel_portion: None,
+            sel_extra: Vec::new(),
+            qf_text: String::new(),
+            qf_open: false,
+            qf_forward: true,
+            qf_match: None,
+            qf_msg: None,
+            sug_active: false,
         }
     }
 
@@ -269,6 +369,65 @@ impl TabState {
         }
         self.disp_cache.insert(line, disp.clone());
         disp
+    }
+
+    /// P0-1: jumlah baris VISUAL untuk satu baris log pada lebar kolom
+    /// (`chars_w` = kapasitas karakter). Wrap word-aware: pemenggalan di
+    /// spasi bila bisa, fallback hard-break untuk token raksasa.
+    /// Hasin di-cache per (baris); cache gugur saat file berubah.
+    pub(crate) fn wrap_count(&mut self, line: u64, text: &str, chars_w: u32) -> u32 {
+        if chars_w < 8 {
+            return 1;
+        }
+        let key = line;
+        if let Some(n) = self.wrap_rows_cache.get(&key) {
+            // Lebar berubah (resize) menggugurkan cache — cek kasar cukup:
+            // jumlah baris tergantung lebar, jadi cache hanya valid bila
+            // pemanggil membersihkannya saat resize. Simpan lebar tidak
+            // dilakukan agar sederhana; cache dibersihkan saat resize.
+            return *n;
+        }
+        let w = chars_w as usize;
+        let mut rows = 0u32;
+        let mut cur = 0usize;
+        let mut last_space: Option<usize> = None;
+        let mut in_space = false;
+        let mut iter = text.char_indices().peekable();
+        while let Some((bi, ch)) = iter.next() {
+            let width = if ch == '\t' { 4 } else { 1 };
+            if cur + width > w {
+                // Wrap: di spasi bila ada, else hard-break.
+                let break_at = match last_space {
+                    Some(s) if s > 0 => s + 1,
+                    _ => bi,
+                };
+                let _ = break_at;
+                rows += 1;
+                cur = 0;
+                // Mulai segmen baru dari karakter ini; spasi di depan
+                // segmen baru dilewati.
+                if ch.is_whitespace() {
+                    continue;
+                }
+                last_space = None;
+            }
+            cur += width;
+            if ch == ' ' {
+                if !in_space {
+                    last_space = Some(bi);
+                    in_space = true;
+                }
+            } else {
+                in_space = false;
+            }
+        }
+        rows += 1; // segmen terakhir
+        let n = rows.max(1);
+        if self.wrap_rows_cache.len() > 8192 {
+            self.wrap_rows_cache.clear();
+        }
+        self.wrap_rows_cache.insert(key, n);
+        n
     }
 
     pub(crate) fn total_view_rows(&self) -> u64 {
@@ -298,6 +457,34 @@ impl TabState {
         if self.view_mode != ViewMode::All {
             self.top_row = 0;
         }
+    }
+
+    /// Nama tampil tab: alias kustom bila ada, else nama file. P1-15.
+    pub(crate) fn display_name(&self) -> &str {
+        self.alias
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(&self.doc.file_name)
+    }
+
+    /// Status pencarian kini (P1-12 state machine). Prioritas: worker dulu,
+    /// lalu galat, lalu pangkas, lalu kosong, lalu statis.
+    pub(crate) fn search_state(&self) -> SearchState {        if self.doc.search_in_progress {
+            if self.search_merge_quiet {
+                return SearchState::AutoRefreshing;
+            }
+            return SearchState::Searching;
+        }
+        if self.doc.search_error.is_some() {
+            return SearchState::Error;
+        }
+        if self.doc.search_truncated {
+            return SearchState::Truncated;
+        }
+        if self.search_text.trim().is_empty() {
+            return SearchState::NoSearch;
+        }
+        SearchState::Static
     }
 
     /// Revisi file untuk kunci cache (ukuran + mtime).
@@ -334,6 +521,10 @@ impl TabState {
         self.doc.hits.clear();
         self.doc.search_error = None;
         self.current_hit = None;
+        self.search_grand_total = 0;
+        self.merge_base = 0;
+        self.search_page_active = false;
+        self.page_base = 0;
         self.results_collapsed = true;
         self.refresh_mode_map();
     }
@@ -392,6 +583,10 @@ impl TabState {
             self.doc.search_error = None;
             self.doc.search_in_progress = false;
             self.current_hit = None;
+            self.search_grand_total = 0;
+            self.merge_base = 0;
+            self.search_page_active = false;
+            self.page_base = 0;
             self.results_collapsed = true;
             self.refresh_mode_map();
             return;
@@ -423,6 +618,10 @@ impl TabState {
         self.current_hit = None;
         self.search_scanned = 0;
         self.search_total = self.doc.size;
+        self.search_grand_total = 0;
+        self.merge_base = 0;
+        self.search_page_active = false;
+        self.page_base = 0;
         // Cache: pola sama + revisi file sama = instan.
         let bool_mode = !self.regex_on && query::is_boolean_query(&q);
         // Cakupan baris -> interval byte via checkpoint (None bila belum petakan).
@@ -443,6 +642,9 @@ impl TabState {
             self.doc.hits = hits;
             self.doc.search_in_progress = false;
             self.search_scanned = self.doc.size;
+            // Cache only stores complete (non-truncated) results, so the
+            // exact total equals the stored hit count here.
+            self.search_grand_total = self.doc.hits.len() as u64;
             self.current_hit = Some(0);
             self.results_collapsed = false;
             self.doc.status = String::from("Hasil dari cache (pola sama).");
@@ -498,6 +700,117 @@ impl TabState {
             self.doc.encoding(),
             self.doc.bom_len,
         );
+    }
+
+    /// Load the next result page past the display cap ("next page"
+    /// button, F3 at the last stored hit). Re-scans from the line after
+    /// the last stored hit with the SAME query/mode/scope; batches append
+    /// in order, so RAM stays bounded to one page per click while every
+    /// one of the (exact, known) grand_total matches becomes explorable.
+    /// Returns false when there is nothing more to load.
+    pub(crate) fn continue_search_page(&mut self) -> bool {
+        use crate::engine::query;
+        if self.doc.search_in_progress || self.search_text.trim().is_empty() {
+            return false;
+        }
+        if !self.doc.search_truncated || self.doc.hits.is_empty() {
+            return false;
+        }
+        if (self.doc.hits.len() as u64) >= self.search_grand_total {
+            self.doc.search_truncated = false;
+            return false;
+        }
+        let last_line = match self.doc.hits.last() {
+            Some(h) => h.line,
+            None => return false,
+        };
+        // Anchor: exact byte start of the next line via the sparse index.
+        // None = past EOF (file shrank since): nothing more to load.
+        let (sb, sl) = match self.doc.line_byte_range(last_line + 1) {
+            Some((s, _)) => (s, last_line + 1),
+            None => {
+                self.doc.search_truncated = false;
+                return false;
+            }
+        };
+        let q = self.search_text.clone();
+        // Fresh generation (page 1 is done; no stragglers), same merge
+        // mechanics as a fresh search — results APPEND to stored hits.
+        self.doc.search_gen += 1;
+        let gen = self.doc.search_gen;
+        self.gen_shared.store(gen, Ordering::Relaxed);
+        self.search_cancel.store(true, Ordering::Relaxed);
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.search_cancel = cancel.clone();
+        let (tx, rx) = mpsc::channel();
+        self.search_rx = Some(rx);
+        self.page_base = self.doc.hits.len();
+        self.search_page_active = true;
+        self.doc.search_truncated = true; // recomputed exact at page done
+        self.doc.search_error = None;
+        self.doc.search_in_progress = true;
+        self.search_scanned = sb;
+        self.search_total = self.doc.size;
+        // Re-arm the cache key: a page completing the set is cacheable.
+        let bool_mode = !self.regex_on && query::is_boolean_query(&q);
+        self.pending_key = Some(CacheKey {
+            query: q.clone(),
+            regex: self.regex_on,
+            case_sensitive: self.case_sensitive,
+            boolean: bool_mode,
+            scope: self.scope,
+            rev: self.file_rev(),
+        });
+        let scope_bytes = self.scope.and_then(|(a, b)| {
+            let (s, _) = self.doc.line_byte_range(a)?;
+            let (_, e) = self.doc.line_byte_range(b)?;
+            Some((s, e))
+        });
+        let seek = Some((sb, sl));
+        self.regex_complex = self.regex_on
+            && crate::engine::search::is_complex_regex(&q, self.case_sensitive);
+        if bool_mode {
+            match query::parse_query(&q) {
+                Ok(ast) => spawn_bool_search(
+                    SearchJobParams {
+                        path: self.doc.path.clone(),
+                        gen,
+                        gen_shared: self.gen_shared.clone(),
+                        tx,
+                        cancel,
+                    },
+                    ast,
+                    self.doc.encoding(),
+                    self.doc.bom_len,
+                    self.case_sensitive,
+                    self.scope,
+                    seek,
+                ),
+                Err(e) => {
+                    self.doc.search_error = Some(e);
+                    self.doc.search_in_progress = false;
+                    self.search_page_active = false;
+                }
+            }
+            return true;
+        }
+        spawn_search(
+            SearchJobParams {
+                path: self.doc.path.clone(),
+                gen,
+                gen_shared: self.gen_shared.clone(),
+                tx,
+                cancel,
+            },
+            q,
+            self.regex_on,
+            self.case_sensitive,
+            scope_bytes,
+            seek,
+            self.doc.encoding(),
+            self.doc.bom_len,
+        );
+        true
     }
 
     pub(crate) fn start_filter(&mut self, query: String) {
@@ -581,7 +894,7 @@ impl TabState {
         if self.search_text.trim().is_empty() || self.doc.search_in_progress {
             return;
         }
-        if self.doc.hits.len() >= search::MAX_STORED_HITS {
+        if self.doc.hits.len() >= search::effective_max_hits() {
             self.doc.search_truncated = true;
             return;
         }
@@ -589,6 +902,11 @@ impl TabState {
             return;
         };
         // Tulis ulang baris jangkar (kasus ekor lanjutan tanpa \n).
+        // Grand-total base: keep the exact count minus the rewritten
+        // anchor hits (the tail worker re-emits that line, counted once
+        // in its own job total).
+        let anchor_hits = self.doc.hits.iter().filter(|h| h.line == sl).count() as u64;
+        self.merge_base = self.search_grand_total.saturating_sub(anchor_hits);
         self.doc.hits.retain(|h| h.line != sl);
         self.current_hit = None;
         let (tx, rx) = mpsc::channel();
@@ -715,6 +1033,35 @@ impl TabState {
         self.doc.status = String::from("Mengekspor di latar…");
     }
 
+    /// Ekspor-streaming SEMUA baris cocok dari query kini, tanpa batas tampil
+    /// (viewport boleh terpangkas, file ekspor tidak). O(chunk) RAM.
+    pub(crate) fn start_export_search(&mut self, out: PathBuf) {
+        if self.export_rx.is_some() {
+            self.doc.status =
+                String::from("Ekspor masih berjalan; tunggu selesai atau Batalkan.");
+            return;
+        }
+        if self.search_text.trim().is_empty() {
+            self.doc.status = String::from("Query kosong — isi kolom Cari dulu.");
+            return;
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.export_cancel = cancel.clone();
+        let job = ExportSearchJob {
+            src: self.doc.path.clone(),
+            out,
+            query: self.search_text.clone(),
+            regex_on: self.regex_on,
+            case_sensitive: self.case_sensitive,
+            encoding: self.doc.encoding(),
+            bom_len: self.doc.bom_len,
+        };
+        let (tx, rx) = mpsc::channel();
+        self.export_rx = Some(rx);
+        spawn_export_search(job, tx, cancel);
+        self.doc.status = String::from("Mengekspor streaming di latar…");
+    }
+
     pub(crate) fn poll_channels(&mut self) {
         // Index updates
         if let Some(rx) = &self.index_rx {
@@ -745,6 +1092,15 @@ impl TabState {
                 }
                 self.search_scanned = m.scanned;
                 self.search_total = m.total;
+                // Exact total: fresh jobs overwrite; quiet tail merges add
+                // onto the base captured at refresh start (tail jobs count
+                // the tail only); continuation pages keep the first-page
+                // exact value (page jobs count their own scope only).
+                if self.search_merge_quiet {
+                    self.search_grand_total = self.merge_base.saturating_add(m.grand_total);
+                } else if !self.search_page_active {
+                    self.search_grand_total = m.grand_total;
+                }
                 let was_empty = self.doc.hits.is_empty();
                 self.doc.hits.extend(m.batch);
                 // Hit pertama masuk: buka panel hasil langsung (tak perlu tunggu selesai).
@@ -762,6 +1118,17 @@ impl TabState {
             let _ = any;
             if done {
                 self.search_rx = None;
+                // Continuation page finished: exact set complete when the
+                // stored count finally reaches the known grand total.
+                let was_page = self.search_page_active;
+                if was_page {
+                    self.search_page_active = false;
+                    if self.doc.search_error.is_none()
+                        && (self.doc.hits.len() as u64) >= self.search_grand_total
+                    {
+                        self.doc.search_truncated = false;
+                    }
+                }
                 // Simpan hasil lengkap ke cache (pola ulang = instan).
                 if self.doc.search_error.is_none() && !self.doc.search_truncated {
                     if let Some(key) = self.pending_key.take() {
@@ -775,11 +1142,18 @@ impl TabState {
                 if self.search_merge_quiet {
                     self.search_merge_quiet = false;
                 } else if self.doc.search_error.is_none() && !self.doc.hits.is_empty() {
-                    self.current_hit = Some(0);
+                    // Fresh search: lompat ke hasil pertama. Page: lompat
+                    // ke hasil pertama HALAMAN ini (jangan yank ke atas).
+                    let target = if was_page {
+                        self.page_base.min(self.doc.hits.len().saturating_sub(1))
+                    } else {
+                        0
+                    };
+                    self.current_hit = Some(target);
                     // Ada hasil: buka panel hasil otomatis.
                     self.results_collapsed = false;
-                    // lompat ke hasil pertama
-                    let ln = self.doc.hits[0].line;
+                    // lompat ke hasil target
+                    let ln = self.doc.hits[target].line;
                     self.selected_line = ln;
                     self.center_on_line(ln);
                 }
@@ -839,11 +1213,19 @@ impl TabState {
                     self.export_rx = None;
                     break;
                 }
-                self.doc.status = format!(
-                    "Mengekspor {} / {} hasil…",
-                    format_count(m.written),
-                    format_count(m.total_hits as u64),
-                );
+                if m.total_hits == 0 {
+                    // Ekspor-streaming: total tak diketahui di muka.
+                    self.doc.status = format!(
+                        "Mengekspor streaming: {} ditulis…",
+                        format_count(m.written),
+                    );
+                } else {
+                    self.doc.status = format!(
+                        "Mengekspor {} / {} hasil…",
+                        format_count(m.written),
+                        format_count(m.total_hits as u64),
+                    );
+                }
             }
         }
         // Marker ERROR/WARN + histogram selesai.
@@ -865,9 +1247,12 @@ impl TabState {
                 Some(_) => self.doc.size.saturating_sub(self.marker_size) > 64 * 1024 * 1024,
             };
             if stale {
+                self.marker_cancel.store(false, Ordering::Relaxed);
+                let cancel = Arc::new(AtomicBool::new(false));
+                self.marker_cancel = cancel.clone();
                 let (tx, rx) = mpsc::channel();
                 self.marker_rx = Some(rx);
-                spawn_marker_scan(self.doc.path.clone(), self.doc.size, tx);
+                spawn_marker_scan(self.doc.path.clone(), self.doc.size, tx, cancel);
             }
         }
     }
@@ -976,11 +1361,311 @@ impl TabState {
         }
     }
 
+    // ---- P0-2: selection helpers (single + portion + multi non-kontigu) ----
+
+    /// Rentang baris terseleksi (asc) bila seleksi baris aktif.
+    pub(crate) fn sel_range(&self) -> Option<(u64, u64)> {
+        match (self.sel_anchor, self.sel_active) {
+            (Some(a), Some(b)) => Some((a.min(b), a.max(b))),
+            _ => None,
+        }
+    }
+
+    /// True bila ada seleksi apa pun (primer / portion / multi).
+    pub(crate) fn sel_has_any(&self) -> bool {
+        self.sel_anchor.is_some() || self.sel_portion.is_some() || !self.sel_extra.is_empty()
+    }
+
+    /// Semua rentang (primer + ekstra), tergabung & terurut.
+    pub(crate) fn sel_all_ranges(&self) -> Vec<(u64, u64)> {
+        let mut v: Vec<(u64, u64)> = Vec::new();
+        if let Some((lo, hi)) = self.sel_range() {
+            v.push((lo, hi));
+        }
+        v.extend(self.sel_extra.iter().copied());
+        if v.is_empty() {
+            return v;
+        }
+        v.sort();
+        // Gabung tumpang-tindih / bersebelahan.
+        let mut out: Vec<(u64, u64)> = Vec::with_capacity(v.len());
+        for (lo, hi) in v {
+            if let Some(last) = out.last_mut() {
+                if lo <= last.1.saturating_add(1) {
+                    last.1 = last.1.max(hi);
+                    continue;
+                }
+            }
+            out.push((lo, hi));
+        }
+        out
+    }
+
+    /// Jumlah baris dalam seluruh seleksi (0 bila tak ada).
+    pub(crate) fn sel_line_count(&self) -> u64 {
+        self.sel_all_ranges().iter().map(|(lo, hi)| hi - lo + 1).sum()
+    }
+
+    /// Baris terpilih (seleksi berisi baris)?
+    pub(crate) fn sel_contains(&self, line: u64) -> bool {
+        if let Some((lo, hi)) = self.sel_range() {
+            if line >= lo && line <= hi {
+                return true;
+            }
+        }
+        self.sel_extra.iter().any(|(lo, hi)| line >= *lo && line <= *hi)
+    }
+
+    /// Mulai seleksi (klik biasa): reset portion + multi, anchor = baris.
+    pub(crate) fn sel_start(&mut self, line: u64, extend: bool) {
+        if !extend {
+            self.sel_anchor = Some(line);
+        }
+        self.sel_active = Some(line);
+        self.sel_portion = None;
+        if !extend {
+            self.sel_extra.clear();
+        }
+        self.selected_line = line;
+    }
+
+    /// Perluas seleksi ke baris (drag / Shift+klik).
+    pub(crate) fn sel_extend(&mut self, line: u64) {
+        if self.sel_anchor.is_none() {
+            self.sel_anchor = Some(line);
+        }
+        self.sel_active = Some(line);
+        self.selected_line = line;
+    }
+
+    /// Ctrl+klik: toggle satu baris ke/dari himpunan multi-seleksi.
+    /// Portion ikut gugur (tak campur dengan multi). Mengembalikan true
+    /// bila baris kini terseleksi.
+    pub(crate) fn sel_toggle(&mut self, line: u64) -> bool {
+        self.sel_portion = None;
+        // Bila baris ada di primer -> keluarkan dari primer ke ekstra.
+        if let Some((lo, hi)) = self.sel_range() {
+            if line >= lo && line <= hi {
+                self.sel_extra.clear();
+                if lo < line {
+                    self.sel_extra.push((lo, line - 1));
+                }
+                if line < hi {
+                    self.sel_extra.push((line + 1, hi));
+                }
+                self.sel_anchor = None;
+                self.sel_active = None;
+                self.selected_line = line;
+                return false;
+            }
+        }
+        // Bila ada di ekstra -> keluarkan (belah bila perlu).
+        if let Some(idx) = self.sel_extra.iter().position(|(lo, hi)| line >= *lo && line <= *hi) {
+            let (lo, hi) = self.sel_extra.remove(idx);
+            if lo < line {
+                self.sel_extra.push((lo, line - 1));
+            }
+            if line < hi {
+                self.sel_extra.push((line + 1, hi));
+            }
+            self.sel_extra.sort();
+            self.selected_line = line;
+            return false;
+        }
+        // Tambahkan: gabung ke primer bila bersebelahan, else ke ekstra.
+        if let Some((lo, hi)) = self.sel_range() {
+            if line + 1 == lo || hi + 1 == line {
+                self.sel_anchor = Some(lo.min(line));
+                self.sel_active = Some(hi.max(line));
+                self.selected_line = line;
+                return true;
+            }
+            self.sel_extra.push((lo, hi));
+        }
+        self.sel_anchor = Some(line);
+        self.sel_active = Some(line);
+        self.sel_extra.sort();
+        // Normalisasi cepat: gabung bila ekstra kini bersebelahan.
+        let merged = self.sel_all_ranges();
+        self.sel_extra.clear();
+        if merged.len() > 1 {
+            // Primer = rentang yang memuat `line`, sisanya ekstra.
+            for (lo, hi) in merged {
+                if line >= lo && line <= hi {
+                    self.sel_anchor = Some(lo);
+                    self.sel_active = Some(hi);
+                } else {
+                    self.sel_extra.push((lo, hi));
+                }
+            }
+        }
+        self.selected_line = line;
+        true
+    }
+
+    /// Batalkan seluruh seleksi.
+    pub(crate) fn sel_clear(&mut self) {
+        self.sel_anchor = None;
+        self.sel_active = None;
+        self.sel_portion = None;
+        self.sel_extra.clear();
+    }
+
+    /// Salin teks seleksi (portion / multi / baris penuh / baris aktif).
+    pub(crate) fn sel_copy_text(&mut self) -> Result<String, String> {
+        // Portion select menang: satu baris sebagian.
+        if let Some((ln, cs, ce)) = self.sel_portion {
+            let text = self.doc.get_line_text(ln).unwrap_or_default();
+            let chars: Vec<char> = text.chars().collect();
+            let a = (cs as usize).min(chars.len());
+            let b = (ce as usize).min(chars.len());
+            let (lo, hi) = (a.min(b), a.max(b));
+            let out: String = chars[lo..hi].iter().collect();
+            return Ok(out);
+        }
+        let ranges = self.sel_all_ranges();
+        if ranges.is_empty() {
+            // Fallback: baris aktif.
+            return self.doc.copy_range_text(self.selected_line, self.selected_line);
+        }
+        let total: u64 = ranges.iter().map(|(lo, hi)| hi - lo + 1).sum();
+        if total > 5_000_000 {
+            return Err(String::from("Pilihan melebihi 16 MB."));
+        }
+        if ranges.len() == 1 {
+            return self.doc.copy_range_text(ranges[0].0, ranges[0].1);
+        }
+        let mut out = String::new();
+        for (i, (lo, hi)) in ranges.iter().enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            out.push_str(&self.doc.copy_range_text(*lo, *hi)?);
+            if out.len() > 16 * 1024 * 1024 {
+                return Err(String::from("Pilihan melebihi 16 MB."));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Select word di sekitar kolom (double-click): portion select.
+    pub(crate) fn sel_word_at(&mut self, line: u64, col_char: u32) {
+        let Some(text) = self.doc.get_line_text(line) else { return };
+        let chars: Vec<char> = text.chars().collect();
+        if chars.is_empty() {
+            return;
+        }
+        let i = (col_char as usize).min(chars.len() - 1);
+        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+        if !is_word(chars[i]) {
+            // Tanda baca/spasi: pilih karakter tunggal itu.
+            self.sel_portion = Some((line, i as u32, i as u32 + 1));
+            self.sel_extra.clear();
+            return;
+        }
+        let mut a = i;
+        while a > 0 && is_word(chars[a - 1]) {
+            a -= 1;
+        }
+        let mut b = i;
+        while b + 1 < chars.len() && is_word(chars[b + 1]) {
+            b += 1;
+        }
+        self.sel_portion = Some((line, a as u32, b as u32 + 1));
+        self.sel_extra.clear();
+        self.selected_line = line;
+    }
+
+    // ---- P0-5: QuickFind ----
+
+    /// QuickFind cari berikutnya dari (baris, kolom) kini. Maju/mundur,
+    /// wrap-around dengan pesan. Literal case-insensitive penuh (Unicode).
+    pub(crate) fn qf_find(&mut self, forward: bool) {
+        self.qf_forward = forward;
+        let needle = self.qf_text.clone();
+        if needle.trim().is_empty() {
+            self.qf_match = None;
+            return;
+        }
+        let total = if self.doc.index.complete {
+            self.doc.index.total_lines
+        } else {
+            self.doc.line_count_estimate()
+        };
+        if total == 0 {
+            return;
+        }
+        let start_line = match self.qf_match {
+            Some((ln, _, _)) => {
+                if forward {
+                    ln
+                } else {
+                    ln.saturating_sub(1).max(1)
+                }
+            }
+            None => self.selected_line.max(1),
+        };
+        let nl_lower = needle.to_lowercase();
+        // Batasi jangkauan linear: seluruh file dengan cap iterasi.
+        let cap = 500_000u64.min(total);
+        let mut wrapped = false;
+        let mut i = 0u64;
+        let mut ln = if forward { start_line + 1 } else { start_line.saturating_sub(1) };
+        if ln < 1 {
+            ln = total;
+            wrapped = true;
+        }
+        if ln > total {
+            ln = 1;
+            wrapped = true;
+        }
+        while i < cap {
+            if let Some(head) = self.doc.get_line_head(ln, 16 * 1024) {
+                let (text, _, _) = (head.0, head.1, head.2);
+                let hay = text.to_lowercase();
+                if let Some(rel) = memchr::memmem::Finder::new(nl_lower.as_bytes())
+                    .find(hay.as_bytes())
+                {
+                    let start = rel as u32;
+                    let end = (rel + nl_lower.len()) as u32;
+                    self.qf_match = Some((ln, start, end));
+                    self.selected_line = ln;
+                    self.center_on_line(ln);
+                    self.qf_msg = None;
+                    return;
+                }
+            }
+            i += 1;
+            if forward {
+                ln += 1;
+                if ln > total {
+                    if wrapped {
+                        break;
+                    }
+                    ln = 1;
+                    wrapped = true;
+                    self.qf_msg = Some((String::from("Sampai akhir file — kembali ke awal."), Instant::now()));
+                }
+            } else {
+                ln = ln.saturating_sub(1);
+                if ln < 1 {
+                    if wrapped {
+                        break;
+                    }
+                    ln = total;
+                    wrapped = true;
+                    self.qf_msg = Some((String::from("Sampai awal file — kembali ke akhir."), Instant::now()));
+                }
+            }
+        }
+        self.qf_msg = Some((String::from("Tidak ditemukan."), Instant::now()));
+    }
+
     pub(crate) fn poll_follow(&mut self) {
         if !self.doc.follow {
             return;
         }
-        if self.last_follow_poll.elapsed() < Duration::from_millis(400) {
+        if self.last_follow_poll.elapsed() < Duration::from_millis(self.follow_ms) {
             return;
         }
         self.last_follow_poll = Instant::now();
@@ -1081,6 +1766,10 @@ impl TabState {
                       // Hasil & filter lama tak valid lagi di file baru.
                       self.doc.hits.clear();
                       self.current_hit = None;
+                      self.search_grand_total = 0;
+                      self.merge_base = 0;
+                      self.search_page_active = false;
+                      self.page_base = 0;
                       // Snapshot tersimpan mengacu nomor baris lama: gugur juga.
                       self.kept.clear();
                       self.kept_view = None;
@@ -1354,5 +2043,126 @@ mod tests {
             "status: {}",
             tab.doc.status
         );
+    }
+
+    #[test]
+    fn multi_selection_toggle_and_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sel.log");
+        std::fs::write(&path, test_lines(100, 10)).unwrap();
+        let mut tab = open_tab(&path);
+        assert!(!tab.sel_has_any());
+        // Klik biasa lalu Ctrl+klik dua baris jauh.
+        tab.sel_start(10, false);
+        assert!(tab.sel_toggle(20));
+        assert!(tab.sel_toggle(30));
+        assert_eq!(tab.sel_all_ranges(), vec![(10, 10), (20, 20), (30, 30)]);
+        assert_eq!(tab.sel_line_count(), 3);
+        assert!(tab.sel_contains(20));
+        assert!(!tab.sel_contains(21));
+        // Toggle off baris tengah.
+        assert!(!tab.sel_toggle(20));
+        assert_eq!(tab.sel_all_ranges(), vec![(10, 10), (30, 30)]);
+        // Ctrl+klik bersebelahan menggabung ke primer.
+        tab.sel_clear();
+        tab.sel_start(10, false);
+        tab.sel_extend(12);
+        assert!(tab.sel_toggle(13));
+        assert_eq!(tab.sel_all_ranges(), vec![(10, 13)]);
+        // Klik biasa mereset multi.
+        tab.sel_toggle(50);
+        tab.sel_start(5, false);
+        assert_eq!(tab.sel_all_ranges(), vec![(5, 5)]);
+        // Clear total.
+        tab.sel_clear();
+        assert!(!tab.sel_has_any());
+        assert!(tab.sel_all_ranges().is_empty());
+    }
+
+    #[test]
+    fn multi_selection_copy_joins_ranges() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sel2.log");
+        std::fs::write(&path, b"l1\nl2\nl3\nl4\nl5\n").unwrap();
+        let mut tab = open_tab(&path);
+        tab.sel_start(1, false);
+        tab.sel_toggle(3);
+        tab.sel_toggle(5);
+        let s = tab.sel_copy_text().unwrap();
+        assert!(s.contains("l1"), "got: {:?}", s);
+        assert!(s.contains("l3"), "got: {:?}", s);
+        assert!(s.contains("l5"), "got: {:?}", s);
+        assert!(!s.contains("l2"), "got: {:?}", s);
+    }
+
+    #[test]
+    fn tab_alias_display_falls_back_to_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nm.log");
+        std::fs::write(&path, b"x\n").unwrap();
+        let mut tab = open_tab(&path);
+        assert_eq!(tab.display_name(), "nm.log");
+        tab.alias = Some(String::from("  "));
+        assert_eq!(tab.display_name(), "nm.log");
+        tab.alias = Some(String::from("DB utama"));
+        assert_eq!(tab.display_name(), "DB utama");
+    }
+
+    #[test]
+    fn search_state_machine_transitions() {        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("st.log");
+        std::fs::write(&path, b"a\nb\n").unwrap();
+        let mut tab = open_tab(&path);
+        // Kosong -> NoSearch.
+        assert_eq!(tab.search_state(), super::SearchState::NoSearch);
+        // Query aktif tanpa worker -> Static.
+        tab.search_text = String::from("a");
+        assert_eq!(tab.search_state(), super::SearchState::Static);
+        // Worker jalan -> Searching; quiet -> AutoRefreshing.
+        tab.doc.search_in_progress = true;
+        assert_eq!(tab.search_state(), super::SearchState::Searching);
+        tab.search_merge_quiet = true;
+        assert_eq!(tab.search_state(), super::SearchState::AutoRefreshing);
+        tab.search_merge_quiet = false;
+        tab.doc.search_in_progress = false;
+        // Galat menang atas pangkas.
+        tab.doc.search_error = Some(String::from("x"));
+        tab.doc.search_truncated = true;
+        assert_eq!(tab.search_state(), super::SearchState::Error);
+        tab.doc.search_error = None;
+        assert_eq!(tab.search_state(), super::SearchState::Truncated);
+        tab.doc.search_truncated = false;
+        assert_eq!(tab.search_state(), super::SearchState::Static);
+    }
+
+    #[test]
+    fn partial_drag_portion_selection_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("portion.log");
+        std::fs::write(&path, b"2026-09-09 checkpoint started successfully\n").unwrap();
+        let mut tab = open_tab(&path);
+        // Simulate intra-line drag from character 11 to 21 ("checkpoint")
+        tab.sel_portion = Some((1, 11, 21));
+        let copied = tab.sel_copy_text().unwrap();
+        assert_eq!(copied, "checkpoint");
+
+        // Verify sel_has_any is true
+        assert!(tab.sel_has_any());
+
+        // Clear selection
+        tab.sel_clear();
+        assert_eq!(tab.sel_portion, None);
+        assert!(!tab.sel_has_any());
+    }
+
+    #[test]
+    fn search_suggestion_state_preserves_active() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sug.log");
+        std::fs::write(&path, b"dummy\n").unwrap();
+        let mut tab = open_tab(&path);
+        assert!(!tab.sug_active);
+        tab.sug_active = true;
+        assert!(tab.sug_active);
     }
 }

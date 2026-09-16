@@ -41,7 +41,7 @@ impl AsisLogApp {
                     let tab = &mut self.tabs[cur_idx];
                     ui.add(
                         egui::TextEdit::singleline(&mut tab.mark_query)
-                            .id_source("tandai-saring")
+                            .id(egui::Id::new("tandai-saring"))
                             .hint_text(lang.tr("Saring penanda…"))
                             .desired_width(f32::INFINITY),
                     );
@@ -245,6 +245,31 @@ impl AsisLogApp {
                         {
                             self.tabs[cur_idx].clear_search();
                         }
+                        // Halaman hasil berikutnya saat terpangkas: satu
+                        // halaman per klik, RAM tetap terbatas.
+                        {
+                            let t = &self.tabs[cur_idx];
+                            let show_page = t.doc.search_truncated
+                                && !t.doc.search_in_progress
+                                && t.kept_view.is_none();
+                            if show_page {
+                                let cap = crate::engine::search::effective_max_hits() as u64;
+                                let remain = t.search_grand_total.saturating_sub(t.doc.hits.len() as u64);
+                                let next = remain.min(cap).max(1);
+                                let label = lang.f1("Muat {} berikutnya", format_count(next));
+                                if ui
+                                    .small_button(label)
+                                    .on_hover_text(lang.f2(
+                                        "Pindai {} hasil berikutnya (total eksak {} — tanpa batas RAM)",
+                                        format_count(next),
+                                        format_count(t.search_grand_total),
+                                    ))
+                                    .clicked()
+                                {
+                                    self.tabs[cur_idx].continue_search_page();
+                                }
+                            }
+                        }
                         let t = &mut self.tabs[cur_idx];
                         let (icon, tip) = if t.results_collapsed && !split {
                             (Icon::ChevronDown, lang.tr("Tampilkan panel hasil"))
@@ -273,6 +298,21 @@ impl AsisLogApp {
                                 t.record_nav(ln);
                             }
                         }
+                    }
+                    // P1-6: extend-search dari seleksi (klogg parity).
+                    if ui
+                        .button(lang.tr("+ Seleksi (OR)"))
+                        .on_hover_text(lang.tr("Tambah teks terpilih ke query pencarian (Shift+A)"))
+                        .clicked()
+                    {
+                        self.extend_search(0);
+                    }
+                    if ui
+                        .button(lang.tr("- Seleksi"))
+                        .on_hover_text(lang.tr("Kecualikan teks terpilih dari pencarian (Shift+E)"))
+                        .clicked()
+                    {
+                        self.extend_search(1);
                     }
                     if ui
                         .button(lang.tr("Salin hasil"))

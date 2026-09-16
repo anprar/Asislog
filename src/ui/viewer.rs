@@ -4,6 +4,108 @@
 /// Fixed row height for the log viewport (matches 14px monospace + padding).
 pub const ROW_H: f32 = 20.0;
 
+/// Map an x-offset (points, from the text left edge) to a CHAR index using
+/// the exact font layout (binary search over prefix widths) — NOT a fixed
+/// char-width guess. Correct for CJK fullwidth, tabs, and custom mono
+/// fonts, because it measures with the same engine that renders the labels.
+/// `font_id` must be the viewport monospace id (see `mono_font_id`).
+/// Returns char count (0..=chars), clamped.
+pub fn x_to_col(ctx: &egui::Context, font_id: &egui::FontId, text: &str, x: f32) -> u32 {
+    if x <= 0.0 || text.is_empty() {
+        return 0;
+    }
+    // Char-boundary byte offsets: [0, .., len].
+    let mut bounds: Vec<usize> = Vec::with_capacity(text.len() + 1);
+    bounds.push(0);
+    for (i, c) in text.char_indices() {
+        bounds.push(i + c.len_utf8());
+    }
+    let n_chars = (bounds.len() - 1) as u32;
+    // Width of text[..bounds[k]] is monotonic in k: binary search the
+    // first prefix WIDER than x; its char index is the answer. Measuring
+    // prefixes (not glyph sums) matches rendered advances exactly.
+    let width = |chars: usize| -> f32 {
+        let end = bounds[chars.min(bounds.len() - 1)];
+        if end == 0 {
+            return 0.0;
+        }
+        ctx.fonts(|f| {
+            f.layout(
+                text[..end].to_owned(),
+                font_id.clone(),
+                egui::Color32::WHITE,
+                f32::INFINITY,
+            )
+            .size()
+            .x
+        })
+    };
+    if x >= width(n_chars as usize) {
+        return n_chars;
+    }
+    let mut lo = 0usize;
+    let mut hi = n_chars as usize;
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if width(mid) <= x {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    // `lo` = first prefix wider than x; snap to the NEAREST boundary so
+    // clicks near a glyph edge pick the visually closer char.
+    let prev_w = if lo > 0 { width(lo - 1) } else { 0.0 };
+    let next_w = width(lo.min(n_chars as usize));
+    if lo > 0 && (x - prev_w) <= (next_w - x) {
+        (lo - 1) as u32
+    } else {
+        lo.min(n_chars as usize) as u32
+    }
+}
+
+/// Map a 2D position `(x, y)` (points, from the text top-left corner) to a CHAR index
+/// taking wrapping into account via egui's Galley layout.
+pub fn pos_to_col(
+    ctx: &egui::Context,
+    font_id: &egui::FontId,
+    text: &str,
+    pos: egui::Vec2,
+    wrap_width: Option<f32>,
+) -> u32 {
+    if text.is_empty() {
+        return 0;
+    }
+    if let Some(w) = wrap_width {
+        let mut job = egui::text::LayoutJob::default();
+        job.wrap.max_width = w;
+        job.wrap.break_anywhere = true;
+        job.append(
+            text,
+            0.0,
+            egui::TextFormat {
+                font_id: font_id.clone(),
+                ..Default::default()
+            },
+        );
+        let galley = ctx.fonts(|f| f.layout_job(job));
+        galley.cursor_from_pos(pos).index as u32
+    } else {
+        x_to_col(ctx, font_id, text, pos.x)
+    }
+}
+
+
+/// Viewport monospace FontId from the live style (tracks zoom + font
+/// choice — the same id every log label is rendered with).
+pub fn mono_font_id(ctx: &egui::Context) -> egui::FontId {
+    ctx.style()
+        .text_styles
+        .get(&egui::TextStyle::Monospace)
+        .cloned()
+        .unwrap_or_else(|| egui::FontId::monospace(14.0))
+}
+
 /// Log level for one visible line.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LineKind {
@@ -104,6 +206,16 @@ pub fn dim_color(dark: bool) -> egui::Color32 {
     }
 }
 
+/// Extra-dim color for lines outside the search scope (klogg parity:
+/// out-of-limit lines render visibly disabled, not silently identical).
+pub fn out_of_scope_color(dark: bool) -> egui::Color32 {
+    if dark {
+        egui::Color32::from_rgb(85, 85, 85)
+    } else {
+        egui::Color32::from_rgb(190, 190, 190)
+    }
+}
+
 /// Timestamp prefix color (bluish gray), theme-aware.
 pub fn time_color(dark: bool) -> egui::Color32 {
     if dark {
@@ -188,6 +300,7 @@ pub fn highlight_spans(line: &str) -> Vec<(usize, usize, LineKind)> {
 
 /// One compiled user highlight rule for viewport rendering.
 /// Compiled once (app caches by version), evaluated per visible row.
+#[derive(Clone)]
 pub struct CompiledRule {
     pub whole_line: bool,
     pub variate: bool,
@@ -311,6 +424,20 @@ impl CompiledRule {
                     .map(|m| (m, m + needle.len()))
                     .collect();
             }
+            // Full-Unicode case-insensitive (é/É, Cyrillic): the regex
+            // engine does SIMD folding; byte offsets stay valid.
+            let pat = regex::escape(needle);
+            if let Ok(re) = regex::RegexBuilder::new(&pat)
+                .case_insensitive(true)
+                .build()
+            {
+                return re
+                    .find_iter(text)
+                    .filter(|m| m.end() > m.start())
+                    .map(|m| (m.start().min(usize::MAX), m.end()))
+                    .collect();
+            }
+            // Fallback: ASCII fold (regex failed to compile — should not happen).
             let h = text.as_bytes().to_ascii_lowercase();
             let n = needle.as_bytes().to_ascii_lowercase();
             let f = memchr::memmem::Finder::new(&n);
@@ -326,7 +453,12 @@ impl CompiledRule {
 /// When `selected`, base text follows the active theme selection color so
 /// every theme (incl. Kontras Tinggi: black on yellow) stays readable;
 /// accent spans keep their kind colors.
-/// Returns the combined click/hover response of all segments.
+/// Render one log line with token highlights (visible rows only).
+/// Single visual line, or wrapped downwards when `wrap` is true.
+/// `rules` are user highlight rules (whole-line rules win first).
+/// When `selected` and no portion selection, base text follows the active theme selection color.
+/// When `portion` is Some((cs, ce)), character indices `cs..ce` are highlighted with selection background.
+/// Returns the combined click/drag response of the label.
 pub fn render_log_line(
     ui: &mut egui::Ui,
     text: &str,
@@ -334,8 +466,10 @@ pub fn render_log_line(
     dark: bool,
     rules: &[CompiledRule],
     selected: bool,
+    wrap_width: Option<f32>,
+    portion: Option<(u32, u32)>,
 ) -> egui::Response {
-    let base = if selected {
+    let base = if selected && portion.is_none() {
         ui.visuals().selection.stroke.color
     } else {
         color_for_theme(kind, dark)
@@ -343,32 +477,105 @@ pub fn render_log_line(
     if text.is_empty() {
         return ui.label(" ");
     }
+    let font_id = mono_font_id(ui.ctx());
+    let mut job = egui::text::LayoutJob::default();
+    let wrap_mode = if let Some(w) = wrap_width {
+        job.wrap.max_width = w;
+        job.wrap.break_anywhere = true;
+        egui::TextWrapMode::Wrap
+    } else {
+        job.wrap.max_width = f32::INFINITY;
+        egui::TextWrapMode::Extend
+    };
+
+    let (portion_b_start, portion_b_end) = if let Some((cs, ce)) = portion {
+        let chars: Vec<(usize, char)> = text.char_indices().collect();
+        let lo = (cs.min(ce) as usize).min(chars.len());
+        let hi = (cs.max(ce) as usize).min(chars.len());
+        let b_start = if lo < chars.len() { chars[lo].0 } else { text.len() };
+        let b_end = if hi < chars.len() { chars[hi].0 } else { text.len() };
+        (b_start, b_end)
+    } else {
+        (0, 0)
+    };
+
+    let sel_bg = if dark {
+        egui::Color32::from_rgb(45, 80, 135)
+    } else {
+        egui::Color32::from_rgb(185, 215, 250)
+    };
+    let sel_fg = if dark {
+        egui::Color32::WHITE
+    } else {
+        egui::Color32::BLACK
+    };
+
+    let push_sub = |job: &mut egui::text::LayoutJob, sub_text: &str, fg: egui::Color32, bg: egui::Color32| {
+        if !sub_text.is_empty() {
+            job.append(
+                sub_text,
+                0.0,
+                egui::TextFormat {
+                    font_id: font_id.clone(),
+                    color: fg,
+                    background: bg,
+                    ..Default::default()
+                },
+            );
+        }
+    };
+
+    let push_span = |job: &mut egui::text::LayoutJob, sub_text: &str, byte_start: usize, fg: egui::Color32| {
+        if sub_text.is_empty() {
+            return;
+        }
+        let byte_end = byte_start + sub_text.len();
+        if portion.is_some() && byte_end > portion_b_start && byte_start < portion_b_end {
+            let mid_start = byte_start.max(portion_b_start);
+            let mid_end = byte_end.min(portion_b_end);
+            let rel_s = mid_start.saturating_sub(byte_start);
+            let rel_e = mid_end.saturating_sub(byte_start);
+            if rel_s > 0 {
+                push_sub(job, &sub_text[..rel_s], fg, egui::Color32::TRANSPARENT);
+            }
+            if rel_e > rel_s {
+                push_sub(job, &sub_text[rel_s..rel_e], sel_fg, sel_bg);
+            }
+            if rel_e < sub_text.len() {
+                push_sub(job, &sub_text[rel_e..], fg, egui::Color32::TRANSPARENT);
+            }
+        } else {
+            push_sub(job, sub_text, fg, egui::Color32::TRANSPARENT);
+        }
+    };
+
     if is_stack_trace(text) {
-        return ui.label(
-            egui::RichText::new(text.to_owned())
-                .monospace()
-                .color(if selected {
-                    ui.visuals().selection.stroke.color
-                } else {
-                    dim_color(dark)
-                }),
-        );
+        let col = if selected && portion.is_none() {
+            ui.visuals().selection.stroke.color
+        } else {
+            dim_color(dark)
+        };
+        push_span(&mut job, text, 0, col);
+        let label = egui::Label::new(job)
+            .sense(egui::Sense::click_and_drag())
+            .wrap_mode(wrap_mode);
+        return ui.add(label);
     }
+
     let ts = ts_prefix_len(text);
     // Whole-line user rules win over everything (first match).
     for r in rules {
         if r.whole_line && !r.find_spans(text).is_empty() {
-            return ui.label(
-                egui::RichText::new(text.to_owned())
-                    .monospace()
-                    .color(r.span_color(dark, text)),
-            );
+            let col = r.span_color(dark, text);
+            push_span(&mut job, text, 0, col);
+            let label = egui::Label::new(job)
+                .sense(egui::Sense::click_and_drag())
+                .wrap_mode(wrap_mode);
+            return ui.add(label);
         }
     }
+
     let spans = highlight_spans(if ts > 0 { &text[ts..] } else { text });
-    // Merge builtin spans (priority 0) with user match spans (priority 1+).
-    // User rules win overlaps; earlier start wins ties. Per-span colors
-    // carry the variance shade so equal values group visually.
     let mut all: Vec<(usize, usize, u32, egui::Color32)> = spans
         .into_iter()
         .map(|(s, e, k)| (s + ts, e + ts, 0u32, color_for_theme(k, dark)))
@@ -400,39 +607,26 @@ pub fn render_log_line(
         }
         kept.push((s, e, p, c));
     }
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 0.0;
-        let mut acc: Option<egui::Response> = None;
-        let mut push = |ui: &mut egui::Ui, s: &str, c: egui::Color32| {
-            let r = ui.label(
-                egui::RichText::new(s.to_owned())
-                    .monospace()
-                    .color(c),
-            );
-            acc = Some(match acc.take() {
-                Some(o) => o.union(r),
-                None => r,
-            });
-        };
-        let mut pos = 0;
-        if ts > 0 {
-            push(ui, &text[..ts], time_color(dark));
-            pos = ts;
+
+    let mut pos = 0;
+    if ts > 0 {
+        push_span(&mut job, &text[..ts], 0, time_color(dark));
+        pos = ts;
+    }
+    for (s, e, _p, c) in kept {
+        if s > pos {
+            push_span(&mut job, &text[pos..s], pos, base);
         }
-        for (s, e, _p, c) in kept {
-            if s > pos {
-                push(ui, &text[pos..s], base);
-            }
-            push(ui, &text[s..e], c);
-            pos = e;
-        }
-        if pos < text.len() {
-            push(ui, &text[pos..], base);
-        }
-        // `text` non-empty guarantees at least one segment.
-        acc.unwrap()
-    })
-    .inner
+        push_span(&mut job, &text[s..e], s, c);
+        pos = e;
+    }
+    if pos < text.len() {
+        push_span(&mut job, &text[pos..], pos, base);
+    }
+    let label = egui::Label::new(job)
+        .sense(egui::Sense::click_and_drag())
+        .wrap_mode(wrap_mode);
+    ui.add(label)
 }
 
 #[cfg(test)]
@@ -535,5 +729,74 @@ mod tests {
                 .unwrap();
         assert!(!rule.variate);
         assert!(!rule.groups_only);
+    }
+
+    #[test]
+    fn x_to_col_exact_layout_mapping() {
+        // Headless: drive one frame so fonts load (same measure path the
+        // viewport uses at runtime).
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let fid = egui::FontId::monospace(14.0);
+            let text = "hello world";
+            assert_eq!(x_to_col(ctx, &fid, text, -5.0), 0);
+            assert_eq!(x_to_col(ctx, &fid, text, 0.0), 0);
+            assert_eq!(x_to_col(ctx, &fid, "", 100.0), 0);
+            assert_eq!(x_to_col(ctx, &fid, text, 100_000.0), 11);
+            // Exactness vs the layout engine itself (no hardcoded pixels):
+            // x just below/above a measured boundary snaps to that char.
+            let w = |s: &str| {
+                ctx.fonts(|f| {
+                    f.layout(s.to_owned(), fid.clone(), egui::Color32::WHITE, f32::INFINITY).size().x
+                })
+            };
+            let w_full = w(text);
+            assert!(w_full > 0.0);
+            let w_hello = w("hello");
+            let adv = w_full - w("hello worl");
+            assert!(adv > 1.0, "glyph advance must be sane, got {}", adv);
+            // Just below the "hello| world" boundary -> char 5; just above -> 5.
+            assert_eq!(x_to_col(ctx, &fid, text, w_hello - 0.5), 5);
+            assert_eq!(x_to_col(ctx, &fid, text, w_hello + 0.5), 5);
+            // The old fixed-width guess (x / 8.4) drifts wherever the real
+            // advance != 8.4 (CJK/tab/custom mono) — layout never does:
+            // x just inside a glyph still snaps to its nearest boundary.
+            let w1 = w("a");
+            assert_eq!(x_to_col(ctx, &fid, "aあb\tc", 0.1), 0);
+            assert_eq!(x_to_col(ctx, &fid, "aあb\tc", w1 - 0.1), 1);
+            assert_eq!(x_to_col(ctx, &fid, "aあb\tc", w1 + 0.1), 1);
+        });
+    }
+
+    #[test]
+    fn render_log_line_with_wrap_and_portion_smoke() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rules = vec![];
+                // Plain line without wrap
+                let _r1 = render_log_line(ui, "2026-09-09 checkpoint ok", LineKind::Normal, true, &rules, false, None, None);
+                // Line with word wrap enabled
+                let _r2 = render_log_line(ui, "2026-09-09 checkpoint ok with a very long line to wrap", LineKind::Normal, true, &rules, false, Some(200.0), None);
+                // Line with partial character selection (drag portion)
+                let _r3 = render_log_line(ui, "2026-09-09 checkpoint ok", LineKind::Normal, true, &rules, false, None, Some((11, 21)));
+                // Stack trace line with wrap and portion
+                let _r4 = render_log_line(ui, "    at com.test.Main.run(Main.java:10)", LineKind::Error, true, &rules, false, Some(200.0), Some((7, 15)));
+            });
+        });
+    }
+
+    #[test]
+    fn pos_to_col_wrap_test() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let fid = egui::FontId::monospace(14.0);
+            let text = "First line long enough to wrap onto the second line for sure";
+            let c0 = pos_to_col(ctx, &fid, text, egui::vec2(10.0, 5.0), Some(120.0));
+            assert!(c0 > 0);
+            // On second visual row: y is lower down
+            let c_wrapped = pos_to_col(ctx, &fid, text, egui::vec2(20.0, 30.0), Some(120.0));
+            assert!(c_wrapped > c0, "Wrapped row cursor must advance: c_wrapped={}, c0={}", c_wrapped, c0);
+        });
     }
 }

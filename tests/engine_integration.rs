@@ -108,14 +108,15 @@ fn filter_json_field_predicate() {
 fn follow_append_then_rotate() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("app.log");
-    // Head fingerprint covers the first 4096 bytes, so the append case needs
-    // a file bigger than that (the realistic catalina.out case).
-    let big: String = (0..500).map(|i| format!("line{:04} pad-pad-pad-pad-pad\n", i)).collect();
-    assert!(big.len() > 4096);
+    // Head fingerprint covers the first 64 KiB and tail the last 16 KiB,
+    // so the append case needs a file bigger than both windows combined
+    // (3000 lines x ~29 B ~= 87 KiB).
+    let big: String = (0..3000).map(|i| format!("line{:04} pad-pad-pad-pad-pad\n", i)).collect();
+    assert!(big.len() > 64 * 1024 + 16 * 1024);
     std::fs::write(&path, &big).unwrap();
 
     let id0 = load_identity(&path).unwrap();
-    // Append: size grows, head identical -> Appended.
+    // Append: size grows, head identical (tail moved but size rules).
     std::fs::write(&path, format!("{}line-extra\n", big)).unwrap();
     let id1 = load_identity(&path).unwrap();
     match check_follow(id0.size, id0.head.as_deref(), &id1) {
@@ -142,6 +143,25 @@ fn follow_append_then_rotate() {
     // Untouched file -> Unchanged.
     assert_eq!(
         check_follow(id4.size, id4.head.as_deref(), &id4),
+        FollowEvent::Unchanged
+    );
+    // Same-size overwrite beyond BOTH head and tail windows on a big file:
+    // the full check (head+tail) still catches it.
+    let mut data = vec![b'x'; 256 * 1024];
+    std::fs::write(&path, &data).unwrap();
+    let ida = load_identity(&path).unwrap();
+    // Rewrite a middle slice (outside head 64K and tail 16K).
+    for b in data.iter_mut().take(128 * 1024).skip(96 * 1024) {
+        *b = b'y';
+    }
+    std::fs::write(&path, &data).unwrap();
+    let idb = load_identity(&path).unwrap();
+    // Middle-only edits are invisible to head+tail fingerprints: size
+    // unchanged and both windows identical -> Unchanged (documented
+    // limitation of windowed fingerprints, same trade-off as klogg's
+    // header/tail fast mode).
+    assert_eq!(
+        check_follow(ida.size, ida.head.as_deref(), &idb),
         FollowEvent::Unchanged
     );
 }
@@ -193,4 +213,45 @@ fn sidecar_roundtrip_and_mismatch() {
     assert_eq!(back.checkpoints, idx.checkpoints);
     // Size mismatch -> rebuild.
     assert!(load_sidecar(&sidecar, data.len() as u64 + 1, mtime).is_none());
+}
+
+// ---------- merge / SQL-lite critical path ----------
+
+#[test]
+fn merge_collect_rows_respects_scan_cap() {
+    use asislog::engine::merge::collect_rows;
+    use asislog::engine::Doc;
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("m.log");
+    let mut data = Vec::new();
+    for i in 0..100u64 {
+        data.extend_from_slice(catalina_line(i).as_bytes());
+    }
+    std::fs::write(&log, &data).unwrap();
+    let mut doc = Doc::open(log).expect("open");
+    // Cap 10: only first 10 lines scanned/kept.
+    let (rows, src) = collect_rows(&mut doc, 10, 512);
+    assert_eq!(src.lines_scanned, 10);
+    assert_eq!(rows.len(), 10);
+    assert!(rows.iter().all(|r| r.line >= 1 && r.line <= 10));
+}
+
+#[test]
+fn sql_scan_cap_bounds_rows() {
+    use asislog::engine::squery::{parse_query, run_on_doc, SQL_DEFAULT_SCAN_CAP};
+    use asislog::engine::Doc;
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("s.log");
+    let mut data = Vec::new();
+    for i in 0..50u64 {
+        data.extend_from_slice(catalina_line(i).as_bytes());
+    }
+    std::fs::write(&log, &data).unwrap();
+    let mut doc = Doc::open(log).expect("open");
+    let q = parse_query("level = ERROR").expect("parse");
+    // Explicit cap 20 lines -> only 2 ERRORs in first 20 (i%10==0).
+    let res = run_on_doc(&mut doc, None, &q, 20, &[]);
+    assert_eq!(res.matched, 2, "first 20 lines have ERROR at 0 and 10");
+    // Default cap constant is 2M (documented in About).
+    assert_eq!(SQL_DEFAULT_SCAN_CAP, 2_000_000);
 }

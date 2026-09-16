@@ -82,7 +82,8 @@ pub struct Config {
     /// Isi scratchpad (dipotong 64 KB saat simpan).
     #[serde(default)]
     pub scratch: String,
-    /// Mode Zen / padat (sembunyikan 5 baris kontrol menjadi 1 baris ramping).
+    /// Layar Penuh / padat (sembunyikan 5 baris kontrol menjadi 1 baris ramping).
+    /// Field JSON tetap `zen_mode` agar config lama tetap kompatibel.
     #[serde(default)]
     pub zen_mode: bool,
     /// Dual-pane split: results pane opens tall beside/below the log.
@@ -103,6 +104,50 @@ pub struct Config {
     /// None = system (best first impression, silent fallback).
     #[serde(default)]
     pub ui_font: Option<String>,
+    /// P1-13: follow poll interval in ms (klogg parity, configurable).
+    #[serde(default = "default_follow_ms")]
+    pub follow_ms: u64,
+    /// P1-13: default word-wrap for new tabs.
+    #[serde(default)]
+    pub word_wrap: bool,
+    /// P1-13: search worker threads (0 = auto, 1..=32). Berlaku setelah restart
+    /// bila pool rayon sudah terinisialisasi.
+    #[serde(default)]
+    pub search_threads: usize,
+    /// P1-13: max stored search hits (0 = 200 rb, 10 rb..=1 jt).
+    #[serde(default)]
+    pub max_hits: usize,
+    /// P1-13: background scan chunk in MiB (0 = 4, 1..=16).
+    #[serde(default)]
+    pub search_chunk_mb: usize,
+    /// P1-13: search result cache entries LRU (0 = 8, 2..=64).
+    #[serde(default)]
+    pub cache_entries: usize,
+    /// Update-check: plain-text version URL ("" = off). No telemetry.
+    #[serde(default)]
+    pub update_url: String,
+    /// Update-check otomatis sekali saat start (bila URL terisi).
+    #[serde(default)]
+    pub update_auto: bool,
+    /// Locale eksternal JSON override (None = bawaan ID/EN).
+    #[serde(default)]
+    pub locale_file: Option<String>,
+    /// Parser log kustom (analyzer): pola regex grup bernama.
+    #[serde(default)]
+    pub parsers: Vec<crate::engine::parser::LogParser>,
+    /// Parser aktif (None = Otomatis).
+    #[serde(default)]
+    pub active_parser: Option<String>,
+    /// Kolom kustom untuk tabel SQL (mis. ["host","status"]).
+    #[serde(default)]
+    pub custom_cols: Vec<String>,
+    /// Riwayat query SQL-lite (terbaru dulu, maks 30).
+    #[serde(default)]
+    pub sql_history: Vec<String>,
+}
+
+fn default_follow_ms() -> u64 {
+    250
 }
 
 fn default_zoom() -> f32 {
@@ -275,6 +320,9 @@ pub struct SessionTab {
     /// (the saved `path` would point at a deleted temp file otherwise).
     #[serde(default)]
     pub archive: Option<String>,
+    /// Custom tab label (None = file name). P1-15 rename.
+    #[serde(default)]
+    pub alias: Option<String>,
 }
 
 /// Full workspace session (tabs + theme + active tab).
@@ -491,6 +539,19 @@ mod tests {
             lang: Some("en".into()),
             shortcuts: [("goto".to_string(), "Alt+G".to_string())].into_iter().collect(),
             ui_font: Some("system".into()),
+            follow_ms: 250,
+            word_wrap: false,
+            search_threads: 0,
+            max_hits: 0,
+            search_chunk_mb: 0,
+            cache_entries: 0,
+            update_url: String::new(),
+            update_auto: false,
+            locale_file: None,
+            parsers: Vec::new(),
+            active_parser: None,
+            custom_cols: Vec::new(),
+            sql_history: Vec::new(),
         };
         let s = serde_json::to_string(&cfg).unwrap();
         let back: Config = serde_json::from_str(&s).unwrap();
@@ -557,6 +618,7 @@ mod tests {
             view_mode: Some("Hasil".into()),
             range: None,
             archive: Some("c:/a.zip".into()),
+            alias: Some("DB".into()),
             }],
             current: 0,
             tema: Some("dark".into()),
@@ -631,6 +693,7 @@ mod tests {
         assert!(s.tabs[0].view_mode.is_none());
         assert!(s.tabs[0].range.is_none());
         assert!(s.tabs[0].archive.is_none());
+        assert!(s.tabs[0].alias.is_none());
         let old_ws = r#"{"version": 1, "name": "x",
             "files": [{"path": "a.log", "top_line": 5, "selected_line": 6}]}"#;
         let ws: Workspace = serde_json::from_str(old_ws).unwrap();

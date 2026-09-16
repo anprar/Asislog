@@ -34,6 +34,45 @@ impl eframe::App for AsisLogApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Startup maximize enforcement: send unconditionally for the
+        // first frames (the OS-reported flag can claim "maximized"
+        // while the window is still normal-sized, so no early exit on
+        // it). Harmless duplicates: winit issues ShowWindow(SW_MAXIMIZE),
+        // then the probe retires forever (manual un-maximize respected).
+        if self.maximize_probe > 0 {
+            self.maximize_probe -= 1;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+            // Opt-in telemetry for stubborn window managers:
+            // ASISLOG_WINPROBE=1 logs viewport geometry to
+            // %TEMP%/asislog-winprobe.log (first 90 frames).
+            if std::env::var("ASISLOG_WINPROBE").as_deref() == Ok("1") {
+                let vp = ctx.input(|i| i.viewport().clone());
+                let msgs = ctx.input(|i| {
+                    i.viewport()
+                        .monitor_size
+                        .map(|m| format!("{}x{}", m.x as i32, m.y as i32))
+                        .unwrap_or_else(|| "?".to_string())
+                });
+                let line = format!(
+                    "frame={} screen={}x{} maximized={:?} monitor={}\n",
+                    60 - self.maximize_probe as i32,
+                    ctx.screen_rect().width() as i32,
+                    ctx.screen_rect().height() as i32,
+                    vp.maximized,
+                    msgs,
+                );
+                let mut p = std::env::temp_dir();
+                p.push("asislog-winprobe.log");
+                use std::io::Write as _;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&p)
+                {
+                    let _ = f.write_all(line.as_bytes());
+                }
+            }
+        }
         self.poll_background(ctx);
         self.render_toolbar(ctx);
         if self.tabs.is_empty() {
@@ -62,6 +101,9 @@ impl eframe::App for AsisLogApp {
         if self.hex_peek_open {
             self.render_hex_peek_panel(ctx, cur_idx);
         }
+        if self.analyze_open {
+            self.render_analyze(ctx, cur_idx);
+        }
         if self.palette_open {
             self.render_palette(ctx);
         }
@@ -81,6 +123,7 @@ impl eframe::App for AsisLogApp {
                     || t.filter_rx.is_some()
                     || t.marker_rx.is_some()
                     || t.follow_note.is_some()
+                    || t.qf_open
             });
         if busy {
             ctx.request_repaint_after(Duration::from_millis(120));

@@ -8,18 +8,24 @@ use std::time::SystemTime;
 
 pub mod archive;
 pub mod decode;
+pub mod fancypre;
 pub mod filter;
 pub mod follow;
 pub mod index;
 pub mod jsonlog;
 pub mod lineset;
 pub mod marks;
+pub mod merge;
 pub mod mmap;
+pub mod parser;
 pub mod query;
 pub mod scratch;
 pub mod search;
+pub mod squery;
 pub mod sqlcols;
 pub mod top_n;
+pub mod watch;
+pub mod wideline;
 
 pub use decode::Encoding;
 pub use filter::ParsedFilter;
@@ -28,6 +34,7 @@ pub use lineset::LineSet;
 pub use search::Hit;
 pub use sqlcols::{parse_sql_cols, SqlCols};
 pub use top_n::{top_errors, top_sessions, TopItem};
+pub use wideline::WideLineReader;
 
 /// Max bytes allowed through clipboard (16 MB per spec).
 pub const COPY_CAP_BYTES: usize = 16 * 1024 * 1024;
@@ -172,6 +179,10 @@ pub struct Doc {
     /// Auto-detected encoding + BOM length.
     pub detected: Encoding,
     pub bom_len: usize,
+    /// True when the head sample is NUL-dense (database blob, not text).
+    /// Line counts and line search are meaningless for such files; the UI
+    /// warns and points at Hex Peek instead of silently showing garbage.
+    pub is_binary: bool,
     /// User override (None = automatic).
     pub encoding_override: Option<Encoding>,
     pub index: SparseIndex,
@@ -226,6 +237,7 @@ impl Doc {
                 detected: Encoding::Utf8,
                 bom_len: 0,
                 encoding_override: None,
+                is_binary: false,
                 index: SparseIndex {
                     checkpoints: Vec::new(),
                     total_lines: 0,
@@ -256,6 +268,18 @@ impl Doc {
             let head_len = (m.len()).min(64 * 1024);
             decode::detect_encoding(&m[..head_len])
         };
+        // Binary guard BEFORE indexing: NUL-dense heads (Firebird blobs,
+        // executables) get an honest warning instead of fake line counts.
+        let is_binary = {
+            let head_len = (m.len()).min(8 * 1024);
+            decode::is_binary_sample(&m[..head_len])
+        };
+        let nul_head = if is_binary {
+            let head_len = (m.len()).min(8 * 1024);
+            decode::count_nul_head(&m[..head_len])
+        } else {
+            0
+        };
         let mut doc = Self {
             path,
             file_name,
@@ -264,6 +288,7 @@ impl Doc {
             detected,
             bom_len,
             encoding_override: None,
+            is_binary,
             index: SparseIndex::empty(),
             search_gen: 0,
             hits: Vec::new(),
@@ -285,6 +310,12 @@ impl Doc {
         doc.build_provisional_index();
         // Try sidecar for instant full index.
         doc.try_load_sidecar();
+        if is_binary {
+            doc.status = format!(
+                "File biner terdeteksi ({} NUL di 8 KB pertama). Hitungan baris tak valid — gunakan Hex Peek.",
+                crate::engine::format_count(nul_head as u64)
+            );
+        }
         Ok(doc)
     }
 
@@ -952,25 +983,27 @@ impl Doc {
             }
             i += 1;
         }
-        // Trailing newline phantom correction:
+        // Trailing-newline accounting (must mirror build_full exactly):
+        // total = newlines(whole file) + (ends_with_\n ? 0 : 1).
+        // The loop above added one per scanned \n onto old_lines, where
+        // old_lines already follows the same convention. Net correction:
+        // - new region ends with \n, old file did NOT  -> subtract 1
+        //   (first \n only closed the old unterminated line);
+        // - new region does NOT end with \n, old file DID -> add 1
+        //   (fresh unterminated tail line);
+        // - otherwise the loop total is already exact (the old code
+        //   always subtracted on trailing \n, undercounting by 1 on
+        //   every clean append like "…\n" + "…\n").
+        let old_ends_nl = start > 0 && data[start - 1] == b'\n';
+        let new_ends_nl = !data.is_empty() && data[data.len() - 1] == b'\n';
         let mut total_lines = line;
-        if !data.is_empty() && data[data.len() - 1] == b'\n' {
-            // total_lines currently counts the phantom; but our loop added it.
-            // build_full trims it, so mirror that: if last byte is newline, the
-            // increment created an empty line past EOF -> subtract.
-            // Only when old file didn't already end with newline? Simplify: recompute
-            // by checking: if data ends with newline, last line start == len => phantom.
-            // Our `line` counts it, so subtract 1 when len>0 and ends with \n and
-            // total content non-empty.
-            // Edge: empty file handled earlier.
+        if new_ends_nl && !old_ends_nl {
             total_lines = total_lines.saturating_sub(1);
-            // Ensure at least 1 when file non-empty? A file "\n" has 1 line? Actually
-            // "a\n" has 1 line per our convention? No: "a\n" -> lines: "a" only? We
-            // defined "a\nb\n" as 2 lines ("a","b"), so "\n" alone = 1 empty line?
-            // Keep max(total,1) for non-empty.
             if total_lines == 0 && !data.is_empty() {
                 total_lines = 1;
             }
+        } else if !new_ends_nl && old_ends_nl && !data.is_empty() {
+            total_lines += 1;
         }
         // Reconcile with full-scan convention for small drift: if checkpoints empty-ish,
         // trust computed.
@@ -1125,9 +1158,66 @@ mod tests {
         doc
     }
 
+    /// index_tail must agree with a fresh full scan for every
+    /// termination shape (the old code undercounted clean appends by 1
+    /// and overcounted fresh unterminated tails).
     #[test]
-    fn viewport_only_decodes_visible() {
-        let mut d = make_doc_with_text("a\nb\nc\n");
+    fn index_tail_matches_full_scan_oracle() {
+        fn check(old: &str, app: &str) {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("t.log");
+            std::fs::write(&p, old).unwrap();
+            let mut doc = Doc::open(p.clone()).unwrap();
+            let full_old = index::build_full(doc.data(), doc.encoding(), doc.bom_len);
+            doc.apply_index(full_old);
+            let old_bytes = doc.size;
+            let old_lines = doc.index.total_lines;
+            {
+                use std::io::Write as _;
+                let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+                f.write_all(app.as_bytes()).unwrap();
+                f.sync_all().unwrap();
+            }
+            doc.remap().unwrap();
+            doc.index_tail(old_bytes, old_lines);
+            let expect = index::build_full(doc.data(), doc.encoding(), doc.bom_len);
+            assert_eq!(
+                doc.index.total_lines, expect.total_lines,
+                "lines old={:?} app={:?}",
+                old, app
+            );
+            if expect.total_lines == 0 {
+                return;
+            }
+            for ln in [1, expect.total_lines / 2 + 1, expect.total_lines] {
+                let a = index::line_byte_range(
+                    doc.data(),
+                    &doc.index.checkpoints,
+                    ln,
+                    doc.encoding(),
+                    doc.bom_len,
+                );
+                let b = index::line_byte_range(
+                    doc.data(),
+                    &expect.checkpoints,
+                    ln,
+                    doc.encoding(),
+                    doc.bom_len,
+                );
+                assert_eq!(a, b, "line {} old={:?} app={:?}", ln, old, app);
+            }
+        }
+        check("a\nb\n", "c\nd\n"); // clean append (reported off-by-one)
+        check("a\nb\n", "c\nd"); // unterminated tail
+        check("a\nb", "c\nd\n"); // old unterminated, clean finish
+        check("a\nb", "c"); // continued partial line
+        check("a\n", ""); // empty append
+        check("", "x\ny\n"); // append to empty file
+        check("solo", ""); // single unterminated line, no append
+    }
+
+    #[test]
+    fn viewport_only_decodes_visible() {        let mut d = make_doc_with_text("a\nb\nc\n");
         // Force complete index like background would.
         let full = index::build_full(d.data(), d.encoding(), d.bom_len);
         d.apply_index(full);

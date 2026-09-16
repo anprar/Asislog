@@ -29,7 +29,7 @@ impl AsisLogApp {
             let lang = self.lang;
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.vertical_centered(|ui| {
-                    ui.add_space(60.0);
+                    ui.add_space(48.0);
                     ui.heading("AsisLog");
                     ui.label(lang.tr("Buka file log…"));
                     ui.label(lang.tr("Penampil portabel untuk file .log / .txt / .out yang sangat besar."));
@@ -37,6 +37,10 @@ impl AsisLogApp {
                     if ui.button(lang.tr("Buka file log…")).clicked() {
                         self.open_dialog();
                     }
+                    ui.add_space(8.0);
+                    ui.weak(lang.tr("Atau seret file ke jendela ini · Ctrl+O · Ctrl+Shift+P untuk palet"));
+                    ui.add_space(4.0);
+                    ui.weak(lang.tr("F11 Layar Penuh · Ctrl+F cari · F1 pintasan"));
                     if let Some(e) = &self.global_error.clone() {
                         ui.colored_label(egui::Color32::RED, lang.tr_status(e));
                     }
@@ -100,9 +104,6 @@ impl AsisLogApp {
                 {
                     tab.doc.status = lang.tr("Tidak ada lokasi berikutnya.").to_string();
                 }
-                if ui.button(lang.tr("Penanda")).clicked() {
-                    tab.show_bookmarks = !tab.show_bookmarks;
-                }
                 if ui
                     .button(lang.tr("Ekspor hasil…"))
                     .on_hover_text(lang.tr("Simpan hasil pencarian ke file baru"))
@@ -110,19 +111,41 @@ impl AsisLogApp {
                 {
                     tab.export_open = true;
                 }
-                if ui
-                    .button(lang.tr("Sorotan…"))
-                    .on_hover_text(lang.tr("Aturan highlight kustom (hanya viewport)"))
-                    .clicked()
-                {
+                // Progressive disclosure: secondary tools collapse into Alat ▾
+                // so the first-run chrome stays short (search stays dominant).
+                let mut open_marks = false;
+                let mut open_hl = false;
+                let mut open_scratch = false;
+                let mut toggle_analyze = false;
+                crate::ui::icons::menu_drop_down(ui, lang.tr("Alat"), |ui| {
+                    if ui.button(lang.tr("Penanda")).on_hover_text(lang.tr("Panel penanda (Ctrl+Shift+B)")).clicked() {
+                        open_marks = true;
+                        ui.close();
+                    }
+                    if ui.button(lang.tr("Sorotan…")).on_hover_text(lang.tr("Aturan highlight kustom (hanya viewport)")).clicked() {
+                        open_hl = true;
+                        ui.close();
+                    }
+                    if ui.button(lang.tr("Catatan")).on_hover_text(lang.tr("Scratchpad: catatan + base64/JWT/JSON/SQL")).clicked() {
+                        open_scratch = true;
+                        ui.close();
+                    }
+                    if ui.button(lang.tr("Analisis")).on_hover_text(lang.tr("Analisis Log (Parser · SQL · Gabung)")).clicked() {
+                        toggle_analyze = true;
+                        ui.close();
+                    }
+                });
+                if open_marks {
+                    tab.show_bookmarks = !tab.show_bookmarks;
+                }
+                if open_hl {
                     self.hl_open = true;
                 }
-                if ui
-                    .button(lang.tr("Catatan"))
-                    .on_hover_text(lang.tr("Scratchpad: catatan + base64/JWT/JSON/SQL"))
-                    .clicked()
-                {
+                if open_scratch {
                     self.scratch_open = true;
+                }
+                if toggle_analyze {
+                    self.analyze_open = !self.analyze_open;
                 }
                 // Toggle LIVE: tiga status selaras dengan bilah status
                 // (LIVE aktif / LIVE dijeda / mati). Klik saat jeda = lanjut.

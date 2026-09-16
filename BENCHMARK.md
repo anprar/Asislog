@@ -70,7 +70,7 @@ Catatan jujur:
 - Perbandingan vs klogg di mesin + file sama belum dilakukan — kolomnya
   sengaja dikosongkan sampai ada yang menjalankannya.
 
-Kontrak performa (dari `asislog-agent-prompt.md`):
+Kontrak performa (dari `docs/asislog-agent-prompt.md`):
 
 - Open first paint < 1 detik (SSD lokal, ukuran file berapa pun)
 - RAM < 250 MB untuk log 10 GB + ribuan hasil
@@ -249,7 +249,7 @@ untuk pola yang sama tanpa nomor baris).
 
 ## 8. Working set GUI asli 12 GB (2026-09-04 sore)
 
-Tanpa kode baru: `asislog.exe D:\teslog\coba.txt` (argumen CLI Batch 1),
+Tanpa kode baru: `asislog.exe <file 12 GB dari §5>` (argumen CLI Batch 1),
 sampling Private + WS tiap 2 dtk selama 5 menit. Sidecar belum ada
 sehingga indeks dingin penuh berjalan di run ini (terbukti:
 `coba.txt.asisidx` 7,0 MB tertulis 15:37).
@@ -326,5 +326,85 @@ jujur untuk GUI) — sengaja dikosongkan, bukan diisi kira-kira.
   tetap Finder saja (AC tak dibangun). **Sengaja tanpa angka**: ini perbaikan
   mekanisme; oracle worker (`worker_bool_matches_oracle_prefiltered_and_fallback`,
   kini mencakup keempat plan di dua mode case) mengunci himpunan hasil identik.
-  Angka menyusul di Tabel §2 bila sempat diukur; sampai saat itu klaim resmi
-  tetap "setara untuk literal, belum tentu untuk regex kompleks".
+   Angka menyusul di Tabel §2 bila sempat diukur; sampai saat itu klaim resmi
+   tetap "setara untuk literal, belum tentu untuk regex kompleks".
+
+## 12. Prefilter fancy + cap baris (P0, 2026-09-10)
+
+Mesin: sama dengan §4 (i5-10400, Windows 11). File: 209,7 MB sintetis
+ala `catalina.out` (INFO massal, `ERROR` tiap 50 baris, stack tiap 500).
+Metode: contoh sementara `examples/fancypre_bench.rs` (sudah dihapus):
+loop naif gaya kode lama (decode tiap baris + `fancy find_iter`, tanpa
+prefilter) vs `find_regex` baru (prefilter literal + cap 256 KB/baris).
+Hitungan dikunci identik (oracle).
+
+| Pola fancy | Lama | Baru | Speedup | Hit |
+|---|---|---|---|---|
+| `(?<=ERROR).*timeout` | 11,88 dtk | 0,47 dtk | **25x** | 38.970 = |
+| `(?!.*DEBUG).*Exception.*` | 59,05 dtk | 0,36 dtk | **164x** | 8.658 = |
+
+Mengapa menang besar: pola lookaround selektif dulu menjalankan
+backtracking di 2 jt baris INFO; kini `memchr`/AC menolak baris tanpa
+literal wajib (`ERROR`+`timeout`, `Exception`) sebelum decode. Bunyi
+soundness: `engine::fancypre` mengunci "prefilter menolak ⇒ engine
+menolak" via oracle 25 pola × 25 baris + fuzz 1500 pola acak
+(`oracle_never_drops_real_matches`, `oracle_fuzz_never_drops_real_matches`).
+
+Batas jujur yang ikut masuk paket ini:
+
+- Fancy memindai maks 256 KB/baris (`FANCY_LINE_CAP`); cocok di luar itu
+  di luar cakupan (display memang dibatasi 16 KB; salin/ekspor tetap penuh).
+  Ekspor fancy TIDAK di-cap (kontrak "nol baris hilang" ekspor).
+- `backtrack_limit` eksplisit 1 jt di 3 situs build fancy (worker, pure,
+  ekspor): baris ganas error per-baris, bukan hang.
+- Tanpa primitif `RegexSet` baru: worker AsisLog single-query sehingga
+  pindaiannya memang sekali jalan (DFA sekali jalan; alternasi literal
+  sudah dicover AC C-D2). Biaya multi-pindai yang riil — fancy tanpa
+  prefilter di worker + ekspor — yang diperbaiki. RegexSet tercatat
+  untuk analyzer multi-pola masa depan bila ada.
+
+## 13. Rilis 0.4.0 — indeks paralel + total eksak + tolak biner (2026-09-16)
+
+Mesin: i5-10400 (6C/12T), RAM 16 GB, Windows. File: SQL trace produksi
+12,16 GB (13.059.672.771 byte), 337.662.998 baris CRLF (fixture lokal,
+tidak ikut rilis) + sampel biner 4 GB (blob database, 8012 NUL/8 KB).
+Biner: `target\release\asislog.exe` 0.4.0 via `cmd /c` + redirect file
+(pola PowerShell yang benar — lihat README; ukur 2×, ambil stabil).
+Kondisi: hangat (page cache; dingin +2–3 dtk). Cooldown 90 dtk antar lari
+(build LTO men-throttle CPU ~25% bila langsung diukur).
+
+| Metrik | 0.3.2 | 0.4.0 | Δ |
+|---|---|---|---|
+| `count` 12 GB (337,7 jt baris) | 22,5–24,1 dtk (~580 MB/s) | **9,1–9,6 dtk (~1,4 GB/s)** | **2,4×** (indeks rayon) |
+| `grep -c COMMIT` (15.257.710 cocok) | 20,2 dtk | **7,8 dtk** | **2,6×** (grep rayon; mode hitung tanpa alokasi) |
+| `count` file biner 4 GB | 7,1 dtk + "16.007.643 baris" PALSU | **ditolak exit 2** + pesan jujur | bug → fix |
+| Total cocok tampil GUI | "200.000 (dibatasi)" tanpa total | **15.257.710 eksak satu pass** + halaman per 200 rb | fit |
+
+Catatan jujur:
+
+- Hitungan baris identik sebelum/sesudah paralel (337.662.998) + oracle
+  `parallel_matches_scalar_oracle` di suite (checkpoint byte-identik).
+- Semantik grep paralel dikunci oracle `grep_collect_matches_oracle`
+  (per-baris, CRLF, pola lintas-baris tidak cocok — sama seperti loop lama).
+- Total eksak GUI dibuktikan tes `worker_grand_total_exact_when_truncated`
+  (30 rb match, cap 10 rb → tersimpan 10 rb + total 30.000).
+
+## 14. GUI headless: open + first paint + search (0.4.0, 2026-09-16)
+
+Harness: `app::ui_viewport::tests::gui_bench_open_and_search` (ignored,
+jalan manual release). File sintetis ~50 MB / 1.250.000 baris
+(INFO massal + `ERROR` tiap 50 baris). Mesin: i5-10400, RAM 16 GB.
+Perintah: `cargo test --release -- --ignored gui_bench --nocapture`.
+Angka = logika UI penuh tanpa GPU (waktu paint-backend tidak termasuk).
+
+| Metrik | AsisLog 0.4.0 | klogg/PapaLogg |
+|---|---|---|
+| Buka file + indeks selesai | 40 ms | (belum diukur) |
+| Frame konten pertama (proxy first paint) | 2 ms | (belum diukur) |
+| Search `ERROR` batch pertama (25.000 hasil) | 30 ms | (belum diukur) |
+| Search selesai | 31 ms | (belum diukur) |
+
+Protokol manual kolom klogg (agar sel terisi jujur): buka file sintetis
+yang sama di klogg GUI, catat waktu status "indexing" s.d. siap + waktu
+status search s.d. batch pertama via stopwatch; tulis mesin + tanggal.
+Tanpa itu, kolom tetap kosong — bukan nol.

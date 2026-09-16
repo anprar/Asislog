@@ -71,6 +71,7 @@ impl AsisLogApp {
         if self.tabs[cur_idx].export_open {
             let mut do_export: Option<usize> = None;
             let mut do_ticket: Option<usize> = None;
+            let mut do_stream = false;
             let mut do_close = false;
             let mut do_cancel = false;
             egui::Window::new(lang.tr("Simpan hasil ke file…"))
@@ -78,6 +79,12 @@ impl AsisLogApp {
                 .show(ctx, |ui| {
                     let tab = &mut self.tabs[cur_idx];
                     ui.label(lang.f1("{} hasil.", tab.doc.hits.len()));
+                    if tab.doc.search_truncated {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(255, 170, 60),
+                            lang.tr("Tampil dipangkas — ekspor biasa ikut terpangkas."),
+                        );
+                    }
                     ui.horizontal(|ui| {
                         ui.label(lang.tr("Konteks (baris sekitar):"));
                         ui.add(egui::DragValue::new(&mut tab.export_context).range(0..=100));
@@ -115,6 +122,16 @@ impl AsisLogApp {
                             do_ticket = Some(tab.export_context);
                         }
                     });
+                    if !tab.search_text.trim().is_empty() {
+                        ui.separator();
+                        if ui
+                            .button(lang.tr("Ekspor SEMUA cocok (streaming)"))
+                            .on_hover_text(lang.tr("Tanpa batas tampil — tulis langsung ke disk."))
+                            .clicked()
+                        {
+                            do_stream = true;
+                        }
+                    }
                 });
             if let Some(cx) = do_export {
                 let out = rfd::FileDialog::new()
@@ -131,6 +148,14 @@ impl AsisLogApp {
                 if let Some(p) = out {
                     let q = self.tabs[cur_idx].search_text.clone();
                     self.tabs[cur_idx].start_export(p, cx, true, q);
+                }
+            }
+            if do_stream {
+                let out = rfd::FileDialog::new()
+                    .set_file_name("asislog-semua-cocok.txt")
+                    .save_file();
+                if let Some(p) = out {
+                    self.tabs[cur_idx].start_export_search(p);
                 }
             }
             if do_cancel {

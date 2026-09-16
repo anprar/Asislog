@@ -30,7 +30,7 @@ impl AsisLogApp {
     /// field (arrows/Home/End/Tab belong to the caret) or when any dialog
     /// is open (shortcuts would act behind the dialog).
     pub(crate) fn focus_state(&self, ctx: &egui::Context) -> (bool, bool) {
-        let field = ["cari", "saring", "tandai-saring"]
+        let field = ["cari", "saring", "tandai-saring", "qf"]
             .iter()
             .any(|id| ctx.memory(|m| m.focused() == Some(egui::Id::new(*id))));
         let dialog = self.hl_open
@@ -46,12 +46,13 @@ impl AsisLogApp {
             || self.hist_panel_open
             || self.top_n_open
             || self.hex_peek_open
+            || self.options_open
             || self.confirm.is_some()
             || self.global_error.is_some()
             || self
                 .tabs
                 .get(self.current)
-                .map(|t| t.goto_open || t.export_open || t.scope_open)
+                .map(|t| t.goto_open || t.export_open || t.scope_open || t.qf_open)
                 .unwrap_or(false);
         (field, dialog)
     }
@@ -76,14 +77,16 @@ impl AsisLogApp {
         if self.scut_pressed(ctx, "help", has_tab, typing, dialog_open) {
             self.shortcuts_open = true;
         }
-        // F11: toggle Mode Zen (C-B1)
+        // F11: toggle Layar Penuh (dulu "Zen")
         if self.scut_pressed(ctx, "zen", has_tab, typing, dialog_open) {
             self.zen_mode = !self.zen_mode;
             self.cfg_dirty = true;
             self.global_status = if self.zen_mode {
-                String::from("Mode Zen aktif (F11 untuk kembali).")
+                self.lang
+                    .tr("Layar Penuh aktif (F11 untuk kembali).")
+                    .to_string()
             } else {
-                String::from("Mode Zen dinonaktifkan.")
+                self.lang.tr("Layar Penuh dinonaktifkan.").to_string()
             };
         }
         // Ctrl+Shift+P: Command Palette (C-C3)
@@ -92,12 +95,24 @@ impl AsisLogApp {
             self.palette_query.clear();
             self.palette_selected = 0;
         }
-        // Ctrl+F fokus cari: kami tandai lewat status (fokus widget di bawah via id)
+        // Ctrl+F fokus cari: tak boleh bisu — tanpa tab, tawarkan buka file.
         if self.scut_pressed(ctx, "focus_search", has_tab, typing, dialog_open) {
-            if self.zen_mode {
-                self.zen_search_open = true;
+            if !has_tab {
+                self.global_status = self
+                    .lang
+                    .tr("Buka file log dulu — belum ada tab terbuka.")
+                    .to_string();
+                self.open_dialog();
+            } else {
+                if self.zen_mode {
+                    self.zen_search_open = true;
+                }
+                ctx.memory_mut(|m| m.request_focus(egui::Id::new("cari")));
             }
-            ctx.memory_mut(|m| m.request_focus(egui::Id::new("cari")));
+        }
+        // Ctrl+Q: keluar aplikasi.
+        if self.scut_pressed(ctx, "quit", has_tab, typing, dialog_open) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         // Ctrl+Shift+S: dual-pane hasil (berlaku tanpa tab).
         if self.scut_pressed(ctx, "split", has_tab, typing, dialog_open) {
@@ -132,7 +147,92 @@ impl AsisLogApp {
         let go_zoom_in = self.scut_pressed(ctx, "zoom_in", has_tab, typing, dialog_open);
         let go_zoom_out = !go_zoom_in && self.scut_pressed(ctx, "zoom_out", has_tab, typing, dialog_open);
         let go_zoom_reset = !go_zoom_in && !go_zoom_out && self.scut_pressed(ctx, "zoom_reset", has_tab, typing, dialog_open);
+        // P0/P1 baru: quickfind, extend-search, close-tab, tab_N, options.
+        let go_quickfind = self.scut_pressed(ctx, "quickfind", has_tab, typing, dialog_open);
+        let go_ex_add = self.scut_pressed(ctx, "extend_add", has_tab, typing, dialog_open);
+        let go_ex_excl = self.scut_pressed(ctx, "extend_exclude", has_tab, typing, dialog_open);
+        let go_ex_repl = self.scut_pressed(ctx, "extend_replace", has_tab, typing, dialog_open);
+        let go_close_tab = self.scut_pressed(ctx, "close_tab", has_tab, typing, dialog_open);
+        let go_options = self.scut_pressed(ctx, "options", has_tab, typing, dialog_open);
+        let go_reload = self.scut_pressed(ctx, "reload", has_tab, typing, dialog_open);
+        // Alias browser-style + bawaan: salah satu cukup.
+        let go_tab_pg_next = self.scut_pressed(ctx, "tab_next_pg", has_tab, typing, dialog_open);
+        let go_tab_pg_prev = self.scut_pressed(ctx, "tab_prev_pg", has_tab, typing, dialog_open);
+        let go_toggle_case = self.scut_pressed(ctx, "toggle_case", has_tab, typing, dialog_open);
+        let go_toggle_regex = self.scut_pressed(ctx, "toggle_regex", has_tab, typing, dialog_open);
+        let mut go_tab_n: Option<usize> = None;
+        for n in 1..=9 {
+            let id = format!("tab_{}", n);
+            if self.scut_pressed(ctx, &id, has_tab, typing, dialog_open) {
+                go_tab_n = Some(n);
+                break;
+            }
+        }
+        // Aksi tanpa pinjaman tab (diproses sebelum early-return).
+        if go_options {
+            self.options_open = !self.options_open;
+        }
+        if let Some(n) = go_tab_n {
+            let total = self.tabs.len();
+            if total > 0 {
+                let target = if n == 9 { total - 1 } else { (n - 1).min(total - 1) };
+                self.current = target;
+                self.session_dirty = true;
+            }
+        }
+        // Ctrl+PgDn / Ctrl+PgUp: alias pindah tab.
+        if (go_tab_pg_next || go_tab_pg_prev) && !self.tabs.is_empty() {
+            let total = self.tabs.len();
+            if go_tab_pg_prev && !go_tab_pg_next {
+                self.current = (self.current + total - 1) % total;
+            } else if go_tab_pg_next {
+                self.current = (self.current + 1) % total;
+            }
+            self.session_dirty = true;
+        }
+        // F5: muat ulang file tab kini dari disk (query/filter/follow dipertahankan).
+        if go_reload && !self.tabs.is_empty() {
+            self.reload_current_tab();
+        }
+        if go_close_tab && !self.tabs.is_empty() {
+            let i = self.current.min(self.tabs.len() - 1);
+            self.tabs[i].index_cancel.store(true, Ordering::Relaxed);
+            self.tabs[i].search_cancel.store(true, Ordering::Relaxed);
+            self.tabs[i].marker_cancel.store(true, Ordering::Relaxed);
+            let tab = self.tabs.remove(i);
+            if let Some(t) = tab.temp_path {
+                let _ = std::fs::remove_file(&t);
+                if let Some(dir) = t.parent() {
+                    let _ = std::fs::remove_dir(dir);
+                }
+            }
+            if self.current >= self.tabs.len() && !self.tabs.is_empty() {
+                self.current = self.tabs.len() - 1;
+            }
+            self.session_dirty = true;
+            self.sync_watch();
+        }
+        // Extend-search butuh &mut self penuh; ditangani setelah tab
+        // dipinjam? extend_search meminjam self.current — panggil di sini
+        // aman (sebelum current_tab_mut) karena hanya memakai self.
+        if go_ex_add {
+            self.extend_search(0);
+        }
+        if go_ex_excl {
+            self.extend_search(1);
+        }
+        if go_ex_repl {
+            self.extend_search(2);
+        }
         let Some(tab) = self.current_tab_mut() else { return };
+        // P0-5: quickfind toggle (Slash di luar ketik; Shift+/ = mundur).
+        if go_quickfind {
+            tab.qf_open = !tab.qf_open;
+            if tab.qf_open {
+                tab.qf_match = None;
+                tab.qf_msg = None;
+            }
+        }
         let mut sess_touch = false;
         // F3 / Shift+F3: boleh saat mengetik query (tangan di keyboard),
         // tapi jangan di balik dialog yang terbuka. Arah mengikuti aksi
@@ -145,11 +245,32 @@ impl AsisLogApp {
             } else {
                 (cur + 1).min(n - 1)
             };
-            tab.jump_to_hit(nxt);
+            // F3 melewati hasil terakhir saat terpangkas = muat halaman
+            // berikutnya (eksplisit, satu halaman per tekan).
+            if go_next && !go_prev && cur + 1 >= n && tab.doc.search_truncated {
+                if !tab.doc.search_in_progress {
+                    tab.continue_search_page();
+                }
+            } else {
+                tab.jump_to_hit(nxt);
+            }
         }
         // Ctrl+G: buka dialog (jangan menumpuk di atas dialog lain).
         if go_goto {
             tab.goto_open = true;
+        }
+        // Alt+C / Alt+R: cermin tombol Aa/.* di samping kolom cari.
+        if go_toggle_case {
+            tab.case_sensitive = !tab.case_sensitive;
+            if !tab.search_text.trim().is_empty() {
+                tab.debounce_at = Some(Instant::now() + Duration::from_millis(150));
+            }
+        }
+        if go_toggle_regex {
+            tab.regex_on = !tab.regex_on;
+            if !tab.search_text.trim().is_empty() {
+                tab.debounce_at = Some(Instant::now() + Duration::from_millis(150));
+            }
         }
         // Ctrl+E: dialog ekspor hasil
         if go_export {
@@ -196,7 +317,10 @@ impl AsisLogApp {
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             let tab_handled = {
                 let t = &mut *tab;
-                if t.scope_open {
+                if t.qf_open {
+                    t.qf_open = false;
+                    true
+                } else if t.scope_open {
                     t.scope_open = false;
                     true
                 } else if t.export_open {
@@ -204,6 +328,9 @@ impl AsisLogApp {
                     true
                 } else if t.goto_open {
                     t.goto_open = false;
+                    true
+                } else if t.sel_has_any() {
+                    t.sel_clear();
                     true
                 } else {
                     false
@@ -213,6 +340,8 @@ impl AsisLogApp {
                 // Modal konfirmasi / palet / HUD paling atas; Esc = Batal/Tutup.
                 if self.palette_open {
                     self.palette_open = false;
+                } else if self.options_open {
+                    self.options_open = false;
                 } else if self.zen_search_open {
                     self.zen_search_open = false;
                 } else if self.top_n_open {
@@ -344,6 +473,10 @@ impl AsisLogApp {
                     let c = t.current_hit.unwrap_or(0);
                     if shift {
                         t.jump_to_hit(c.saturating_sub(1).min(n - 1));
+                    } else if c + 1 >= n && t.doc.search_truncated && !t.doc.search_in_progress
+                    {
+                        // n di ujung saat terpangkas = halaman berikutnya.
+                        t.continue_search_page();
                     } else {
                         t.jump_to_hit((c + 1).min(n - 1));
                     }
@@ -667,7 +800,6 @@ pub(crate) fn spawn_download(url: String, tx: mpsc::Sender<DlMsg>) {
 
 /// Warna dot penanda, sadar-tema.
 pub(crate) fn mark_color(c: BookmarkColor, dark: bool) -> egui::Color32 {
-    // Varian terang digelapkan agar terbaca di latar terang.
     match c {
         BookmarkColor::Default => viewer::gutter_color(dark),
         BookmarkColor::Blue => {
@@ -808,5 +940,165 @@ pub(crate) fn apply_time_range(tab: &mut TabState, start: &str, end: &str) -> Re
         format_count(hi - lo + 1),
         if truncated { " (dibatasi 2 jt)" } else { "" }
     ))
+}
+
+// ---------- P1-6: extend search from selection (klogg Shift+A/E/R) ----------
+
+/// Ekstrak teks terpilih (portion / baris aktif) untuk extend-search.
+fn selection_text(tab: &mut TabState) -> Option<String> {
+    if let Some((ln, cs, ce)) = tab.sel_portion {
+        let text = tab.doc.get_line_text(ln).unwrap_or_default();
+        let chars: Vec<char> = text.chars().collect();
+        let a = (cs as usize).min(chars.len());
+        let b = (ce as usize).min(chars.len());
+        let (lo, hi) = (a.min(b), a.max(b));
+        if hi > lo {
+            let s: String = chars[lo..hi].iter().collect();
+            return Some(s).filter(|s| !s.trim().is_empty());
+        }
+        return None;
+    }
+    // Multi-baris / multi-range: pakai baris aktif saja (klogg behavior).
+    let t = tab.doc.get_line_text(tab.selected_line)?;
+    let trimmed = t.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Escape query sesuai mode (regex on/off; boolean pakai kutip bila ber-spasi).
+fn extend_query(tab: &TabState, sel: &str, mode: ExtendMode) -> String {
+    match mode {
+        ExtendMode::Replace => tab.regex_on.then(|| regex::escape(sel)).unwrap_or_else(|| sel.to_string()),
+        ExtendMode::Add => {
+            if tab.regex_on {
+                format!("{}|{}", tab.search_text, regex::escape(sel))
+            } else if crate::engine::query::is_boolean_query(&tab.search_text) {
+                if sel.contains(' ') {
+                    format!("{} OR \"{}\"", tab.search_text, sel)
+                } else {
+                    format!("{} OR {}", tab.search_text, sel)
+                }
+            } else if tab.search_text.trim().is_empty() {
+                sel.to_string()
+            } else if sel.contains(' ') {
+                format!("\"{}\" OR \"{}\"", tab.search_text, sel)
+            } else {
+                format!("{} OR {}", tab.search_text, sel)
+            }
+        }
+        ExtendMode::Exclude => {
+            if tab.regex_on {
+                // Regex: negative lookahead wrapper.
+                format!("^(?!.*{})", regex::escape(sel))
+            } else {
+                format!("{} -{}", tab.search_text, sel)
+            }
+        }
+    }
+}
+
+enum ExtendMode {
+    Add,
+    Exclude,
+    Replace,
+}
+
+impl AsisLogApp {
+    /// Shift+A (OR-kan seleksi ke query), Shift+E (exclusion), Shift+R
+    /// (ganti query) — klogg parity; butuh seleksi/teks baris aktif.
+    pub(crate) fn extend_search(&mut self, mode: u8) {
+        let Some(tab) = self.tabs.get_mut(self.current) else { return };
+        let sel = match selection_text(tab) {
+            Some(s) => s,
+            None => {
+                tab.doc.status = self
+                    .lang
+                    .tr("Tidak ada teks terpilih untuk ditambahkan (klik baris / pilih kata dulu).")
+                    .to_string();
+                return;
+            }
+        };
+        let m = match mode {
+            0 => ExtendMode::Add,
+            1 => ExtendMode::Exclude,
+            _ => ExtendMode::Replace,
+        };
+        let new_q = extend_query(tab, &sel, m);
+        tab.search_text = new_q;
+        tab.debounce_at = Some(Instant::now() + Duration::from_millis(150));
+    }
+}
+
+// ---------- P1-9: OS integration (explorer / default app / full path) ----------
+
+/// Buka folder berisi file di file manager OS (Explorer / Finder / xdg-open).
+pub(crate) fn show_in_explorer(path: &std::path::Path, status: &mut String, lang: crate::i18n::Lang) {
+    let Some(_dir) = path.parent() else {
+        *status = lang.tr("Path tanpa folder.").to_string();
+        return;
+    };
+    #[cfg(windows)]
+    {
+        // explorer /select, mem-highlight file-nya.
+        let out = std::process::Command::new("explorer")
+            .arg(format!("/select,{}", path.display()))
+            .spawn();
+        match out {
+            Ok(_) => *status = lang.tr("Folder dibuka di Explorer.").to_string(),
+            Err(e) => *status = lang.f1("Gagal membuka Explorer: {}", e),
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("open")
+            .arg("-R")
+            .arg(path)
+            .spawn();
+        match out {
+            Ok(_) => *status = lang.tr("Folder dibuka di Finder.").to_string(),
+            Err(e) => *status = lang.f1("Gagal membuka Finder: {}", e),
+        }
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    {
+        let out = std::process::Command::new("xdg-open").arg(dir).spawn();
+        match out {
+            Ok(_) => *status = lang.tr("Folder dibuka.").to_string(),
+            Err(e) => *status = lang.f1("Gagal membuka folder: {}", e),
+        }
+    }
+}
+
+/// Buka file di aplikasi default OS.
+pub(crate) fn open_in_default_app(path: &std::path::Path, status: &mut String, lang: crate::i18n::Lang) {
+    #[cfg(windows)]
+    {
+        let out = std::process::Command::new("cmd")
+            .args(["/C", "start", "", path.as_os_str().to_string_lossy().as_ref()])
+            .spawn();
+        match out {
+            Ok(_) => *status = lang.tr("Dibuka di aplikasi default.").to_string(),
+            Err(e) => *status = lang.f1("Gagal membuka aplikasi default: {}", e),
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("open").arg(path).spawn();
+        match out {
+            Ok(_) => *status = lang.tr("Dibuka di aplikasi default.").to_string(),
+            Err(e) => *status = lang.f1("Gagal membuka aplikasi default: {}", e),
+        }
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    {
+        let out = std::process::Command::new("xdg-open").arg(path).spawn();
+        match out {
+            Ok(_) => *status = lang.tr("Dibuka di aplikasi default.").to_string(),
+            Err(e) => *status = lang.f1("Gagal membuka aplikasi default: {}", e),
+        }
+    }
 }
 

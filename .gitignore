@@ -20,6 +20,10 @@ perf-*.log
 bench-data/
 # Portable release archives (rebuilt by CI release job, never commit binaries)
 *.zip
+# Staged release binaries + checksums (rebuilt locally via README steps)
+asislog-windows.exe
+asislog-linux
+dist/
 # Scratch measurement logs at repo root (bench*.txt, mem*.txt, ...)
 bench*.txt
 mem*.txt

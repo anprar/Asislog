@@ -79,6 +79,35 @@ pub fn icon_button(ui: &mut egui::Ui, icon: Icon, tooltip: &str) -> egui::Respon
     resp
 }
 
+/// Dropdown menu button: text + painted chevron-down, zero font glyphs
+/// (never tofu — same philosophy as `icon_button`). Behavior is exactly
+/// `ui.menu_button` (same open/hover/close); the chevron is decoration
+/// painted inside the button's right padding, which two trailing NBSPs
+/// reserve (U+00A0 is Latin-1 so every font has it, and unlike a regular
+/// space it is never trimmed from measurement).
+pub fn menu_drop_down<R>(
+    ui: &mut egui::Ui,
+    title: &str,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<Option<R>> {
+    let padded = format!("{title}\u{a0}\u{a0}");
+    let resp = ui.menu_button(padded, add_contents);
+    let rect = resp.response.rect;
+    let c = egui::pos2(rect.right() - 7.5, rect.center().y);
+    let fg = ui.style().interact(&resp.response).fg_stroke.color;
+    let stroke = egui::Stroke::new(2.0_f32, fg);
+    for [[x1, y1], [x2, y2]] in segments(Icon::ChevronDown, 2.8) {
+        ui.painter().line_segment(
+            [
+                egui::pos2(c.x + x1, c.y + y1),
+                egui::pos2(c.x + x2, c.y + y2),
+            ],
+            stroke,
+        );
+    }
+    resp
+}
+
 /// App logo (assets/asislog-32.png, baked into the binary).
 /// `None` when the bytes fail to decode: callers must paint
 /// `paint_logo_fallback` instead (vector A, still no fonts/symbols).
@@ -180,6 +209,33 @@ mod tests {
         let img = image::load_from_memory(LOGO_PNG).expect("baked logo must decode");
         assert_eq!((img.width(), img.height()), (32, 32));
         assert!(logo_image().is_some());
+    }
+
+    #[test]
+    fn menu_drop_down_reserves_chevron_space() {
+        // The painted chevron must not sit on top of the label text: two
+        // trailing NBSPs have to widen a real menu_button. Fails loudly if
+        // egui ever trims them from measurement.
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let (plain_w, padded_w) = egui::CentralPanel::default()
+                .show(ctx, |ui| {
+                    let a = ui
+                        .menu_button("Riwayat", |_| {})
+                        .response
+                        .rect
+                        .width();
+                    let b = menu_drop_down(ui, "Riwayat", |_| {}).response.rect.width();
+                    (a, b)
+                })
+                .inner;
+            assert!(
+                padded_w > plain_w + 4.0,
+                "NBSP padding must widen the button (plain={}, padded={})",
+                plain_w,
+                padded_w
+            );
+        });
     }
 
     #[test]

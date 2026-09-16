@@ -12,7 +12,7 @@ use crate::engine::filter::{parse_filter, ParsedFilter};
 use crate::engine::follow::{check_follow, load_identity, FollowEvent};
 use crate::engine::index::{self, SparseIndex};
 use crate::engine::search::{self, CacheKey, FileRev, Hit, SearchCache};
-use crate::engine::{format_count, format_size, BlockKind, BookmarkColor, Doc};
+use crate::engine::{format_count, format_size, BlockKind, BookmarkColor, Doc, WideLineReader};
 use crate::store::{HighlightRule, HighlightSet, HistEntry, Preset};
 use crate::ui::{
     dialogs::parse_goto,
@@ -96,20 +96,22 @@ pub(crate) fn spawn_indexer(
                 }
                 // odd tail byte ignored (carried roughly; wide huge files are rare)
             } else {
-                for &b in &buf[start..n] {
-                    byte += 1;
-                    if b == b'\n' {
-                        line += 1;
-                        if byte < total_size
-                            && (line - last_cp_line >= index::CHECKPOINT_LINES
-                                || byte - last_cp_byte >= index::CHECKPOINT_BYTES)
-                        {
-                            checkpoints.push((line, byte));
-                            last_cp_line = line;
-                            last_cp_byte = byte;
-                        }
+                // SIMD newline scan over the buffer (same checkpoint rule
+                // as before; the old per-byte loop topped out ~580 MB/s).
+                let base = byte; // absolute offset of buf[start]
+                for rel in memchr::memchr_iter(b'\n', &buf[start..n]) {
+                    byte = base + rel as u64 + 1;
+                    line += 1;
+                    if byte < total_size
+                        && (line - last_cp_line >= index::CHECKPOINT_LINES
+                            || byte - last_cp_byte >= index::CHECKPOINT_BYTES)
+                    {
+                        checkpoints.push((line, byte));
+                        last_cp_line = line;
+                        last_cp_byte = byte;
                     }
                 }
+                byte = base + (n - start) as u64;
             }
             if last_send.elapsed() > Duration::from_millis(50) {
                 last_send = Instant::now();
@@ -186,17 +188,36 @@ pub(crate) fn spawn_filter(
                 return;
             }
         };
-        let mut reader = std::io::BufReader::with_capacity(1024 * 1024, file);
+        let wide = encoding.is_wide();
+        let le = encoding == Encoding::Utf16Le;
+        let mut narrow_reader: Option<std::io::BufReader<std::fs::File>> = None;
+        let mut wide_reader: Option<WideLineReader<std::fs::File>> = if wide {
+            Some(WideLineReader::new(
+                std::io::BufReader::with_capacity(1024 * 1024, file),
+                le,
+            ))
+        } else {
+            narrow_reader = Some(std::io::BufReader::with_capacity(1024 * 1024, file));
+            None
+        };
         let mut line_no: u64 = 1;
         if let Some((sb, sl)) = tail_from {
             // Gagal seek = pindai penuh (benar, lebih lambat).
-            if reader.seek(SeekFrom::Start(sb)).is_ok() {
+            use std::io::Seek;
+            let ok = if let Some(wr) = wide_reader.as_mut() {
+                wr.seek_start(sb).is_ok()
+            } else if let Some(nr) = narrow_reader.as_mut() {
+                nr.seek(SeekFrom::Start(sb)).is_ok()
+            } else {
+                false
+            };
+            if ok {
                 line_no = sl.max(1);
             }
         }
         // No match cap: results stream straight into a roaring bitmap
-        // (200M consecutive lines ≈ 43 KB), so the old silent 5M-line
-        // truncation is gone — reported counts are always exact.
+        // (200M consecutive lines â‰ˆ 43 KB), so the old silent 5M-line
+        // truncation is gone â€” reported counts are always exact.
         let mut map = crate::engine::LineSet::new();
         let mut buf: Vec<u8> = Vec::new();
         // Pre-cancelled (superseded before first line): send nothing.
@@ -210,23 +231,42 @@ pub(crate) fn spawn_filter(
                 return;
             }
             buf.clear();
-            match reader.read_until(b'\n', &mut buf) {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(_) => break,
+            let n: u64 = if let Some(wr) = wide_reader.as_mut() {
+                wr.read_line(&mut buf)
+            } else if let Some(nr) = narrow_reader.as_mut() {
+                match nr.read_until(b'\n', &mut buf) {
+                    Ok(0) => 0,
+                    Ok(n) => n as u64,
+                    Err(_) => 0,
+                }
+            } else {
+                0
+            };
+            if n == 0 && buf.is_empty() {
+                break;
             }
             // strip newline
             let mut line_bytes = &buf[..];
-            if line_bytes.ends_with(b"\n") {
+            if wide {
+                let (n1, n2) = if le { (0x0Au8, 0x00u8) } else { (0x00u8, 0x0Au8) };
+                if line_bytes.len() >= 2
+                    && line_bytes[line_bytes.len() - 2] == n1
+                    && line_bytes[line_bytes.len() - 1] == n2
+                {
+                    line_bytes = &line_bytes[..line_bytes.len() - 2];
+                    let (c1, c2) = if le { (0x0Du8, 0x00u8) } else { (0x00u8, 0x0Du8) };
+                    if line_bytes.len() >= 2
+                        && line_bytes[line_bytes.len() - 2] == c1
+                        && line_bytes[line_bytes.len() - 1] == c2
+                    {
+                        line_bytes = &line_bytes[..line_bytes.len() - 2];
+                    }
+                }
+            } else if line_bytes.ends_with(b"\n") {
                 line_bytes = &line_bytes[..line_bytes.len() - 1];
             }
-            let ok = if encoding.is_wide() {
-                // wide: decode raw (includes \r\n as units); rough but functional
-                let s = crate::engine::decode::decode_bytes(line_bytes, encoding);
-                crate::engine::filter::line_matches(&s, &f)
-            } else {
-                crate::engine::filter::line_bytes_match(line_bytes, encoding, &f)
-            };
+            let s = crate::engine::decode::decode_bytes(line_bytes, encoding);
+            let ok = crate::engine::filter::line_matches(&s, &f);
             if ok {
                 map.insert(line_no);
             }
@@ -286,11 +326,14 @@ pub fn build_time_hist(samples: &[(i64, u64)], max_bins: usize) -> Option<TimeHi
 
 /// Pindai latar: tandai bucket byte yang mengandung ERROR/FATAL/Exception
 /// (bit 0) atau WARN (bit 1). Satu pass memchr, ~detik untuk 2 GB.
-/// Kasar per ±4 MB pada file 2 GB — cukup sebagai "peta masalah" strip.
+/// Kasar per Â±4 MB pada file 2 GB â€” cukup sebagai "peta masalah" strip.
+/// Menghormati flag cancel (tab ditutup/rotasi) â€” worker besar terakhir
+/// kini bisa dihentikan seperti indexer/filter/search.
 pub(crate) fn spawn_marker_scan(
     path: PathBuf,
     total: u64,
     tx: mpsc::Sender<MarkerUpdate>,
+    cancel: Arc<AtomicBool>,
 ) {
     std::thread::spawn(move || {
         use std::io::{BufRead, Read};
@@ -306,6 +349,9 @@ pub(crate) fn spawn_marker_scan(
                 return;
             }
         };
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
         let mut reader = std::io::BufReader::with_capacity(1024 * 1024, file);
         let err_fs = [
             memchr::memmem::Finder::new(b"ERROR"),
@@ -317,6 +363,9 @@ pub(crate) fn spawn_marker_scan(
         let mut buf = vec![0u8; 1024 * 1024];
         let mut offset: u64 = 0;
         loop {
+            if cancel.load(Ordering::Relaxed) {
+                return;
+            }
             let n = match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => n,
@@ -335,16 +384,22 @@ pub(crate) fn spawn_marker_scan(
             }
             offset += n as u64;
         }
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
         // Pass kedua: histogram ERROR per menit (garis ber-cap waktu saja).
         // Satu baca sekuensial tambahan; page cache masih hangat.
-        let hist = time_hist_pass(&path);
+        let hist = time_hist_pass(&path, &cancel);
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
         let _ = tx.send((bits, total, hist));
     });
 }
 
 /// Pass garis: kumpulkan (epoch-menit, baris) garis ERROR (maks 200 rb),
 /// lalu kuantisasi menjadi histogram. None bila < 2 menit berbeda.
-pub(crate) fn time_hist_pass(path: &PathBuf) -> Option<TimeHist> {
+pub(crate) fn time_hist_pass(path: &PathBuf, cancel: &Arc<AtomicBool>) -> Option<TimeHist> {
     use std::io::BufRead;
     let file = std::fs::File::open(path).ok()?;
     let mut reader = std::io::BufReader::with_capacity(1024 * 1024, file);
@@ -357,6 +412,9 @@ pub(crate) fn time_hist_pass(path: &PathBuf) -> Option<TimeHist> {
     let mut line_no: u64 = 1;
     let mut buf: Vec<u8> = Vec::new();
     loop {
+        if line_no & 4095 == 0 && cancel.load(Ordering::Relaxed) {
+            return None;
+        }
         buf.clear();
         match reader.read_until(b'\n', &mut buf) {
             Ok(0) => break,
@@ -529,6 +587,323 @@ pub(crate) fn spawn_export(
     });
 }
 
+/// Ekspor-streaming tanpa batas tampil: pindai ulang file dari query kini
+/// dan tulis baris cocok LANGSUNG ke disk (O(chunk) RAM, nol Hit tersimpan).
+/// Jawaban atas "jutaan match": viewport tetap dibatasi (DV), tapi tidak
+/// ada satu pun baris cocok yang hilang di file ekspor.
+pub(crate) struct ExportSearchJob {
+    pub src: PathBuf,
+    pub out: PathBuf,
+    pub query: String,
+    pub regex_on: bool,
+    pub case_sensitive: bool,
+    pub encoding: Encoding,
+    pub bom_len: usize,
+}
+
+/// Matcher per-baris untuk ekspor streaming. Semantik = jalur search:
+/// literal sensitif = Finder byte; insensitif = fold Unicode penuh;
+/// regex = mesin cepat (+ fallback fancy); boolean = AST di teks terdecode.
+enum ExportMatcher {
+    Literal { needle: Vec<u8> },
+    LiteralCi { needle_lower: String },
+    RegexFast(regex::bytes::Regex),
+    RegexFancy(fancy_regex::Regex),
+    Bool(crate::engine::query::Query),
+}
+
+fn compile_export_matcher(
+    query: &str,
+    regex_on: bool,
+    case_sensitive: bool,
+) -> Result<ExportMatcher, String> {
+    if !regex_on && !crate::engine::query::is_boolean_query(query) {
+        if case_sensitive {
+            Ok(ExportMatcher::Literal { needle: query.as_bytes().to_vec() })
+        } else {
+            Ok(ExportMatcher::LiteralCi { needle_lower: query.to_lowercase() })
+        }
+    } else if regex_on {
+        match crate::engine::search::compile_regex_auto(query, case_sensitive) {
+            Ok(crate::engine::search::CompiledRegex::Fast(_)) => {
+                let mut b = regex::bytes::RegexBuilder::new(query);
+                b.case_insensitive(!case_sensitive);
+                b.build()
+                    .map(ExportMatcher::RegexFast)
+                    .map_err(|e| format!("Regex tidak valid: {}", e))
+            }
+            Ok(crate::engine::search::CompiledRegex::Fancy(_)) => {
+                let mut fb = fancy_regex::RegexBuilder::new(query);
+                fb.case_insensitive(!case_sensitive);
+                // Explicit default: pathological lines error, not hang.
+                fb.backtrack_limit(1_000_000);
+                fb.build()
+                    .map(ExportMatcher::RegexFancy)
+                    .map_err(|e| format!("Regex tidak valid: {}", e))
+            }
+            Err(e) => Err(format!("Regex tidak valid: {}", e)),
+        }
+    } else {
+        crate::engine::query::parse_query(query)
+            .map(ExportMatcher::Bool)
+            .map_err(|e| format!("Query tidak valid: {}", e))
+    }
+}
+
+/// Terapkan matcher ke satu baris. `text` = hasil decode; `scan` = byte yang
+/// dipindai matcher byte (raw untuk narrow, decoded-utf8 untuk wide —
+/// paritas dengan jalur search).
+fn export_line_matches(
+    m: &ExportMatcher,
+    text: &str,
+    scan: &[u8],
+    case_sensitive: bool,
+) -> bool {
+    match m {
+        ExportMatcher::Literal { needle } => memchr::memmem::find(scan, needle).is_some(),
+        ExportMatcher::LiteralCi { needle_lower } => {
+            text.to_lowercase().contains(needle_lower.as_str())
+        }
+        ExportMatcher::RegexFast(re) => re.is_match(scan),
+        ExportMatcher::RegexFancy(re) => re.is_match(text).unwrap_or(false),
+        ExportMatcher::Bool(ast) => ast.matches(text, case_sensitive),
+    }
+}
+
+/// Inti sinkron (dipakai worker + tes): tulis `ln: teks` semua baris cocok.
+/// Mengembalikan jumlah baris ditulis. `progress(written)` dipanggil berkala.
+pub(crate) fn export_search_to_file(
+    job: &ExportSearchJob,
+    cancel: &AtomicBool,
+    mut progress: impl FnMut(u64),
+) -> Result<u64, String> {
+    use std::io::{Read, Write};
+    if job.query.trim().is_empty() {
+        return Err(String::from("Query kosong — isi kolom Cari dulu."));
+    }
+    let matcher = compile_export_matcher(&job.query, job.regex_on, job.case_sensitive)?;
+    // P0: same required-literal prefilter as the fancy search worker.
+    // Narrow only (wide filters on decoded text below). Export stays EXACT:
+    // no line cap here (search caps, export must not lose rows).
+    let fancy_pre = match &matcher {
+        ExportMatcher::RegexFancy(_) => {
+            crate::engine::fancypre::FancyPrefilter::new(&job.query, job.case_sensitive)
+        }
+        _ => crate::engine::fancypre::FancyPrefilter::disabled(),
+    };
+    let is_fancy = matches!(&matcher, ExportMatcher::RegexFancy(_));
+    let mut f = std::fs::File::create(&job.out)
+        .map_err(|e| format!("Gagal membuat file ekspor: {}", e))?;
+    let wide = job.encoding.is_wide();
+    let le = job.encoding == Encoding::Utf16Le;
+    let mut written: u64 = 0;
+    let mut check_cancel_lines = 0u32;
+
+    // Satu baris cocok -> tulis + hitung. Returns Err on I/O failure.
+    let emit = |ln: u64,
+                    text: &str,
+                    f: &mut std::fs::File,
+                    written: &mut u64,
+                    progress: &mut dyn FnMut(u64)|
+     -> Result<(), String> {
+        writeln!(f, "{}: {}", ln, text).map_err(|_| String::from("Gagal menulis ekspor."))?;
+        *written += 1;
+        if (*written).is_multiple_of(1024) {
+            progress(*written);
+        }
+        Ok(())
+    };
+
+    if wide {
+        let file = std::fs::File::open(&job.src)
+            .map_err(|e| format!("Gagal membuka sumber ekspor: {}", e))?;
+        let mut reader =
+            WideLineReader::new(std::io::BufReader::with_capacity(1024 * 1024, file), le);
+        let mut line_no: u64 = 1;
+        let mut buf: Vec<u8> = Vec::new();
+        let mut first = true;
+        let (n1, n2) = if le { (0x0Au8, 0x00u8) } else { (0x00u8, 0x0Au8) };
+        let (c1, c2) = if le { (0x0Du8, 0x00u8) } else { (0x00u8, 0x0Du8) };
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(String::from("Ekspor dibatalkan."));
+            }
+            buf.clear();
+            let n = reader.read_line(&mut buf);
+            if n == 0 && buf.is_empty() {
+                break;
+            }
+            let mut lb = &buf[..];
+            if lb.len() >= 2 && lb[lb.len() - 2] == n1 && lb[lb.len() - 1] == n2 {
+                lb = &lb[..lb.len() - 2];
+                if lb.len() >= 2 && lb[lb.len() - 2] == c1 && lb[lb.len() - 1] == c2 {
+                    lb = &lb[..lb.len() - 2];
+                }
+            }
+            if first {
+                first = false;
+                if job.bom_len > 0 && lb.len() >= job.bom_len {
+                    lb = &lb[job.bom_len..];
+                }
+            }
+            // Baris padding NUL (odd-pad) dilewati seperti jalur search.
+            if !lb.is_empty() && lb.iter().any(|&b| b != 0) {
+                let text = crate::engine::decode::decode_bytes(lb, job.encoding);
+                let pre_ok = !is_fancy || fancy_pre.passes(text.as_bytes());
+                if pre_ok && export_line_matches(&matcher, &text, text.as_bytes(), job.case_sensitive) {
+                    let disp = crate::engine::decode::strip_cr(text);
+                    emit(line_no, &disp, &mut f, &mut written, &mut progress)?;
+                }
+            }
+            line_no += 1;
+            check_cancel_lines += 1;
+            if check_cancel_lines >= 4096 {
+                check_cancel_lines = 0;
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(String::from("Ekspor dibatalkan."));
+                }
+                progress(written);
+            }
+        }
+    } else {
+        let file = std::fs::File::open(&job.src)
+            .map_err(|e| format!("Gagal membuka sumber ekspor: {}", e))?;
+        let mut reader = std::io::BufReader::with_capacity(1024 * 1024, file);
+        let chunk_size = search::effective_chunk_bytes();
+        let mut carry: Vec<u8> = Vec::new();
+        let mut line_no: u64 = 1;
+        let mut first_chunk = true;
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(String::from("Ekspor dibatalkan."));
+            }
+            let mut tmp = vec![0u8; chunk_size];
+            let n = match reader.read(&mut tmp) {
+                Ok(n) => n,
+                Err(e) => return Err(format!("Gagal membaca sumber ekspor: {}", e)),
+            };
+            let eof = n < chunk_size;
+            tmp.truncate(n);
+            if tmp.is_empty() && carry.is_empty() {
+                break;
+            }
+            // Satukan carry + fresh, belah per baris penuh.
+            let mut combined = std::mem::take(&mut carry);
+            combined.extend_from_slice(&tmp);
+            let mut start = 0usize;
+            let mut first_line = first_chunk;
+            first_chunk = false;
+            for (i, &b) in combined.iter().enumerate() {
+                if b != b'\n' {
+                    continue;
+                }
+                let mut lb = &combined[start..i];
+                if !lb.is_empty() && lb[lb.len() - 1] == b'\r' {
+                    lb = &lb[..lb.len() - 1];
+                }
+                let mut lbm = lb;
+                if first_line {
+                    first_line = false;
+                    if job.bom_len > 0 && lbm.len() >= job.bom_len {
+                        lbm = &lbm[job.bom_len..];
+                    }
+                }
+                // Matcher byte = raw (paritas jalur search narrow).
+                // Fancy: required-literal prefilter dulu (tanpa decode).
+                let hit = match &matcher {
+                    ExportMatcher::Literal { needle } => {
+                        memchr::memmem::find(lbm, needle).is_some()
+                    }
+                    ExportMatcher::RegexFancy(_) if !fancy_pre.passes(lbm) => false,
+                    _ => {
+                        let text = crate::engine::decode::decode_bytes(lbm, job.encoding);
+                        export_line_matches(&matcher, &text, lbm, job.case_sensitive)
+                    }
+                };
+                if hit {
+                    let text = crate::engine::decode::decode_bytes(lbm, job.encoding);
+                    let disp = crate::engine::decode::strip_cr(text);
+                    emit(line_no, &disp, &mut f, &mut written, &mut progress)?;
+                }
+                line_no += 1;
+                start = i + 1;
+            }
+            carry = combined[start..].to_vec();
+            if eof {
+                // Sisa ekor tanpa newline = baris terakhir.
+                if !carry.is_empty() {
+                    let mut lbm = &carry[..];
+                    if !lbm.is_empty() && lbm[lbm.len() - 1] == b'\r' {
+                        lbm = &lbm[..lbm.len() - 1];
+                    }
+                    let hit = match &matcher {
+                        ExportMatcher::Literal { needle } => {
+                            memchr::memmem::find(lbm, needle).is_some()
+                        }
+                        ExportMatcher::RegexFancy(_) if !fancy_pre.passes(lbm) => false,
+                        _ => {
+                            let text = crate::engine::decode::decode_bytes(lbm, job.encoding);
+                            export_line_matches(&matcher, &text, lbm, job.case_sensitive)
+                        }
+                    };
+                    if hit {
+                        let text = crate::engine::decode::decode_bytes(lbm, job.encoding);
+                        let disp = crate::engine::decode::strip_cr(text);
+                        emit(line_no, &disp, &mut f, &mut written, &mut progress)?;
+                    }
+                }
+                break;
+            }
+        }
+    }
+    progress(written);
+    Ok(written)
+}
+
+pub(crate) fn spawn_export_search(
+    job: ExportSearchJob,
+    tx: mpsc::Sender<ExportMsg>,
+    cancel: Arc<AtomicBool>,
+) {
+    std::thread::spawn(move || {
+        let progress = |written: u64| {
+            let _ = tx.send(ExportMsg {
+                written,
+                total_hits: 0, // streaming: total tak diketahui di muka
+                out: job.out.clone(),
+                ticket: false,
+                context: 0,
+                error: None,
+                done: false,
+            });
+        };
+        match export_search_to_file(&job, &cancel, progress) {
+            Ok(w) => {
+                let _ = tx.send(ExportMsg {
+                    written: w,
+                    total_hits: 0,
+                    out: job.out.clone(),
+                    ticket: false,
+                    context: 0,
+                    error: None,
+                    done: true,
+                });
+            }
+            Err(e) => {
+                let _ = tx.send(ExportMsg {
+                    written: 0,
+                    total_hits: 0,
+                    out: job.out.clone(),
+                    ticket: false,
+                    context: 0,
+                    error: Some(e),
+                    done: true,
+                });
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,7 +967,7 @@ mod tests {
 
     #[test]
     fn filter_reports_exact_count_with_roaring_heap() {
-        // 100k consecutive matches: the old Vec+5M-cap design is gone —
+        // 100k consecutive matches: the old Vec+5M-cap design is gone â€”
         // exact count, and a heap a fraction of the old 800 KB Vec.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("dense.log");
@@ -729,5 +1104,136 @@ mod tests {
             }
         }
         assert!(saw_cancel);
+    }
+
+    fn export_search_job(
+        dir: &std::path::Path,
+        name: &str,
+        content: &[u8],
+        query: &str,
+        regex_on: bool,
+        case_sensitive: bool,
+    ) -> (ExportSearchJob, PathBuf) {
+        let src = dir.join(name);
+        std::fs::write(&src, content).unwrap();
+        let out = dir.join("stream-out.txt");
+        (
+            ExportSearchJob {
+                src,
+                out: out.clone(),
+                query: query.to_string(),
+                regex_on,
+                case_sensitive,
+                encoding: Encoding::Utf8,
+                bom_len: 0,
+            },
+            out,
+        )
+    }
+
+    fn run_export_search(job: &ExportSearchJob) -> Result<u64, String> {
+        let cancel = AtomicBool::new(false);
+        export_search_to_file(job, &cancel, |_| {})
+    }
+
+    #[test]
+    fn export_search_literal_case_modes() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = b"2026 ERROR timeout\n2026 info ok\n2026 error retry\n2026 WARN x\n";
+        // Sensitif: 1 baris.
+        let (job, out) = export_search_job(dir.path(), "s.log", data, "ERROR", false, true);
+        assert_eq!(run_export_search(&job).unwrap(), 1);
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert!(text.starts_with("1: 2026 ERROR timeout"));
+        // Insensitif Unicode: ÉCLAIR vs éclair (e polos tak ikut).
+        let data2 = "w1 ÉCLAIR x\nw2 éclair y\nw3 plain\n".as_bytes();
+        let (job, out) =
+            export_search_job(dir.path(), "u.log", data2, "éclair", false, false);
+        assert_eq!(run_export_search(&job).unwrap(), 2);
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert!(text.contains("1: w1"));
+        assert!(text.contains("2: w2"));
+    }
+
+    #[test]
+    fn export_search_regex_and_boolean() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = b"err 1 timeout\nerr 2 slow\nok 3 timeout\ninfo 4\n";
+        let (job, out) =
+            export_search_job(dir.path(), "r.log", data, "^err.*timeout", true, true);
+        assert_eq!(run_export_search(&job).unwrap(), 1);
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert!(text.starts_with("1: err 1 timeout"));
+        // Boolean + XOR baru.
+        let (job, _out) =
+            export_search_job(dir.path(), "b.log", data, "err timeout -slow", false, true);
+        assert_eq!(run_export_search(&job).unwrap(), 1);
+        let (job, out) =
+            export_search_job(dir.path(), "x.log", data, "err XOR ok", false, true);
+        assert_eq!(run_export_search(&job).unwrap(), 3);
+        let _ = out;
+        // Regex jelek + query kosong ditolak jujur.
+        let (job, _) = export_search_job(dir.path(), "e1.log", data, "([a", true, true);
+        assert!(run_export_search(&job).is_err());
+        let (job, _) = export_search_job(dir.path(), "e2.log", data, "   ", false, true);
+        assert!(run_export_search(&job).is_err());
+    }
+
+    #[test]
+    fn export_search_wide_utf16_and_cancel() {
+        let dir = tempfile::tempdir().unwrap();
+        // UTF-16LE: BOM + 4 baris.
+        let mut raw = vec![0xFFu8, 0xFE];
+        for l in ["alpha one", "beta two", "alpha three", "gamma"] {
+            for u in format!("{}\n", l).encode_utf16() {
+                raw.extend_from_slice(&u.to_le_bytes());
+            }
+        }
+        let src = dir.path().join("w.log");
+        std::fs::write(&src, &raw).unwrap();
+        let out = dir.path().join("w-out.txt");
+        let job = ExportSearchJob {
+            src,
+            out: out.clone(),
+            query: String::from("alpha"),
+            regex_on: false,
+            case_sensitive: true,
+            encoding: Encoding::Utf16Le,
+            bom_len: 2,
+        };
+        assert_eq!(run_export_search(&job).unwrap(), 2);
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert!(text.contains("1: alpha one"));
+        assert!(text.contains("3: alpha three"));
+        // Cancel sejak awal -> Err batal.
+        let cancel = AtomicBool::new(true);
+        let err = export_search_to_file(&job, &cancel, |_| {}).unwrap_err();
+        assert_eq!(err, "Ekspor dibatalkan.");
+    }
+
+    #[test]
+    fn export_search_ignores_display_cap() {
+        // 20 rb baris cocok: jauh di atas cap tampil default, semua keluar.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("big.log");
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&src).unwrap();
+            for i in 0..20_000u64 {
+                writeln!(f, "2026-09-04 ERROR id={}", i).unwrap();
+            }
+        }
+        let out = dir.path().join("big-out.txt");
+        let job = ExportSearchJob {
+            src,
+            out: out.clone(),
+            query: String::from("ERROR"),
+            regex_on: false,
+            case_sensitive: true,
+            encoding: Encoding::Utf8,
+            bom_len: 0,
+        };
+        assert_eq!(run_export_search(&job).unwrap(), 20_000);
+        assert_eq!(std::fs::read_to_string(&out).unwrap().lines().count(), 20_000);
     }
 }

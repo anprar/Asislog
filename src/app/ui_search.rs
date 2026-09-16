@@ -28,6 +28,15 @@ impl AsisLogApp {
     pub(crate) fn render_search(&mut self, ctx: &egui::Context, cur_idx: usize) {
         // ---- Baris 2: pencarian (pusat UI, full-width) ----
         let lang = self.lang;
+        // Label pintasan dinamis: dihitung sebelum pinjam tab (&self vs
+        // &mut tab tak boleh berdampingan di closure bawah).
+        let case_hint =
+            format!("{} ({})", lang.tr("Peka huruf besar/kecil"), self.scut_label("toggle_case"));
+        let regex_hint = format!(
+            "{} ({})",
+            lang.tr("Perlakukan query sebagai regex"),
+            self.scut_label("toggle_regex")
+        );
         let mut open_range = false;
         let mut filter_all = false;
         egui::TopBottomPanel::top("search").show(ctx, |ui| {
@@ -41,7 +50,7 @@ impl AsisLogApp {
             let mut search_focused = false;
             ui.horizontal_wrapped(|ui| {
                 // Menu preset pencarian (bawaan + simpanan user).
-                ui.menu_button(lang.tr("Preset v"), |ui| {
+                crate::ui::icons::menu_drop_down(ui, lang.tr("Preset"), |ui| {
                     ui.label(lang.tr("Bawaan:"));
                     for p in crate::store::builtin_presets_for(lang) {
                         if ui.button(p.name.clone()).clicked() {
@@ -92,7 +101,7 @@ impl AsisLogApp {
                 let resp = ui.add_sized(
                     egui::vec2(w, 0.0),
                     egui::TextEdit::singleline(&mut tab.search_text)
-                        .id_source("cari")
+                        .id(egui::Id::new("cari"))
                         .hint_text(lang.tr("Cari teks, exception, request ID, atau regex…")),
                 );
                 search_focused = resp.has_focus();
@@ -104,7 +113,7 @@ impl AsisLogApp {
                 let cs = tab.case_sensitive;
                 if ui
                     .add(egui::Button::selectable(cs, "Aa"))
-                    .on_hover_text(lang.tr("Peka huruf besar/kecil (Alt+C)"))
+                    .on_hover_text(case_hint.clone())
                     .clicked()
                 {
                     tab.case_sensitive = !cs;
@@ -115,7 +124,7 @@ impl AsisLogApp {
                 let rx = tab.regex_on;
                 if ui
                     .add(egui::Button::selectable(rx, ".*"))
-                    .on_hover_text(lang.tr("Perlakukan query sebagai regex (Alt+R)"))
+                    .on_hover_text(regex_hint.clone())
                     .clicked()
                 {
                     tab.regex_on = !rx;
@@ -155,19 +164,38 @@ impl AsisLogApp {
                     tab.jump_to_hit((c + 1).min(n - 1));
                 }
 
-                // Info hasil / progress / 0-hasil yang menjelaskan.
+                // Info hasil / progress / state machine (P1-12).
+                // Chip status: NoSearch/Searching/AutoRefreshing/Static/Truncated/Error.
+                let st = tab.search_state();
+                let (chip_col, chip_txt) = match st {
+                    crate::app::tab::SearchState::NoSearch => (egui::Color32::GRAY, st.label_in(lang)),
+                    crate::app::tab::SearchState::Searching => (egui::Color32::YELLOW, st.label_in(lang)),
+                    crate::app::tab::SearchState::AutoRefreshing => (egui::Color32::from_rgb(90, 200, 255), st.label_in(lang)),
+                    crate::app::tab::SearchState::Static => (egui::Color32::GREEN, st.label_in(lang)),
+                    crate::app::tab::SearchState::Truncated => (egui::Color32::from_rgb(255, 170, 60), st.label_in(lang)),
+                    crate::app::tab::SearchState::Error => (egui::Color32::RED, st.label_in(lang)),
+                };
+                ui.colored_label(chip_col, chip_txt);
+                // Total eksak (grand_total) bila worker sudah melapor;
+                // fallback ke jumlah tersimpan untuk hasil cache lama.
+                // Template terjemahan dipakai ulang — tanpa string baru.
+                let shown = if tab.search_grand_total > 0 {
+                    tab.search_grand_total
+                } else {
+                    tab.doc.hits.len() as u64
+                };
                 if tab.doc.search_in_progress {
                     if tab.search_total > 0 {
-                        ui.label(lang.f3("Mencari… {} / {} · {} hasil", format_size(tab.search_scanned), format_size(tab.search_total), format_count(tab.doc.hits.len() as u64)));
+                        ui.label(lang.f3("Mencari… {} / {} · {} hasil", format_size(tab.search_scanned), format_size(tab.search_total), format_count(shown)));
                     } else {
-                        ui.label(lang.f1("Mencari… {} hasil", format_count(tab.doc.hits.len() as u64)));
+                        ui.label(lang.f1("Mencari… {} hasil", format_count(shown)));
                     }
                 } else if let Some(e) = &tab.doc.search_error.clone() {
                     ui.colored_label(egui::Color32::RED, lang.tr_status(e));
                 } else if !tab.search_text.trim().is_empty() && tab.doc.hits.is_empty() {
                     let q: String = tab.search_text.chars().take(40).collect();
                     ui.label(lang.f1("Tidak ada kecocokan \"{}\"", q));
-                } else {
+                } else if !tab.search_text.trim().is_empty() {
                     let mode = if tab.regex_on {
                         if tab.regex_complex {
                             "regex-complex"
@@ -179,10 +207,11 @@ impl AsisLogApp {
                     } else {
                         "literal"
                     };
-                    ui.label(lang.f2("{} hasil ({})", format_count(tab.doc.hits.len() as u64), mode));
+                    ui.label(lang.f2("{} hasil ({})", format_count(shown), mode));
                 }
                 if tab.doc.search_truncated {
-                    ui.label(lang.tr("(dibatasi 200 rb)"));
+                    let lim = crate::engine::search::effective_max_hits();
+                    ui.label(lang.f1("(dibatasi {})", format_count(lim as u64)));
                 }
 
                 ui.separator();
@@ -214,8 +243,7 @@ impl AsisLogApp {
                     .add_enabled(can_filter, egui::Button::new(lang.tr("Jadikan filter")))
                     .on_hover_text(lang.tr("Konversi query pencarian ke filter permanen"))
                     .clicked()
-                {
-                    if tab.regex_on {
+                {                    if tab.regex_on {
                         tab.doc.status = lang.tr("Pencarian regex tidak dapat dijadikan filter token.").to_string();
                     } else {
                         match crate::engine::query::parse_query(&tab.search_text) {
@@ -305,13 +333,14 @@ impl AsisLogApp {
                     }
                 });
             }
-            // Baris autocomplete history: tampil saat kolom fokus + ada yang cocok.
-            if search_focused && !tab.search_text.trim().is_empty() {
+            // Baris autocomplete history: tampil saat kolom fokus / aktif + ada yang cocok.
+            let show_sug = (search_focused || tab.sug_active) && !tab.search_text.trim().is_empty();
+            if show_sug {
                 let sug = crate::store::suggest_history(history, tab.search_text.trim(), 6);
                 if !sug.is_empty() {
-                    ui.horizontal_wrapped(|ui| {
+                    let mut apply: Option<HistEntry> = None;
+                    let resp = ui.horizontal_wrapped(|ui| {
                         ui.label(lang.tr("Riwayat:"));
-                        let mut apply: Option<HistEntry> = None;
                         for h in sug {
                             let short: String = h.query.chars().take(40).collect();
                             let tag = if h.regex { " .*" } else { "" };
@@ -319,15 +348,21 @@ impl AsisLogApp {
                                 apply = Some(h.clone());
                             }
                         }
-                        if let Some(h) = apply {
-                            tab.search_text = h.query.clone();
-                            tab.regex_on = h.regex;
-                            tab.case_sensitive = h.case_sensitive;
-                            tab.debounce_at =
-                                Some(Instant::now() + Duration::from_millis(150));
-                        }
-                    });
+                    }).response;
+                    if let Some(h) = apply {
+                        tab.search_text = h.query.clone();
+                        tab.regex_on = h.regex;
+                        tab.case_sensitive = h.case_sensitive;
+                        tab.debounce_at = None;
+                        tab.start_search(history);
+                        ctx.memory_mut(|m| m.request_focus(egui::Id::new("cari")));
+                    }
+                    tab.sug_active = search_focused || resp.hovered() || resp.contains_pointer();
+                } else {
+                    tab.sug_active = false;
                 }
+            } else {
+                tab.sug_active = false;
             }
             // ---- Filter + mode tampil + cakupan ----
             ui.horizontal_wrapped(|ui| {
@@ -335,7 +370,7 @@ impl AsisLogApp {
                 let w = (ui.available_width() - 420.0).clamp(120.0, 420.0);
                 ui.add(
                     egui::TextEdit::singleline(&mut tab.filter_text)
-                        .id_source("saring")
+                        .id(egui::Id::new("saring"))
                         .hint_text("ERROR -DEBUG")
                         .desired_width(w),
                 );
@@ -446,12 +481,12 @@ impl AsisLogApp {
         }
     }
 
-    /// Floating search HUD saat di Zen mode (C-B1).
+    /// Floating search HUD saat di Layar Penuh (C-B1).
     pub(crate) fn render_zen_search(&mut self, ctx: &egui::Context, cur_idx: usize) {
         let lang = self.lang;
         let tab = &mut self.tabs[cur_idx];
         let mut close = false;
-        egui::Window::new(lang.tr("Pencarian (Zen)"))
+        egui::Window::new(lang.tr("Pencarian (Layar Penuh)"))
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::RIGHT_TOP, [-20.0, 36.0])
@@ -459,7 +494,7 @@ impl AsisLogApp {
                 ui.horizontal(|ui| {
                     let re = ui.add(
                         egui::TextEdit::singleline(&mut tab.search_text)
-                            .id_source("cari")
+                            .id(egui::Id::new("cari"))
                             .hint_text(lang.tr("Cari ..."))
                             .desired_width(220.0),
                     );

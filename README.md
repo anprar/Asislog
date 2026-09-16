@@ -33,6 +33,8 @@ Pengguna tidak perlu menginstal Rust untuk **menjalankan** biner.
 
 ## Rilis portable (maintainer)
 
+Riwayat fitur tiap versi: lihat `CHANGELOG.md` (versi biner: `asislog --version`).
+
 Biner rilis tanpa jendela console, sudah dioptimasi ukuran (`opt-level=z`,
 LTO, strip ≈ 7 MB), berikon + metadata versi (via `build.rs` +
 `assets/asislog.ico`), lalu dikompresi UPX `--lzma` (≈ 2,55 MB; budget
@@ -47,9 +49,25 @@ Lokal (Windows):
 cargo build --release
 .\target\release\asislog.exe --version   # smoke test
 winget install -e --id UPX.UPX          # sekali saja
-upx --lzma --best .\target\release\asislog.exe
-Compress-Archive .\target\release\asislog.exe asislog-windows.zip -Force
+New-Item -ItemType Directory dist -Force | Out-Null
+Copy-Item .\target\release\asislog.exe .\dist\asislog-windows.exe
+upx --lzma --best .\dist\asislog-windows.exe
+Compress-Archive .\dist\asislog-windows.exe .\dist\asislog-windows.zip -Force
 ```
+
+### Packaging komunitas (opsional)
+
+Biner portabel sudah cukup untuk sebagian besar pengguna. Untuk manajer paket:
+
+| Manajer | Contoh instal | Catatan |
+|---|---|---|
+| **winget** | `winget install AsisLog` | butuh manifest di microsoft/winget-pkgs |
+| **Scoop** | `scoop install asislog` | bucket lokal / bucket publik |
+| **Chocolatey** | `choco install asislog` | butuh paket di chocolatey.org |
+| **AppImage (Linux)** | `./AsisLog.AppImage` | bungkus biner glibc dari CI |
+
+Manifest winget/scoop/choco belum dikirim upstream — kontribusi diterima.
+Biner tetap single-file: tidak perlu dependensi runtime.
 
 Verifikasi keaslian unduhan & Mitigasi Antivirus (Windows Defender SmartScreen / WDSI):
 
@@ -80,6 +98,20 @@ asislog count <FILE>               hitung total baris dan ukuran file instan men
 asislog --version                  tampilkan versi lalu keluar
 asislog --help                     tampilkan bantuan ringkas
 ```
+
+> [!NOTE]
+> **Catatan PowerShell**: `asislog.exe` adalah aplikasi GUI-subsystem
+> (tanpa jendela console), jadi PowerShell **tidak menunggu** selesai bila
+> output ditangkap ke variabel (`$o = & asislog count f.log` kembali
+> seketika dengan hasil kosong). Untuk scripting pakai salah satu pola ini:
+> ```powershell
+> cmd /c "asislog count C:\logs\app.log > hasil.txt 2>&1"
+> asislog count C:\logs\app.log | Out-String   # pipe memaksa tunggu
+> Start-Process .\asislog.exe -ArgumentList 'count','app.log' -Wait -NoNewWindow
+> ```
+> File **biner** (NUL > 5% di 8 KB pertama, mis. blob database bernama
+> `.log`) **ditolak jujur** oleh `count`/`grep` (exit 2 + pesan) — buka di
+> GUI dan pakai **Hex Peek** untuk file semacam itu.
 
 ## Penggunaan singkat
 
@@ -197,24 +229,33 @@ asislog --help                     tampilkan bantuan ringkas
 - **Bahasa / Language**: menu **Bahasa** di bilah atas beralih
   Indonesia ⇄ English seketika, tersimpan di `config.json` (portabel,
   tanpa instal ulang). Palet (`Ctrl+Shift+P`) → *Ganti bahasa /
-  Switch language* bisa dipakai dari mode Zen. CLI:
+  Switch language* bisa dipakai dari Layar Penuh. CLI:
   `asislog --lang en --help` atau `ASISLOG_LANG=en`.
   Format ekspor tiket Markdown stabil dua bahasa agar tetap bisa di-grep.
 - **Language**: the **Bahasa** menu in the top bar switches
   Indonesian ⇄ English instantly, persisted to portable `config.json`.
   Palette (`Ctrl+Shift+P`) → *Ganti bahasa / Switch language* also works
-  from Zen mode. CLI: `asislog --lang en --help` or `ASISLOG_LANG=en`.
+  from Full Screen mode. CLI: `asislog --lang en --help` or `ASISLOG_LANG=en`.
   First run (GUI) without saved config follows the OS locale (`LANG`/`LC_*`;
   English for unknown locales, Indonesian when undetectable as before —
   Windows display language needs OS APIs, so it stays Indonesian default).
   Panel hasil dan penanda bisa diubah ukurannya dengan menyeret pembatasnya;
   baris log yang panjang digulir mendatar agar tidak terpotong.
-- **Mode Zen (`F11`)**: Memadatkan seluruh bilah toolbar dan header 5-baris menjadi 1-baris ramping (22px) untuk memaksimalkan ruang baca log. Menekan `Ctrl+F` di mode Zen memunculkan jendela pencarian HUD melayang (floating search bar).
-- **Command Palette (`Ctrl+Shift+P`)**: Akses cepat ke seluruh fitur aplikasi melalui dialog pencarian fuzzy keyboard-first (buka file, simpan workspace, ganti tema, toggle Zen, ekspor, goto baris, scratchpad).
+- **Layar Penuh (`F11`)**: Memadatkan seluruh bilah toolbar dan header 5-baris menjadi 1-baris ramping (22px) untuk memaksimalkan ruang baca log. Menekan `Ctrl+F` di Layar Penuh memunculkan jendela pencarian HUD melayang (floating search bar).
+- **Command Palette (`Ctrl+Shift+P`)**: Akses cepat ke seluruh fitur aplikasi melalui dialog pencarian fuzzy keyboard-first (buka file, simpan workspace, ganti tema, toggle Layar Penuh, ekspor, goto baris, scratchpad).
 - **Histogram Waktu ERROR**: Panel interaktif di bawah viewport yang memetakan lonjakan frekuensi ERROR per menit. Klik pada bar histogram mana pun untuk melompatkan viewport langsung ke rentang waktu tersebut.
 - **Investigasi Top-N**: 1-klik untuk mengagregasi 10 error atau ID sesi/thread paling sering muncul dengan memori terkendali (< 20 MB). Tombol *Saring* instan mengubah error terpilih menjadi filter pencarian.
 - **Hex Peek**: Mode inspeksi biner aman untuk file log korup atau file non-teks, menampilkan alamat offset, 16 hex byte, dan karakter ASCII yang aman.
 - **Kolom SQL**: Pengurai otomatis struktur log query (Waktu, Sesi/Thread, Aksi SQL, Perintah Query) menjadi kolom tabel yang rapi dan mudah diinspeksi.
+- **Analisis (tombol Analisis / palet)**: paket analyzer ala LogViewPlus —
+  tab **Parser** (deteksi format otomatis JSON/SQL/generik, parser bawaan Java/bracket/Apache/syslog,
+  wizard pola regex + singkatan `{TS} {LVL} {MSG} {kolom} {kolom:regex}` dengan uji-cocok,
+  kolom kustom tersimpan di config),
+  tab **SQL-lite** (`SELECT koloms|*|COUNT(*) WHERE AND/OR/NOT = != ~ !~ > < >= <= GROUP BY ORDER BY count LIMIT`,
+  tanpa SELECT = filter WHERE; grafik bar Top-N + ekspor CSV; pindai dibatasi 2 jt baris pertama tab aktif),
+  tab **Gabung** (timeline 1-klik sortir-cap-waktu lintas semua tab + laporan skew antar server,
+  cari-pola di semua tab sekaligus, ekspor gabungan; maks 200 rb baris/file).
+  Jujur: SQL-lite BUKAN Transact-SQL penuh (tanpa JOIN, tanpa fungsi tanggal).
 - **Peek Preview Peta**: Arahkan kursor (hover) pada strip peta kepadatan di tepi kanan layar untuk melihat tooltip cuplikan baris asli secara instan.
 - **Zoom**: `Ctrl+=` / `Ctrl+-` / `Ctrl+0` (tersimpan di config).
 - **Scratchpad**: tombol **Catatan** — tab catatan + transform
@@ -276,4 +317,5 @@ asislog --help                     tampilkan bantuan ringkas
   1 GB lokal via `--ignored`). Lihat `BENCHMARK.md` untuk metodologi
   perbandingan jujur vs klogg.
 
-Lihat `asislog-agent-prompt.md` untuk spesifikasi awal.
+Lihat `docs/asislog-agent-prompt.md` untuk spesifikasi awal dan
+`docs/` untuk analisis kompetitif.

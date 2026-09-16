@@ -1,6 +1,60 @@
 // English comments: i18n Language switch (Indonesian / English), portable, no installer.
 // UI default is Indonesian (backward compatible). English via toolbar switch,
 // persisted in config.json as "id" / "en".
+// Third+ locales arrive as EXTERNAL JSON overrides (path in config):
+// {"Buka": "Open", ...} consulted before the built-in table, so a dozen
+// locales ship without code changes. Values are leaked once (bounded).
+
+use std::collections::HashMap;
+
+/// External locale overrides: Indonesian source -> replacement text.
+/// Applied to BOTH built-in languages (an override replaces the string).
+static LOCALE_OVR: std::sync::LazyLock<
+    std::sync::RwLock<std::collections::HashMap<String, &'static str>>,
+> = std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+
+fn locale_override(id: &str) -> Option<&'static str> {
+    LOCALE_OVR.read().ok()?.get(id).copied()
+}
+
+/// Install/replace the whole override table (e.g. from a locale file).
+/// Empty values are dropped (fall back to built-in).
+pub fn set_locale_overrides(map: std::collections::HashMap<String, String>) {
+    let mut ovr = HashMap::new();
+    for (k, v) in map {
+        if v.trim().is_empty() {
+            continue;
+        }
+        ovr.insert(k, Box::leak(v.into_boxed_str()) as &'static str);
+    }
+    if let Ok(mut w) = LOCALE_OVR.write() {
+        *w = ovr;
+    }
+}
+
+/// Drop all overrides (back to built-in ID/EN).
+pub fn clear_locale_overrides() {
+    if let Ok(mut w) = LOCALE_OVR.write() {
+        w.clear();
+    }
+}
+
+/// Number of active overrides (shown in Options).
+pub fn locale_override_count() -> usize {
+    LOCALE_OVR.read().map(|r| r.len()).unwrap_or(0)
+}
+
+/// Load overrides from a JSON object file `{"source": "text", ...}`.
+/// Returns the number of entries installed.
+pub fn load_locale_file(path: &std::path::Path) -> Result<usize, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("Gagal membaca locale: {}", e))?;
+    let map: std::collections::HashMap<String, String> = serde_json::from_str(&text)
+        .map_err(|_| String::from("Locale JSON tidak valid (perlu {\"sumber\": \"teks\"})."))?;
+    let n = map.len();
+    set_locale_overrides(map);
+    Ok(n)
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Lang {
@@ -115,7 +169,11 @@ impl Lang {
 
     /// Translate an Indonesian source string (or template with `{}`/`{:...}`).
     /// Unknown keys fall back to the Indonesian source (forward compatible).
+    /// External locale overrides win over everything (both languages).
     pub fn tr(self, id: &str) -> &str {
+        if let Some(s) = locale_override(id) {
+            return s;
+        }
         if self == Lang::Id {
             return id;
         }
@@ -124,7 +182,7 @@ impl Lang {
             "Buka" => "Open",
             "Arsip" => "Archive",
             "Semua" => "All",
-            "Riwayat v" => "History v",
+            "Riwayat" => "History",
             "Favorit:" => "Favorites:",
             "Terakhir dibuka:" => "Recent:",
             "Belum ada riwayat." => "No history yet.",
@@ -135,14 +193,14 @@ impl Lang {
             "Jadikan favorit" => "Make favorite",
             "Bersihkan riwayat" => "Clear history",
             "Bersihkan riwayat?" => "Clear history?",
-            "URL/teks v" => "URL/text v",
+            "URL/teks" => "URL/text",
             "Buka URL…" => "Open URL…",
             "Tempel teks…" => "Paste text…",
-            "Workspace v" => "Workspace v",
+            "Workspace" => "Workspace",
             "Simpan workspace…" => "Save workspace…",
             "Buka workspace…" => "Open workspace…",
-            "Ganti tab v" => "Switch tab v",
-            "Keluar Zen (F11)" => "Exit Zen (F11)",
+            "Ganti tab" => "Switch tab",
+            "Keluar Layar Penuh (F11)" => "Exit Full Screen (F11)",
             "Kembalikan bilah kontrol lengkap (F11)" => "Restore full toolbar (F11)",
             "Buka HUD pencarian melayang" => "Open floating search HUD",
             "Unduh http(s) ke temp lalu buka" => "Download http(s) to temp then open",
@@ -154,15 +212,19 @@ impl Lang {
                 "Open N logs + filter + highlight set from file"
             }
             "Daftar pintasan (F1)" => "Shortcut list (F1)",
-            "Mode Zen: sembunyikan 5 baris kontrol ke 1 baris ramping (F11)" => {
-                "Zen mode: collapse 5 control rows into 1 slim row (F11)"
+            "Layar Penuh: sembunyikan 5 baris kontrol ke 1 baris ramping (F11)" => {
+                "Full screen: collapse 5 control rows into 1 slim row (F11)"
             }
             "Cari (Ctrl+F)" => "Search (Ctrl+F)",
             "Palet (Ctrl+Shift+P)" => "Palette (Ctrl+Shift+P)",
             "Palet" => "Palette",
-            "Zen (F11)" => "Zen (F11)",
+            "Layar Penuh (F11)" => "Full Screen (F11)",
             "Tema" => "Theme",
+            "Tema:" => "Theme:",
+            "Font Log:" => "Log Font:",
+            "Font UI:" => "UI Font:",
             "Bahasa" => "Language",
+            "Bahasa:" => "Language:",
             "Bahasa/Language" => "Language",
             "Tab: {}" => "Tab: {}",
             "File favorit tak ditemukan: {}" => "Favorite file not found: {}",
@@ -212,7 +274,7 @@ impl Lang {
                 "File encoding (Automatic = BOM + sample detection)"
             }
             // ---- search ----
-            "Preset v" => "Presets v",
+            "Preset" => "Presets",
             "Bawaan:" => "Built-in:",
             "Belum ada simpanan." => "No saved presets.",
             "Hapus preset" => "Delete preset",
@@ -222,6 +284,21 @@ impl Lang {
             }
             "Peka huruf besar/kecil (Alt+C)" => "Case sensitive (Alt+C)",
             "Perlakukan query sebagai regex (Alt+R)" => "Treat query as regex (Alt+R)",
+            "Peka huruf besar/kecil" => "Case sensitive",
+            "Perlakukan query sebagai regex" => "Treat query as regex",
+            "Mode regex" => "Regex mode",
+            "Keluar aplikasi" => "Quit application",
+            "Muat ulang file" => "Reload file",
+            "Awal file (tanpa Ctrl)" => "Start of file (no Ctrl)",
+            "Akhir file (tanpa Ctrl)" => "End of file (no Ctrl)",
+            "Satu layar ke bawah (Spasi)" => "One screen down (Space)",
+            "Satu layar ke atas (Shift+Spasi)" => "One screen up (Shift+Space)",
+            "Tab berikut (Ctrl+PgDn)" => "Next tab (Ctrl+PgDn)",
+            "Tab sebelum (Ctrl+PgUp)" => "Previous tab (Ctrl+PgUp)",
+            "Buka file log dulu — belum ada tab terbuka." => {
+                "Open a log file first — no tab open yet."
+            }
+            "Dimuat ulang: {}." => "Reloaded: {}.",
             "Bersihkan pencarian (Esc)" => "Clear search (Esc)",
             "Hasil sebelumnya (Shift+F3)" => "Previous result (Shift+F3)",
             "Hasil berikutnya (F3)" => "Next result (F3)",
@@ -230,6 +307,12 @@ impl Lang {
             "Tidak ada kecocokan \"{}\"" => "No matches for \"{}\"",
             "{} hasil ({})" => "{} results ({})",
             "(dibatasi 200 rb)" => "(limited to 200k)",
+            "(dibatasi {})" => "(limited {})",
+            "Muat {} berikutnya" => "Load next {}",
+            "Pindai {} hasil berikutnya (total eksak {} — tanpa batas RAM)" => {
+                "Scan the next {} results ({} exact total — memory-bounded)"
+            },
+            "{} baris ({} rentang)" => "{} lines ({} ranges)",
             "Sorot" => "Highlight",
             "Saring" => "Filter",
             "Tampilkan semua baris, sorot kecocokan (F3 untuk lompat)" => {
@@ -297,7 +380,7 @@ impl Lang {
             }
             "Filter aktif: {} · {}/{} baris" => "Active filter: {} · {}/{} lines",
             "Hapus" => "Delete",
-            "Pencarian (Zen)" => "Search (Zen)",
+            "Pencarian (Layar Penuh)" => "Search (Full Screen)",
             "Cari ..." => "Search ...",
             "Huruf besar/kecil" => "Case",
             "Regex" => "Regex",
@@ -330,7 +413,7 @@ impl Lang {
             "Hapus snapshot ini" => "Delete this snapshot",
             "Panel belah (dual-pane hasil)" => "Split panel (dual-pane results)",
             "Bantuan / daftar pintasan" => "Help / shortcut list",
-            "Mode Zen" => "Zen mode",
+            "Layar Penuh" => "Full Screen",
             "Hasil berikutnya" => "Next result",
             "Hasil sebelumnya" => "Previous result",
             "Hasil berikut/plin (gaya vi)" => "Next/prev result (vi style)",
@@ -404,6 +487,41 @@ impl Lang {
                 "Results + context as paste-ready Markdown"
             }
             "Ekspor dibatalkan." => "Export cancelled.",
+            "Ekspor SEMUA cocok (streaming)" => "Export ALL matches (streaming)",
+            "Tanpa batas tampil — tulis langsung ke disk." => {
+                "No display cap — writes straight to disk."
+            }
+            "Tampil dipangkas — ekspor biasa ikut terpangkas." => {
+                "Display is truncated — plain export is truncated too."
+            }
+            "Mengekspor streaming di latar…" => "Streaming export in background…",
+            "Query kosong — isi kolom Cari dulu." => "Empty query — fill the Search field first.",
+            "Pembaruan & crash" => "Updates & crashes",
+            "URL cek versi (kosong = mati):" => "Version check URL (empty = off):",
+            "File teks polos berisi versi terbaru, mis. 0.2.0." => {
+                "Plain text file holding the newest version, e.g. 0.2.0."
+            }
+            "Cek otomatis saat start" => "Check automatically at startup",
+            "Periksa sekarang" => "Check now",
+            "Pengecekan versi berjalan…" => "Version check running…",
+            "Masih berjalan — tunggu selesai." => "Still running — please wait.",
+            "Versi baru tersedia: {} (kini {})." => "New version available: {} (current {}).",
+            "Sudah versi terbaru ({})." => "Already newest ({}).",
+            "Gagal cek versi: {}" => "Version check failed: {}",
+            "Locale eksternal: {} override." => "External locale: {} overrides.",
+            "Locale eksternal (JSON):" => "External locale (JSON):",
+            "Muat file…" => "Load file…",
+            "Gagal muat locale: {}" => "Failed to load locale: {}",
+            "Laporan crash ditemukan" => "Crash reports found",
+            "AsisLog pernah crash. Isi membantu diagnosis; kirim ke pengelola bila perlu." => {
+                "AsisLog crashed before. Contents help diagnosis; send to the maintainer if needed."
+            }
+            "Salin isi" => "Copy contents",
+            "Buka folder crash" => "Open crash folder",
+            "Hapus laporan" => "Delete reports",
+            "Nanti" => "Later",
+            "Crash disalin." => "Crash copied.",
+            "Laporan crash dihapus." => "Crash reports deleted.",
             "Cakupan pencarian (baris)" => "Search scope (lines)",
             "Cari hanya dalam rentang baris ini. Hemat untuk file besar." => {
                 "Search only within this line range. Saves time on huge files."
@@ -470,6 +588,7 @@ impl Lang {
             }
             "Buka sebagai file" => "Open as file",
             "Teks kosong." => "Text is empty.",
+            "Berkas versi kosong." => "Version file is empty.",
             "Gagal menulis temp: {}" => "Failed to write temp: {}",
             "Scratchpad (catatan + transform)" => "Scratchpad (notes + transform)",
             "Catatan, token, JSON, JWT, SQL…" => "Notes, tokens, JSON, JWT, SQL…",
@@ -511,7 +630,7 @@ impl Lang {
             "Klik untuk lompat ke baris waktu ini" => "Click to jump to this time",
             "Ke akhir file (Ctrl+End)" => "Go to end of file (Ctrl+End)",
             "Baris {} / {} · {}%" => "Line {} / {} · {}%",
-            "Salin v" => "Copy v",
+            "Salin" => "Copy",
             "Salin baris ini" => "Copy this line",
             "Baris disalin ke papan klip." => "Line copied to clipboard.",
             "Salin 50 baris" => "Copy 50 lines",
@@ -527,7 +646,7 @@ impl Lang {
             "{}/{} · {}%" => "{}/{} · {}%",
             "Salin sebagai path" => "Copy as path",
             "Salin \"file:baris\" untuk referensi" => "Copy \"file:line\" for reference",
-            "Salin blok v" => "Copy block v",
+            "Salin blok" => "Copy block",
             "Salin blok SQL" => "Copy SQL block",
             "Statement --INSERT-…/INSERT INTO… s.d. go" => "Statement --INSERT-…/INSERT INTO… to go",
             "Salin blok transaksi" => "Copy transaction block",
@@ -545,8 +664,8 @@ impl Lang {
             "Palet Perintah" => "Command palette",
             "Ketik nama perintah..." => "Type a command name...",
             "Tidak ada aksi yang cocok." => "No matching actions.",
-            "Mode Zen aktif (F11 untuk kembali)." => "Zen mode on (F11 to exit).",
-            "Mode Zen dinonaktifkan." => "Zen mode off.",
+            "Layar Penuh aktif (F11 untuk kembali)." => "Full Screen on (F11 to exit).",
+            "Layar Penuh dinonaktifkan." => "Full Screen off.",
             // ---- highlight ----
             "Set highlight (viewport)" => "Highlight sets (viewport)",
             "Set bernama per produk; aturan hanya untuk baris terlihat." => {
@@ -606,16 +725,26 @@ impl Lang {
             "Log" => "Log",
             "Ekspor" => "Export",
             "Alat" => "Tools",
+            "Atau seret file ke jendela ini · Ctrl+O · Ctrl+Shift+P untuk palet" => {
+                "Or drop a file here · Ctrl+O · Ctrl+Shift+P for palette"
+            }
+            "F11 Layar Penuh · Ctrl+F cari · F1 pintasan" => {
+                "F11 Full Screen · Ctrl+F search · F1 shortcuts"
+            }
             "Investigasi" => "Investigate",
             "Bantuan" => "Help",
             "Jadikan filter pencarian" => "Make search filter",
             // ---- palette titles (Buka file log… already above) ----
             "Fokus pencarian" => "Focus search",
-            "Toggle Mode Zen (Kepadatan)" => "Toggle Zen mode (density)",
+            "Toggle Layar Penuh (Kepadatan)" => "Toggle Full Screen (density)",
             "Toggle Ikuti log (LIVE)" => "Toggle follow log (LIVE)",
             "Ke baris / cap waktu…" => "Go to line / timestamp…",
             "Ekspor hasil pencarian…" => "Export search results…",
             "Tiket Markdown Jira (1-klik)" => "Jira Markdown ticket (1-click)",
+            "Lipat Baris / Word Wrap (Toggle)" => "Word wrap (toggle)",
+            "Cari Cepat (QuickFind)" => "Quick find",
+            "Buka Folder File (Explorer)" => "Open file folder (Explorer)",
+            "Buka File di Aplikasi Default" => "Open file in default app",
             "Tambah / Hapus Penanda baris" => "Add / remove line bookmark",
             "Panel Penanda" => "Bookmarks panel",
             "Catatan / Scratchpad (Base64/JWT/SQL)" => "Notes / Scratchpad (Base64/JWT/SQL)",
@@ -644,6 +773,85 @@ impl Lang {
             "Hex Peek (Mode Inspeksi Biner Aman)" => "Hex Peek (Safe binary inspection)",
             "Menampilkan 512 byte mulai offset 0x{}:" => {
                 "Showing 512 bytes from offset 0x{}:"
+            }
+            // ---- analyzer: parser / SQL-lite / merge ----
+            "Analisis Log (Parser · SQL · Gabung)" => "Log analysis (Parser · SQL · Merge)",
+            "Analisis Log (Parser/SQL/Gabung)" => "Log analysis (Parser/SQL/Merge)",
+            "Analisis" => "Analyze",
+            "Parser" => "Parser",
+            "SQL-lite" => "SQL-lite",
+            "Gabung" => "Merge",
+            "Deteksi format tab ini" => "Detect this tab's format",
+            "Tab kosong / belum terindeks." => "Empty tab / not indexed yet.",
+            "Otomatis (JSON → SQL → generik)" => "Auto (JSON → SQL → generic)",
+            "Kustom" => "Custom",
+            "Otomatis: tiap baris dicoba JSON → kolom SQL → pola generik; kolom kustom di bawah tetap ditambahkan ke tabel SQL." => {
+                "Auto: each line is tried as JSON → SQL columns → generic pattern; custom columns below are still added to the SQL table."
+            }
+            "Parser kustom tersimpan:" => "Saved custom parsers:",
+            "Belum ada. Buat lewat wizard di bawah." => "None yet. Create one with the wizard below.",
+            "Pakai" => "Use",
+            "Hapus parser" => "Delete parser",
+            "Wizard parser:" => "Parser wizard:",
+            "Contoh baris:" => "Sample line:",
+            "Ambil baris terpilih" => "Take selected line",
+            "Pola (regex + (?P<nama>...) atau singkatan {TS} {LVL} {MSG} {kolom} {kolom:regex}):" => {
+                "Pattern (regex + (?P<name>...) or shorthand {TS} {LVL} {MSG} {col} {col:regex}):"
+            }
+            "Uji pola" => "Test pattern",
+            "Simpan parser" => "Save parser",
+            "Pola valid tapi TIDAK cocok dengan contoh." => {
+                "Pattern is valid but does NOT match the sample."
+            }
+            "Cocok! Kolom: {}" => "Match! Columns: {}",
+            "Parser tersimpan. Kolom: {}" => "Parser saved. Columns: {}",
+            "Kolom: {}" => "Columns: {}",
+            "Kolom kustom (tambah ke tabel SQL, pisah koma):" => {
+                "Custom columns (added to the SQL table, comma-separated):"
+            }
+            "Mis. host, status, session — diambil dari parser/JSON/k=v bila ada, kosong bila tidak." => {
+                "E.g. host, status, session — taken from parser/JSON/k=v when present, empty otherwise."
+            }
+            "Dialek SQL-lite (bukan Transact-SQL penuh): SELECT koloms / * / COUNT(*) · WHERE AND OR NOT = != ~ !~ > < >= <= · GROUP BY · ORDER BY count DESC · LIMIT. Tanpa SELECT = filter WHERE saja. Pindai dibatasi 2 jt baris pertama tab aktif." => {
+                "SQL-lite dialect (not full Transact-SQL): SELECT cols / * / COUNT(*) · WHERE AND OR NOT = != ~ !~ > < >= <= · GROUP BY · ORDER BY count DESC · LIMIT. No SELECT = WHERE filter only. Scan limited to the active tab's first 2M lines."
+            }
+            "Jalankan di tab aktif" => "Run on active tab",
+            "Ekspor CSV" => "Export CSV",
+            "Tidak ada tab terbuka." => "No tabs open.",
+            "Grafik:" => "Chart:",
+            "Hasil ({} baris tampil):" => "Results ({} rows shown):",
+            "…dan {} baris lain (ekspor CSV untuk semua)." => {
+                "…and {} more rows (export CSV for all)."
+            }
+            "CSV tersimpan: {} baris." => "CSV saved: {} rows.",
+            "Pindai {} / {} · {} cocok." => "Scanned {} / {} · {} matched.",
+            "dibatasi 2 jt baris" => "capped at 2M lines",
+            "baris dipangkas LIMIT" => "rows trimmed by LIMIT",
+            "Gabung N log jadi 1 timeline sortir-cap-waktu (maks 200 rb baris/file, tampil 5 rb). Multi-cari memakai mesin yang sama dengan pencarian tab." => {
+                "Merge N logs into 1 timestamp-sorted timeline (max 200k lines/file, 5k shown). Multi-search uses the same engine as tab search."
+            }
+            "Bangun timeline semua tab" => "Build timeline of all tabs",
+            "Ekspor gabungan" => "Export merge",
+            "Gabungan tersimpan: {} baris." => "Merge saved: {} rows.",
+            "Cakupan & skew waktu:" => "Coverage & time skew:",
+            "Timeline ({} baris):" => "Timeline ({} rows):",
+            "Timeline: {} baris dari {} file (maks 200 rb/file)." => {
+                "Timeline: {} rows from {} files (max 200k/file)."
+            }
+            "Cari di semua tab:" => "Search all tabs:",
+            "Cari semua" => "Search all",
+            "Isi dulu pola pencarian." => "Enter a search pattern first.",
+            "Total {} hasil di {} file." => "Total {} results in {} files.",
+            "File {} tidak lagi terbuka." => "File {} is no longer open.",
+            "'+' = dipangkas 50 rb/file; buka tab untuk pindaian penuh + panel hasil." => {
+                "'+' = truncated at 50k/file; open the tab for a full scan + results panel."
+            }
+            "Terdeteksi: {} ({}% dari {} baris sampel)." => {
+                "Detected: {} ({}% of {} sample lines)."
+            }
+            "Nama parser tidak boleh kosong." => "Parser name cannot be empty.",
+            "Pola harus punya minimal 1 grup bernama (?P<nama>...)." => {
+                "Pattern needs at least 1 named group (?P<name>...)."
             }
             // ---- misc status ----
             "Ketik query dulu, lalu tekan 1-9 untuk label warna." => {
@@ -724,6 +932,135 @@ impl Lang {
             "Bahasa diganti ke Indonesia. / Language switched to Indonesian." => {
                 "Language switched to Indonesian. / Bahasa diganti ke Indonesia."
             }
+            // ---- P0/P1 additions (wrap, selection, quickfind, options, tabs) ----
+            "Lipat (W)" => "Wrap (W)",
+            "Word wrap: baris panjang dilipat ke lebar jendela" => {
+                "Word wrap: long lines fold to the window width"
+            }
+            "Lipat baris (word wrap)" => "Word wrap",
+            "Lipat baris (word wrap) default untuk tab baru" => {
+                "Word wrap by default for new tabs"
+            }
+            "Seleksi disalin ke papan klip." => "Selection copied to clipboard.",
+            "Pilih semua baris" => "Select all lines",
+            "Cari cepat (QuickFind)" => "Quick find",
+            "Cari cepat:" => "Quick find:",
+            "Ketik untuk cari instan… (Enter berikutnya)" => {
+                "Type to find instantly… (Enter for next)"
+            }
+            "Sebelumnya (Shift+Enter)" => "Previous (Shift+Enter)",
+            "Berikutnya (Enter)" => "Next (Enter)",
+            "Sampai akhir file — kembali ke awal." => "Reached end of file — wrapped to start.",
+            "Sampai awal file — kembali ke akhir." => "Reached start of file — wrapped to end.",
+            "Tambah seleksi ke pencarian (OR)" => "Add selection to search (OR)",
+            "Kecualikan seleksi dari pencarian" => "Exclude selection from search",
+            "Ganti pencarian dengan seleksi" => "Replace search with selection",
+            "Tidak ada teks terpilih untuk ditambahkan (klik baris / pilih kata dulu)." => {
+                "No selected text to add (click a line / select a word first)."
+            }
+            "+ Seleksi (OR)" => "+ Selection (OR)",
+            "- Seleksi" => "- Selection",
+            "Tambah teks terpilih ke query pencarian (Shift+A)" => {
+                "Add selected text to the search query (Shift+A)"
+            }
+            "Kecualikan teks terpilih dari pencarian (Shift+E)" => {
+                "Exclude selected text from the search (Shift+E)"
+            }
+            "Folder" => "Folder",
+            "Buka folder file ini di File Explorer" => "Open this file's folder in File Explorer",
+            "Buka di aplikasi" => "Open in app",
+            "Buka file ini di aplikasi default OS" => "Open this file in the OS default app",
+            "Path penuh" => "Full path",
+            "Salin path penuh file ini" => "Copy this file's full path",
+            "Path penuh disalin." => "Full path copied.",
+            "Folder dibuka di Explorer." => "Folder opened in Explorer.",
+            "Folder dibuka di Finder." => "Folder opened in Finder.",
+            "Folder dibuka." => "Folder opened.",
+            "Gagal membuka Explorer: {}" => "Failed to open Explorer: {}",
+            "Gagal membuka Finder: {}" => "Failed to open Finder: {}",
+            "Gagal membuka folder: {}" => "Failed to open folder: {}",
+            "Dibuka di aplikasi default." => "Opened in the default app.",
+            "Gagal membuka aplikasi default: {}" => "Failed to open default app: {}",
+            "Path tanpa folder." => "Path has no folder.",
+            "File sudah terbuka — pindah ke tab-nya." => "File already open — switched to its tab.",
+            "Tutup tab ini" => "Close this tab",
+            "Tutup tab lainnya" => "Close other tabs",
+            "Tutup semua tab" => "Close all tabs",
+            "Buka folder file" => "Open file folder",
+            "Pengaturan" => "Settings",
+            "Pengaturan AsisLog…" => "AsisLog settings…",
+            "Pengaturan AsisLog (Ctrl+,)" => "AsisLog settings (Ctrl+,)",
+            "Pengaturan disimpan." => "Settings saved.",
+            "Pemantauan file (LIVE)" => "File watching (LIVE)",
+            "Interval poll (ms):" => "Poll interval (ms):",
+            "Lebih kecil = lebih responsif, lebih besar = hemat CPU. Default 250 ms." => {
+                "Smaller = more responsive, larger = saves CPU. Default 250 ms."
+            }
+            "Ada pintasan dobel — dua aksi akan terpicu bersamaan." => {
+                "Duplicate shortcut — two actions would fire together."
+            }
+            "DOBEL: dipakai aksi lain juga" => "DUPLICATE: also used by another action",
+            "Tutup tab kini" => "Close current tab",
+            "Tab 1" => "Tab 1",
+            "Tab 2" => "Tab 2",
+            "Tab 3" => "Tab 3",
+            "Tab 4" => "Tab 4",
+            "Tab 5" => "Tab 5",
+            "Tab 6" => "Tab 6",
+            "Tab 7" => "Tab 7",
+            "Tab 8" => "Tab 8",
+            "Tab terakhir" => "Last tab",
+            // P1-12 state machine + P1-13 options penuh + multi-select + tab.
+            "Mencari…" => "Searching…",
+            "Auto-refresh…" => "Auto-refreshing…",
+            "Statis" => "Static",
+            "Dibatasi" => "Truncated",
+            "Mesin pencari" => "Search engine",
+            "Thread (0=auto):" => "Threads (0=auto):",
+            "Ganti thread berlaku setelah restart bila pencarian pernah jalan." => {
+                "Thread change applies after restart if a search already ran."
+            }
+            "Maks hasil (0=default):" => "Max hits (0=default):",
+            "Chunk pindai MiB (0=default):" => "Scan chunk MiB (0=default):",
+            "Cache pola (0=default):" => "Pattern cache (0=default):",
+            "Default: 200 rb hasil, 4 MiB chunk, 8 pola." => {
+                "Defaults: 200K hits, 4 MiB chunk, 8 patterns."
+            }
+            "Tiap hasil ±24 B RAM; 10 jt ≈ 240 MB. Jutaan match: pakai Ekspor SEMUA (streaming)." => {
+                "Each hit ≈24 B RAM; 10M ≈ 240 MB. For millions of matches use Export ALL (streaming)."
+            }
+            "Watch native (OS event) + polling sebagai fallback." => {
+                "Native watch (OS events) + polling fallback."
+            }
+            "Watch native: aktif (event OS memicu poll segera)." => {
+                "Native watch: on (OS events trigger an immediate poll)."
+            }
+            "Watch native: mati (polling saja)." => {
+                "Native watch: off (polling only)."
+            }
+            "Pengaturan disimpan. Thread baru berlaku setelah restart." => {
+                "Settings saved. New thread count applies after restart."
+            }
+            "Pindahkan ke kiri" => "Move left",
+            "Pindahkan ke kanan" => "Move right",
+            "Ubah nama tab…" => "Rename tab…",
+            "Ubah nama tab" => "Rename tab",
+            "Nama tab (kosong = nama file):" => "Tab name (empty = file name):",
+            "Ctrl+klik: tambah/hapus baris ke seleksi." => {
+                "Ctrl+click: add/remove lines to selection."
+            }
+            "seleksi kata" => "word selection",
+            "seleksi teks" => "text selection",
+            "Tentang AsisLog" => "About AsisLog",
+            "Tentang AsisLog (versi + log fitur)" => "About AsisLog (version + feature log)",
+            "Batas & catatan jujur:" => "Limits & honest notes:",
+            "SQL-lite: maks 2 jt baris pertama · Gabung timeline: 200 rb baris/file · Regex fancy: 256 KB/baris · Hyperscan/Vectorscan tidak tersedia di Windows (NO-GO). Ekspor streaming tanpa batas tampil." => {
+                "SQL-lite: max first 2M lines · Timeline merge: 200k lines/file · Fancy regex: 256 KB/line · Hyperscan/Vectorscan not available on Windows (NO-GO). Streaming export is uncapped."
+            }
+            "Versi disalin." => "Version copied.",
+            "Salin versi" => "Copy version",
+            "Log fitur (CHANGELOG.md):" => "Feature log (CHANGELOG.md):",
+            "Versi {}" => "Version {}",
             _ => id,
         }
     }
@@ -746,6 +1083,10 @@ impl Lang {
             // NOTE: no prefix here may shadow a TEMPLATE_PAIRS shape with a
             // worse partial translation (locked by test). Prefix rests must
             // already be language-neutral (paths, numbers, English IO errors).
+            ("Gagal membuka Explorer", "Failed to open Explorer"),
+            ("Gagal membuka Finder", "Failed to open Finder"),
+            ("Gagal membuka folder", "Failed to open folder"),
+            ("Gagal membuka aplikasi default", "Failed to open default app"),
             ("Membuka ", "Opening "),
             ("File favorit tak ditemukan", "Favorite file not found"),
             ("Gagal ", "Failed "),
@@ -764,8 +1105,8 @@ impl Lang {
             ("Mengunduh…", "Downloading…"),
             ("LIVE dijeda", "LIVE paused"),
             ("memantau tiap 500 ms", "watching every 500 ms"),
-            ("Mode Zen aktif", "Zen mode on"),
-            ("Mode Zen dinonaktifkan", "Zen mode off"),
+            ("Layar Penuh aktif", "Full Screen on"),
+            ("Layar Penuh dinonaktifkan", "Full Screen off"),
             ("Zoom ", "Zoom "),
             ("File dipotong/dirotasi", "File truncated/rotated"),
             ("File bertambah", "File grew"),
@@ -808,6 +1149,14 @@ impl Lang {
             ("Lompat ke baris", "Jump to line"),
             ("Pos: baris", "Pos: line"),
             ("Cari: ", "Search: "),
+            ("Pilihan melebihi", "Selection exceeds"),
+            ("Seleksi disalin", "Selection copied"),
+            ("Folder dibuka", "Folder opened"),
+            ("Dibuka di aplikasi", "Opened in app"),
+            ("Path penuh disalin", "Full path copied"),
+            ("File sudah terbuka", "File already open"),
+            ("Tutup tab", "Close tab"),
+            ("Pengaturan disimpan", "Settings saved"),
         ];
         for (id_pre, en_pre) in PREFIXES {
             if let Some(rest) = msg.strip_prefix(id_pre) {
@@ -867,10 +1216,27 @@ const TEMPLATE_PAIRS: &[(&str, &str)] = &[
     ("Xz tidak valid: {}", "Invalid xz: {}"),
     ("7z tidak valid: {}", "Invalid 7z: {}"),
     ("Mengekspor {} / {} hasil…", "Exporting {} / {} results…"),
+    ("Mengekspor streaming: {} ditulis…", "Streaming export: {} written…"),
+    ("Query tidak valid: {}", "Invalid query: {}"),
     ("Penanda baris {} akan dihapus permanen (tak bisa dibatalkan).",
      "Bookmark on line {} will be permanently deleted (cannot be undone)."),
     ("Penanda ditambahkan di baris {}.", "Bookmark added on line {}."),
     ("Tiket disimpan ({} hasil): {}", "Ticket saved ({} results): {}"),
+    ("Sampai akhir file — kembali ke awal.", "Reached end of file — wrapped to start."),
+    ("Sampai awal file — kembali ke akhir.", "Reached start of file — wrapped to end."),
+    ("Gagal membuka Explorer: {}", "Failed to open Explorer: {}"),
+    ("Gagal membuka Finder: {}", "Failed to open Finder: {}"),
+    ("Gagal membuka folder: {}", "Failed to open folder: {}"),
+    ("Gagal membuka aplikasi default: {}", "Failed to open default app: {}"),
+    ("Pola parser tidak valid: {}", "Invalid parser pattern: {}"),
+    ("Regex parser gagal: {}", "Parser regex failed: {}"),
+    ("Grup '{}' tanpa pola.", "Group '{}' has no pattern."),
+    ("'{}' kata kunci, bukan kolom.", "'{}' is a keyword, not a column."),
+    ("File biner terdeteksi ({} NUL di 8 KB pertama). Hitungan baris tak valid — gunakan Hex Peek.",
+     "Binary file detected ({} NULs in first 8 KB). Line counts are invalid — use Hex Peek."),
+    ("Muat {} berikutnya", "Load next {}"),
+    ("Pindai {} hasil berikutnya (total eksak {} — tanpa batas RAM)",
+     "Scan the next {} results ({} exact total — memory-bounded)"),
 ];
 
 /// Match `msg` against one ID template; on success rebuild the EN
@@ -942,6 +1308,39 @@ mod tests {
         let en = Lang::En;
         assert_eq!(en.tr("Kalimat tak dikenal XYZ 123"), "Kalimat tak dikenal XYZ 123");
         assert_eq!(Lang::Id.tr("Buka"), "Buka");
+    }
+
+    #[test]
+    fn locale_override_wins_and_resets() {
+        // Overrides beat BOTH built-in languages, then clear cleanly.
+        // NOTE: tests run in parallel in one process — use exotic keys no
+        // other test touches, and always clear at the end.
+        let mut m = HashMap::new();
+        m.insert("Kunci proba XYZ".to_string(), "Probe key XYZ".to_string());
+        m.insert("Kosong proba".to_string(), "   ".to_string()); // dropped
+        set_locale_overrides(m);
+        assert_eq!(locale_override_count(), 1);
+        assert_eq!(Lang::Id.tr("Kunci proba XYZ"), "Probe key XYZ");
+        assert_eq!(Lang::En.tr("Kunci proba XYZ"), "Probe key XYZ");
+        assert_eq!(Lang::En.tr("Buka"), "Open"); // built-in untouched
+        clear_locale_overrides();
+        assert_eq!(locale_override_count(), 0);
+        assert_eq!(Lang::En.tr("Kunci proba XYZ"), "Kunci proba XYZ");
+    }
+
+    #[test]
+    fn locale_file_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("nl.json");
+        std::fs::write(&p, r#"{"Tutup proba": "Sluiten", "bad": 123}"#).unwrap();
+        // Non-object values are rejected, not half-loaded.
+        assert!(load_locale_file(&p).is_err());
+        assert_eq!(locale_override_count(), 0);
+        std::fs::write(&p, r#"{"Tutup proba": "Sluiten"}"#).unwrap();
+        assert_eq!(load_locale_file(&p).unwrap(), 1);
+        assert_eq!(Lang::Id.tr("Tutup proba"), "Sluiten");
+        clear_locale_overrides();
+        assert!(load_locale_file(&dir.path().join("hilang.json")).is_err());
     }
 
     #[test]
@@ -1135,6 +1534,9 @@ mod tests {
         "src/engine/marks.rs",
         "src/engine/scratch.rs",
         "src/engine/query.rs",
+        "src/engine/parser.rs",
+        "src/engine/squery.rs",
+        "src/engine/merge.rs",
         "src/engine/decode.rs",
         "src/engine/follow.rs",
         "src/store.rs",
@@ -1144,6 +1546,7 @@ mod tests {
         "src/app/jobs_search.rs",
         "src/app/state.rs",
         "src/app/ui.rs",
+        "src/app/ui_analyze.rs",
         "src/app/ui_chrome.rs",
         "src/app/ui_dialogs.rs",
         "src/app/ui_highlight.rs",
@@ -1400,6 +1803,8 @@ mod tests {
         const IDENTITY_TEMPLATES: &[&str] = &[
             // Pure numbers/symbols: nothing to translate.
             "{}/{} · {}%",
+            // Version label: "v" + version + info glyph, identical in EN.
+            "v{} · i",
         ];
         let en = Lang::En;
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));

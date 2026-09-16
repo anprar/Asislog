@@ -12,7 +12,7 @@ use crate::engine::filter::{parse_filter, ParsedFilter};
 use crate::engine::follow::{check_follow, load_identity, FollowEvent};
 use crate::engine::index::{self, SparseIndex};
 use crate::engine::search::{self, CacheKey, FileRev, Hit, SearchCache};
-use crate::engine::{format_count, format_size, BlockKind, BookmarkColor, Doc};
+use crate::engine::{format_count, format_size, BlockKind, BookmarkColor, Doc, WideLineReader};
 use crate::store::{HighlightRule, HighlightSet, HistEntry, Preset};
 use crate::ui::{
     dialogs::parse_goto,
@@ -37,6 +37,49 @@ pub(crate) struct SearchJobParams {
 /// True when the job must abort: superseded query (gen) or tab closed (cancel).
 fn job_stale(gen_shared: &Arc<AtomicU64>, gen: u64, cancel: &Arc<AtomicBool>) -> bool {
     cancel.load(Ordering::Relaxed) || gen_shared.load(Ordering::Relaxed) != gen
+}
+
+/// Wide (UTF-16) decode helper for search: decode raw bytes (no \r strip
+/// needed here; callers handle line endings) so literal/regex/boolean scans
+/// can run on UTF-8 text like any byte-oriented encoding.
+fn wide_decode(bytes: &[u8], encoding: Encoding) -> String {
+    crate::engine::decode::decode_bytes(bytes, encoding)
+}
+
+/// UTF-16 newline scanner: count wide newlines (0A 00 / 00 0A) in bytes,
+/// stopping at the last COMPLETE unit. Returns (count, consumed_pairs).
+fn count_nl_wide(bytes: &[u8], le: bool) -> u64 {
+    let mut n = 0u64;
+    let mut i = 0usize;
+    while i + 1 < bytes.len() {
+        let is_nl = if le {
+            bytes[i] == 0x0A && bytes[i + 1] == 0x00
+        } else {
+            bytes[i] == 0x00 && bytes[i + 1] == 0x0A
+        };
+        if is_nl {
+            n += 1;
+        }
+        i += 2;
+    }
+    n
+}
+
+/// Byte offset (raw) of the wide newline at/after `from` (even alignment).
+fn find_nl_wide(bytes: &[u8], from: usize, le: bool) -> Option<usize> {
+    let mut i = from + (from & 1); // snap to even
+    while i + 1 < bytes.len() {
+        let is_nl = if le {
+            bytes[i] == 0x0A && bytes[i + 1] == 0x00
+        } else {
+            bytes[i] == 0x00 && bytes[i + 1] == 0x0A
+        };
+        if is_nl {
+            return Some(i);
+        }
+        i += 2;
+    }
+    None
 }
 
 /// C-D2: Ekstrak cabang alternasi literal dari pola regex (contoh: `A|B|C` atau `(A|B|C)`).
@@ -75,6 +118,9 @@ pub(crate) fn extract_literal_alternations(pattern: &str) -> Option<Vec<String>>
 }
 
 /// Pindai satu chunk biner utuh menggunakan pencocok (AC, Finder, atau Regex) dan hitung offset baris/kolom.
+/// Returns (stored hits, exact in-scope match total): past the display cap
+/// the scan continues in count-only mode (no Hit allocation, no line math),
+/// so one pass yields both the first-N display set and the exact grand total.
 #[allow(clippy::too_many_arguments)]
 fn search_chunk_bytes(
     chunk_bytes: &[u8],
@@ -86,8 +132,10 @@ fn search_chunk_bytes(
     ac: Option<&aho_corasick::AhoCorasick>,
     case_sensitive: bool,
     scope: Option<(u64, u64)>,
-) -> Vec<Hit> {
+) -> (Vec<Hit>, u64) {
     let mut hits = Vec::new();
+    let mut total: u64 = 0;
+    let cap = || search::effective_max_hits();
     if let Some(ac) = ac {
         // C-D2: Jalur super cepat Aho-Corasick untuk alternasi literal
         let mut prev_s = 0usize;
@@ -103,6 +151,10 @@ fn search_chunk_bytes(
                 if gp < ss || gp >= ee {
                     continue;
                 }
+            }
+            total += 1;
+            if hits.len() >= cap() {
+                continue; // count-only past the cap
             }
             let gap = &chunk_bytes[prev_s..s];
             let mut nl = 0u64;
@@ -131,9 +183,6 @@ fn search_chunk_bytes(
                 col_start: s.saturating_sub(ls) as u32,
                 col_end: ce,
             });
-            if hits.len() >= search::MAX_STORED_HITS {
-                break;
-            }
         }
     } else if let Some(finder) = finder {
         let hay_owned;
@@ -174,10 +223,11 @@ fn search_chunk_bytes(
                     continue;
                 }
             }
-            hits.push(hit);
-            if hits.len() >= search::MAX_STORED_HITS {
-                break;
+            total += 1;
+            if hits.len() >= cap() {
+                continue; // count-only past the cap
             }
+            hits.push(hit);
         }
     } else if let Some(re) = re {
         let mut prev_s = 0usize;
@@ -193,6 +243,10 @@ fn search_chunk_bytes(
                 if gp < ss || gp >= ee {
                     continue;
                 }
+            }
+            total += 1;
+            if hits.len() >= cap() {
+                continue; // count-only past the cap
             }
             let gap = &chunk_bytes[prev_s..s];
             let mut nl = 0u64;
@@ -221,16 +275,154 @@ fn search_chunk_bytes(
                 col_start: s.saturating_sub(ls) as u32,
                 col_end: ce,
             });
-            if hits.len() >= search::MAX_STORED_HITS {
-                break;
-            }
         }
     }
-    hits
+    (hits, total)
 }
 
 /// 8 args (clippy:too_many_arguments allowed): the worker needs the full
 /// search context and every caller passes plain values (no builder needed).
+/// P0-4: scan satu chunk UTF-16 (berbatas baris penuh). Setiap baris
+/// di-decode ke UTF-8 lalu di-scan dengan matcher teks â€” nomor baris dan
+/// kolom konsisten dengan jalur byte-oriented.
+#[allow(clippy::too_many_arguments)]
+fn scan_wide_chunk(
+    chunk_bytes: &[u8],
+    base_byte: u64,
+    start_line: u64,
+    encoding: Encoding,
+    bom_len: usize,
+    first_chunk: bool,
+    finder: Option<&memchr::memmem::Finder>,
+    needle_len: usize,
+    re: Option<&regex::bytes::Regex>,
+    ac: Option<&aho_corasick::AhoCorasick>,
+    case_sensitive: bool,
+    scope: Option<(u64, u64)>,
+) -> (Vec<Hit>, u64) {
+    let le = encoding == Encoding::Utf16Le;
+    let mut hits = Vec::new();
+    let mut total: u64 = 0;
+    let mut line_no = start_line;
+    let mut i = 0usize;
+    if first_chunk && bom_len > 0 && chunk_bytes.len() >= bom_len {
+        i = bom_len;
+    }
+    while i < chunk_bytes.len() {
+        let line_end = find_nl_wide(chunk_bytes, i, le).unwrap_or(chunk_bytes.len());
+        let mut body_end = line_end;
+        // Strip wide CR (0D 00 / 00 0D) sebelum newline bila ada.
+        if body_end >= 2 && body_end - 2 >= i {
+            let (c1, c2) = if le { (0x0Du8, 0x00u8) } else { (0x00u8, 0x0Du8) };
+            if chunk_bytes[body_end - 2] == c1 && chunk_bytes[body_end - 1] == c2 {
+                body_end -= 2;
+            }
+        }
+        if body_end > i {
+            let body = &chunk_bytes[i..body_end];
+            let text = crate::engine::decode::decode_bytes(body, encoding);
+            let ts: &str = &text;
+            let scan_one = |s: usize, e: usize, hits: &mut Vec<Hit>, total: &mut u64| {
+                if e == s {
+                    return;
+                }
+                if let Some((ss, ee)) = scope {
+                    let gp = base_byte + i as u64 + s as u64;
+                    if gp < ss || gp >= ee {
+                        return;
+                    }
+                }
+                *total += 1;
+                if hits.len() >= search::effective_max_hits() {
+                    return; // count-only past the cap
+                }
+                hits.push(Hit {
+                    line: line_no,
+                    byte: base_byte + i as u64,
+                    col_start: s as u32,
+                    col_end: e as u32,
+                });
+            };
+            if let Some(f) = finder {
+                if case_sensitive {
+                    for m in f.find_iter(ts.as_bytes()) {
+                        scan_one(m, m + needle_len, &mut hits, &mut total);
+                    }
+                } else {
+                    // Full-Unicode CI: fold kedua sisi, scan memchr.
+                    let hay = ts.to_lowercase();
+                    let nl = String::from_utf8_lossy(f.needle()).to_lowercase();
+                    let mut from = 0usize;
+                    while let Some(rel) = find_sub_ci(&hay, &nl, from) {
+                        scan_one(rel, rel + nl.len(), &mut hits, &mut total);
+                        from = rel + nl.len().max(1);
+                    }
+                }
+            } else if let Some(re) = re {
+                for m in re.find_iter(ts.as_bytes()) {
+                    scan_one(m.start(), m.end(), &mut hits, &mut total);
+                }
+            } else if let Some(ac) = ac {
+                for m in ac.find_iter(ts.as_bytes()) {
+                    scan_one(m.start(), m.end(), &mut hits, &mut total);
+                }
+            }
+        }
+        if line_end + 2 <= chunk_bytes.len() {
+            i = line_end + 2;
+        } else {
+            i = chunk_bytes.len();
+        }
+        line_no += 1;
+    }
+    (hits, total)
+}
+
+/// Case-insensitive substring find on already-lowercased text (memchr).
+fn find_sub_ci(hay_lower: &str, needle_lower: &str, from: usize) -> Option<usize> {
+    if needle_lower.is_empty() {
+        return None;
+    }
+    let h = hay_lower.as_bytes();
+    let n = needle_lower.as_bytes();
+    if from >= h.len() {
+        return None;
+    }
+    memchr::memmem::Finder::new(n).find(&h[from..]).map(|m| from + m)
+}
+
+/// True when a stripped wide line still has content (not just padding 00).
+fn body_nonempty(lb: &[u8]) -> bool {
+    // All-zero body (e.g. from odd padding) decodes to NULs â€” skip those.
+    !lb.is_empty() && lb.iter().any(|&b| b != 0)
+}
+
+/// Ordered slot helpers for the streaming rayon emission (P0-3).
+/// Each slot holds (stored hits, exact chunk match total): the display set
+/// stays capped while the grand total stays exact after one pass.
+trait HitSlots {
+    fn slots_set(&mut self, idx: usize, hits: Vec<Hit>, chunk_total: u64);
+    fn slots_ready(&self, idx: usize) -> bool;
+    fn slots_take(&mut self, idx: usize) -> (Vec<Hit>, u64);
+}
+
+impl HitSlots for Vec<Option<(Vec<Hit>, u64)>> {
+    fn slots_set(&mut self, idx: usize, hits: Vec<Hit>, chunk_total: u64) {
+        if let Some(slot) = self.get_mut(idx) {
+            *slot = Some((hits, chunk_total));
+        }
+    }
+
+    fn slots_ready(&self, idx: usize) -> bool {
+        self.get(idx).map(|s| s.is_some()).unwrap_or(false)
+    }
+
+    fn slots_take(&mut self, idx: usize) -> (Vec<Hit>, u64) {
+        self.get_mut(idx)
+            .and_then(|s| s.take())
+            .unwrap_or_default()
+    }
+}
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_search(
     params: SearchJobParams,
@@ -255,6 +447,7 @@ pub(crate) fn spawn_search(
                 error: None,
                 scanned: 0,
                 total: 0,
+            grand_total: 0,
             });
             return;
         }
@@ -279,6 +472,7 @@ pub(crate) fn spawn_search(
                         error: Some(format!("Regex tidak valid: {}", e)),
                         scanned: 0,
                         total: 0,
+                    grand_total: 0,
                     });
                     return;
                 }
@@ -298,6 +492,31 @@ pub(crate) fn spawn_search(
                         error: Some(format!("Regex tidak valid: {}", e)),
                         scanned: 0,
                         total: 0,
+                    grand_total: 0,
+                    });
+                    return;
+                }
+            }
+        } else if !case_sensitive {
+            // Literal insensitif = regex Unicode-CI atas needle yang
+            // di-escape: TANPA salinan lowercase 4 MiB per chunk + fold
+            // Unicode penuh (É/É, Cyrillic) — paritas klaim engine.
+            // (Dulu: Finder di atas ASCII-fold — salah untuk non-ASCII.)
+            let pat = regex::escape(&query);
+            let mut b = regex::bytes::RegexBuilder::new(&pat);
+            b.case_insensitive(true);
+            match b.build() {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    let _ = tx.send(SearchBatchMsg {
+                        gen,
+                        batch: Vec::new(),
+                        done: true,
+                        truncated: false,
+                        error: Some(format!("Regex tidak valid: {}", e)),
+                        scanned: 0,
+                        total: 0,
+                    grand_total: 0,
                     });
                     return;
                 }
@@ -305,16 +524,14 @@ pub(crate) fn spawn_search(
         } else {
             None
         };
-        let needle_cmp: Vec<u8> = if !regex_on {
-            if case_sensitive {
-                query.as_bytes().to_vec()
-            } else {
-                query.as_bytes().to_ascii_lowercase()
-            }
+        // Finder byte-exact hanya untuk literal sensitif; semua jalur
+        // insensitif lewat cabang regex di atas.
+        let needle_cmp: Vec<u8> = if !regex_on && case_sensitive {
+            query.as_bytes().to_vec()
         } else {
             Vec::new()
         };
-        let finder = if !regex_on {
+        let finder = if !regex_on && case_sensitive {
             Some(memchr::memmem::Finder::new(&needle_cmp))
         } else {
             None
@@ -333,7 +550,10 @@ pub(crate) fn spawn_search(
             None
         };
 
-        // C-D1: Paralelisasi Rayon untuk Chunk-Level Search via memory map
+        // C-D1: Paralelisasi Rayon untuk Chunk-Level Search via memory map.
+        // Jalur UTF-16 (wide) di-decode per-chunk ke UTF-8 dulu, lalu
+        // dipindai dengan matcher teks yang sama (nomor baris dipetakan
+        // dari newline wide di chunk sumber).
         if let Ok(m) = crate::engine::mmap::open_mmap(&path) {
             let total_size = m.len() as u64;
             if total_size == 0 {
@@ -345,6 +565,7 @@ pub(crate) fn spawn_search(
                     error: None,
                     scanned: 0,
                     total: 0,
+                grand_total: 0,
                 });
                 return;
             }
@@ -360,90 +581,196 @@ pub(crate) fn spawn_search(
                         error: None,
                         scanned: total_size,
                         total: total_size,
+                    grand_total: 0,
                     });
                     return;
                 }
                 None => (0usize, 1u64),
             };
 
+            let wide = encoding.is_wide();
+            let le = encoding == Encoding::Utf16Le;
+            let effective_bom = if start_offset == 0 { bom_len } else { 0 };
+
+            // Bangun chunk per BARIS (wide: split di unit newline wide;
+            // narrow: extend ke \n berikutnya seperti sebelumnya).
             let slice = &m[start_offset..];
-            let chunk_target = search::SEARCH_CHUNK;
+            let chunk_target = search::effective_chunk_bytes();
             let mut chunk_ranges: Vec<(usize, usize)> = Vec::new();
-            let mut pos = 0;
-            while pos < slice.len() {
-                let mut next = (pos + chunk_target).min(slice.len());
-                if next < slice.len() {
-                    if let Some(nl) = memchr::memchr(b'\n', &slice[next..]) {
-                        next += nl + 1;
-                    } else {
-                        next = slice.len();
+            let mut chunk_start_lines: Vec<u64> = Vec::new();
+            {
+                let mut pos = 0usize;
+                let mut cur_line = initial_line;
+                while pos < slice.len() {
+                    let mut next = (pos + chunk_target).min(slice.len());
+                    if next < slice.len() {
+                        if wide {
+                            let p = next + (next & 1); // snap even
+                            if p + 1 >= slice.len() {
+                                next = slice.len();
+                            } else {
+                                // cari wide newline dari p
+                                match find_nl_wide(slice, p, le) {
+                                    Some(i) => next = i + 2,
+                                    None => next = slice.len(),
+                                }
+                            }
+                        } else if let Some(nl) = memchr::memchr(b'\n', &slice[next..]) {
+                            next += nl + 1;
+                        } else {
+                            next = slice.len();
+                        }
                     }
+                    // Baris awal chunk = baris pada pos (checkpoint-style
+                    // hitung mundur: newline antara posisi-pos sebelumnya
+                    // sudah terhitung di iterasi loop ini).
+                    chunk_ranges.push((pos, next));
+                    chunk_start_lines.push(cur_line);
+                    // Hitung newline di chunk baru (wide: unit 2-byte).
+                    let nls = if wide {
+                        count_nl_wide(&slice[pos..next], le)
+                    } else {
+                        memchr::memchr_iter(b'\n', &slice[pos..next]).count() as u64
+                    };
+                    cur_line += nls;
+                    pos = next;
                 }
-                chunk_ranges.push((pos, next));
-                pos = next;
             }
 
-            // Hitung jumlah baris per chunk secara paralel untuk penomoran baris yang presisi
-            let chunk_lines: Vec<u64> = chunk_ranges
-                .par_iter()
-                .map(|&(start, end)| {
-                    memchr::memchr_iter(b'\n', &slice[start..end]).count() as u64
-                })
-                .collect();
-
-            let mut chunk_start_lines = Vec::with_capacity(chunk_ranges.len());
-            let mut cur_line = initial_line;
-            for count in chunk_lines {
-                chunk_start_lines.push(cur_line);
-                cur_line += count;
-            }
-
-            // Pindai chunk paralel dengan Rayon, mematuhi batas pembatalan search_gen
             let finder_ref = finder.as_ref();
             let re_ref = re.as_ref();
             let ac_ref = pure_literal_ac.as_ref();
             let needle_len = needle_cmp.len();
 
-            let chunk_results: Vec<Result<Vec<Hit>, ()>> = chunk_ranges
-                .par_iter()
-                .zip(chunk_start_lines.par_iter())
-                .map(|(&(start, end), &st_line)| {
+            // P0-3: streaming emission â€” setiap chunk yang selesai dikirim
+            // segera (batch 500, progres = akhir chunk). Arsitektur: emitter
+            // thread membaca slot berurut (prefix-ready) dan mengirim ke
+            // channel; par_iter mengisi slot. Tidak ada clone mmap.
+            let (ctx_tx, ctx_rx) = std::sync::mpsc::channel::<(usize, Vec<Hit>, u64)>();
+            let total_chunks = chunk_ranges.len();
+            {
+                let n = total_chunks;
+                let next_emit = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let results: std::sync::Arc<std::sync::Mutex<Vec<Option<(Vec<Hit>, u64)>>>> =
+                    std::sync::Arc::new(std::sync::Mutex::new(
+                        (0..n).map(|_| None).collect::<Vec<_>>(),
+                    ));
+                let stale_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let done_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                // Emitter thread: kirim slot berurut begitu siap.
+                {
+                    let results = results.clone();
+                    let ctx_tx = ctx_tx.clone();
+                    let stale_flag = stale_flag.clone();
+                    let done_flag = done_flag.clone();
+                    let next_emit = next_emit.clone();
+                    std::thread::spawn(move || {
+                        loop {
+                            let cur = next_emit.load(Ordering::Acquire);
+                            if cur >= n {
+                                break;
+                            }
+                            let take = {
+                                let mut slots = match results.lock() {
+                                    Ok(g) => g,
+                                    Err(p) => p.into_inner(),
+                                };
+                                if slots.slots_ready(cur) {
+                                    next_emit.fetch_add(1, Ordering::AcqRel);
+                                    Some(slots.slots_take(cur))
+                                } else {
+                                    None
+                                }
+                            };
+                            if let Some((hits, chunk_total)) = take {
+                                if ctx_tx.send((cur, hits, chunk_total)).is_err() {
+                                    break; // penerima pergi (stale).
+                                }
+                            } else if done_flag.load(Ordering::Acquire) {
+                                // Par_iter selesai tapi slot cur tak terisi
+                                // (stale abort): berhenti, jangan hang.
+                                break;
+                            } else if stale_flag.load(Ordering::Relaxed) {
+                                break;
+                            } else {
+                                std::thread::sleep(std::time::Duration::from_millis(1));
+                            }
+                        }
+                    });
+                }
+                let chunk_ranges = &chunk_ranges;
+                let chunk_start_lines = &chunk_start_lines;
+                let finder_ref = finder_ref;
+                let re_ref = re_ref;
+                let ac_ref = ac_ref;
+                let slice = slice;
+                (0..n).into_par_iter().for_each(|i| {
                     if job_stale(&gen_shared, gen, &cancel) {
-                        return Err(());
+                        stale_flag.store(true, Ordering::Relaxed);
+                        return;
                     }
-                    let chunk_bytes = &slice[start..end];
-                    let base_byte = (start_offset + start) as u64;
-                    let hits = search_chunk_bytes(
-                        chunk_bytes,
-                        base_byte,
-                        st_line,
-                        finder_ref,
-                        needle_len,
-                        re_ref,
-                        ac_ref,
-                        case_sensitive,
-                        scope,
-                    );
-                    Ok(hits)
-                })
-                .collect();
+                    if stale_flag.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let (start, end) = chunk_ranges[i];
+                    let st_line = chunk_start_lines[i];
+                    let (hits, chunk_total) = if wide {
+                        scan_wide_chunk(
+                            &slice[start..end],
+                            (start_offset + start) as u64,
+                            st_line,
+                            encoding,
+                            effective_bom,
+                            i == 0,
+                            finder_ref,
+                            needle_len,
+                            re_ref,
+                            ac_ref,
+                            case_sensitive,
+                            scope,
+                        )
+                    } else {
+                        search_chunk_bytes(
+                            &slice[start..end],
+                            (start_offset + start) as u64,
+                            st_line,
+                            finder_ref,
+                            needle_len,
+                            re_ref,
+                            ac_ref,
+                            case_sensitive,
+                            scope,
+                        )
+                    };
+                    match results.lock() {
+                        Ok(mut slots) => slots.slots_set(i, hits, chunk_total),
+                        Err(p) => p.into_inner().slots_set(i, hits, chunk_total),
+                    }
+                });
+                done_flag.store(true, Ordering::Release);
+            }
+            drop(ctx_tx);
 
-            // Urutkan batch sebelum dikirim ke UI sesuai urutan chunk
+            // Emission diurutkan di sini: terima (idx, hits, chunk_total)
+            // dan batch-kan. grand_total = jumlah eksak semua chunk (satu
+            // pass; chunk yang datang setelah cap global tetap dijumlah).
             let mut pending: Vec<Hit> = Vec::with_capacity(search::SEARCH_BATCH);
             let mut total_found = 0usize;
+            let mut grand_total: u64 = 0;
             let mut truncated = false;
-
-            for (i, res) in chunk_results.into_iter().enumerate() {
+            let mut expect_idx = 0usize;
+            for (idx, hits, chunk_total) in ctx_rx.iter() {
                 if job_stale(&gen_shared, gen, &cancel) {
                     return;
                 }
-                let hits = match res {
-                    Ok(h) => h,
-                    Err(_) => return,
-                };
-                let (_, end) = chunk_ranges[i];
+                if idx != expect_idx {
+                    // Tak mungkin (emitter berurut); guard tetap.
+                    continue;
+                }
+                expect_idx = idx + 1;
+                grand_total += chunk_total;
+                let (_, end) = chunk_ranges[idx];
                 let scanned_bytes = (start_offset + end) as u64;
-
                 for hit in hits {
                     pending.push(hit);
                     total_found += 1;
@@ -457,15 +784,38 @@ pub(crate) fn spawn_search(
                             error: None,
                             scanned: scanned_bytes,
                             total: total_size,
+                            grand_total,
                         });
                     }
-                    if total_found >= search::MAX_STORED_HITS {
+                    if total_found >= search::effective_max_hits() {
                         truncated = true;
                         break;
                     }
                 }
                 if truncated {
                     break;
+                }
+                // Flush kecil per chunk agar progres terlihat live.
+                if !pending.is_empty() {
+                    let b = std::mem::take(&mut pending);
+                    let _ = tx.send(SearchBatchMsg {
+                        gen,
+                        batch: b,
+                        done: false,
+                        truncated: false,
+                        error: None,
+                        scanned: scanned_bytes,
+                        total: total_size,
+                        grand_total,
+                    });
+                }
+            }
+            // Chunks sisa bila truncated menghentikan iterasi lebih awal:
+            // drain channel agar thread bantu tidak deadlock — sambil
+            // menjumlah total eksak (sudah dihitung tiap chunk).
+            if truncated {
+                for (_, _, chunk_total) in ctx_rx.iter() {
+                    grand_total += chunk_total;
                 }
             }
 
@@ -474,13 +824,15 @@ pub(crate) fn spawn_search(
             }
             let _ = tx.send(SearchBatchMsg {
                 gen,
-                batch: pending,
+                batch: std::mem::take(&mut pending),
                 done: true,
                 truncated,
                 error: None,
                 scanned: total_size,
                 total: total_size,
+                grand_total,
             });
+            let _ = total_chunks;
             return;
         }
 
@@ -495,13 +847,186 @@ pub(crate) fn spawn_search(
                     error: Some(format!("Gagal membaca file: {}", e)),
                     scanned: 0,
                     total: 0,
+                grand_total: 0,
                 });
                 return;
             }
         };
         let total_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        // P0-4: wide (UTF-16) tanpa mmap â€” jalur per-baris (paritas fancy
+        // worker, matcher literal/regex tetap cepat per baris).
+        if encoding.is_wide() {
+            let le = encoding == Encoding::Utf16Le;
+            let mut reader = WideLineReader::new(
+                std::io::BufReader::with_capacity(1024 * 1024, file),
+                le,
+            );
+            let mut line_no: u64 = 1;
+            let mut byte_off: u64 = 0;
+            let mut pending: Vec<Hit> = Vec::with_capacity(search::SEARCH_BATCH);
+            let mut total_found: usize = 0;
+            let mut grand_total: u64 = 0;
+            let mut truncated = false;
+            let mut buf: Vec<u8> = Vec::new();
+            let mut first = true;
+            if let Some((sb, sl)) = seek_to {
+                if reader.seek_start(sb).is_ok() {
+                    byte_off = sb;
+                    line_no = sl.max(1);
+                    first = sb == 0;
+                }
+            }
+            loop {
+                if job_stale(&gen_shared, gen, &cancel) {
+                    return;
+                }
+                buf.clear();
+                let n = reader.read_line(&mut buf);
+                if n == 0 && buf.is_empty() {
+                    break;
+                }
+                let line_start = byte_off;
+                byte_off += if n > 0 { n } else { buf.len() as u64 };
+                let mut lb = &buf[..];
+                let (n1, n2) = if le { (0x0Au8, 0x00u8) } else { (0x00u8, 0x0Au8) };
+                if lb.len() >= 2 && lb[lb.len() - 2] == n1 && lb[lb.len() - 1] == n2 {
+                    lb = &lb[..lb.len() - 2];
+                    let (c1, c2) = if le { (0x0Du8, 0x00u8) } else { (0x00u8, 0x0Du8) };
+                    if lb.len() >= 2 && lb[lb.len() - 2] == c1 && lb[lb.len() - 1] == c2 {
+                        lb = &lb[..lb.len() - 2];
+                    }
+                }
+                if first {
+                    first = false;
+                    if bom_len > 0 && lb.len() >= bom_len {
+                        lb = &lb[bom_len..];
+                    }
+                }
+                if body_nonempty(lb) {
+                    let text = crate::engine::decode::decode_bytes(lb, encoding);
+                    let ts: &str = &text;
+                    let add_hit = |s: usize,
+                                     e: usize,
+                                     pending: &mut Vec<Hit>,
+                                     total_found: &mut usize,
+                                     grand_total: &mut u64| {
+                        if e == s {
+                            return;
+                        }
+                        if let Some((ss, ee)) = scope {
+                            let gp = line_start + s as u64;
+                            if gp < ss || gp >= ee {
+                                return;
+                            }
+                        }
+                        *grand_total += 1;
+                        if *total_found >= search::effective_max_hits() {
+                            return; // count-only past the cap
+                        }
+                        pending.push(Hit {
+                            line: line_no,
+                            byte: line_start,
+                            col_start: s as u32,
+                            col_end: e as u32,
+                        });
+                        *total_found += 1;
+                    };
+                    if let Some(f) = finder.as_ref() {
+                        if case_sensitive {
+                            for m in f.find_iter(ts.as_bytes()) {
+                                add_hit(
+                                    m,
+                                    m + needle_cmp.len(),
+                                    &mut pending,
+                                    &mut total_found,
+                                    &mut grand_total,
+                                );
+                            }
+                        } else {
+                            let hay = ts.to_lowercase();
+                            let nl = String::from_utf8_lossy(&needle_cmp).to_lowercase();
+                            let mut from = 0usize;
+                            while let Some(rel) = find_sub_ci(&hay, &nl, from) {
+                                add_hit(
+                                    rel,
+                                    rel + nl.len(),
+                                    &mut pending,
+                                    &mut total_found,
+                                    &mut grand_total,
+                                );
+                                from = rel + nl.len().max(1);
+                            }
+                        }
+                    } else if let Some(re) = re.as_ref() {
+                        for m in re.find_iter(ts.as_bytes()) {
+                            add_hit(
+                                m.start(),
+                                m.end(),
+                                &mut pending,
+                                &mut total_found,
+                                &mut grand_total,
+                            );
+                        }
+                    } else if let Some(ac) = pure_literal_ac.as_ref() {
+                        for m in ac.find_iter(ts.as_bytes()) {
+                            add_hit(
+                                m.start(),
+                                m.end(),
+                                &mut pending,
+                                &mut total_found,
+                                &mut grand_total,
+                            );
+                        }
+                    }
+                    if pending.len() >= search::SEARCH_BATCH {
+                        let b = std::mem::take(&mut pending);
+                        let _ = tx.send(SearchBatchMsg {
+                            gen,
+                            batch: b,
+                            done: false,
+                            truncated: false,
+                            error: None,
+                            scanned: byte_off,
+                            total: total_size,
+                            grand_total,
+                        });
+                    }
+                    if !truncated && total_found >= search::effective_max_hits() {
+                        truncated = true;
+                    }
+                    // Count-only tail: keep progress alive every 16k lines.
+                    if truncated && line_no % 16384 == 0 {
+                        let _ = tx.send(SearchBatchMsg {
+                            gen,
+                            batch: Vec::new(),
+                            done: false,
+                            truncated: false,
+                            error: None,
+                            scanned: byte_off,
+                            total: total_size,
+                            grand_total,
+                        });
+                    }
+                }
+                line_no += 1;
+            }
+            if job_stale(&gen_shared, gen, &cancel) {
+                return;
+            }
+            let _ = tx.send(SearchBatchMsg {
+                gen,
+                batch: std::mem::take(&mut pending),
+                done: true,
+                truncated,
+                error: None,
+                scanned: total_size,
+                total: total_size,
+                grand_total,
+            });
+            return;
+        }
         let mut reader = std::io::BufReader::with_capacity(4 * 1024 * 1024, file);
-        let chunk_size = search::SEARCH_CHUNK;
+        let chunk_size = search::effective_chunk_bytes();
         let mut carry: Vec<u8> = Vec::new(); // overlap tail
         let mut global_offset: u64 = 0;
         let mut line_no: u64 = 1;
@@ -515,6 +1040,7 @@ pub(crate) fn spawn_search(
         }
         let mut pending: Vec<Hit> = Vec::with_capacity(search::SEARCH_BATCH);
         let mut total_found: usize = 0;
+        let mut grand_total: u64 = 0;
         let mut truncated = false;
         // Track whether previous chunk ended mid-line to fix line numbers:
         // line_no always counts lines started. carry holds tail bytes of prev chunk
@@ -522,8 +1048,12 @@ pub(crate) fn spawn_search(
         // combined = carry + chunk for matches but only report matches starting
         // at >= carry_len - overlap_guard? Simplify: report matches in combined
         // whose start >= carry.len() except first chunk, plus handle cross-boundary
-        // by overlap = needle.len().
-        let overlap = if !regex_on {
+        // by overlap = needle.len(). Finder (literal sensitif) butuh
+        // overlap sepanjang needle; cabang regex (termasuk
+        // literal-insensitif CI) memakai ekor 8 KiB yang sound untuk
+        // needle berapa pun (match yang menyentuh byte fresh selalu
+        // dilaporkan; yang penuh di carry sudah dilaporkan).
+        let overlap = if finder.is_some() {
             needle_cmp.len().min(16 * 1024)
         } else {
             8 * 1024
@@ -549,6 +1079,7 @@ pub(crate) fn spawn_search(
                         error: Some(format!("Gagal membaca file: {}", e)),
                         scanned: global_offset,
                         total: total_size,
+                        grand_total,
                     });
                     return;
                 }
@@ -585,23 +1116,14 @@ pub(crate) fn spawn_search(
                     continue;
                 }
             }
-            // Search in combined (lowercased view if needed)
-            if !regex_on {
-                let hay_owned;
-                let hay: &[u8] = if case_sensitive {
-                    &combined
-                } else {
-                    hay_owned = combined.to_ascii_lowercase();
-                    // Length-preserving ASCII fold, so offsets match `combined`.
-                    drop(combined);
-                    combined = hay_owned;
-                    &combined
-                };
-                let f = finder.as_ref().unwrap();
+            // Search in combined. Cabang literal-byte hanya bila Finder
+            // ada (literal sensitif); insensitif + regex lewat mesin CI.
+            if let Some(f) = finder.as_ref() {
+                let hay: &[u8] = &combined;
                 // Incremental line mapping: `find_iter` yields matches in
                 // ascending order, so line(m) = line(prev) + newlines in
                 // hay[prev_m..m]. One memchr pass total per chunk, O(1) per
-                // hit — no line table, no binary search. Anchored at
+                // hit â€” no line table, no binary search. Anchored at
                 // combined[0], whose line is cur_line.
                 let mut prev_m = 0usize;
                 let mut prev_line = cur_line;
@@ -646,23 +1168,25 @@ pub(crate) fn spawn_search(
                             continue;
                         }
                     }
-                    pending.push(hit);
-                    total_found += 1;
-                    if pending.len() >= search::SEARCH_BATCH {
-                        let b = std::mem::take(&mut pending);
-                                let _ = tx.send(SearchBatchMsg {
-                                    gen,
-                                    batch: b,
-                                    done: false,
-                                    truncated: false,
-                                    error: None,
-                                    scanned: global_offset,
-                                    total: total_size,
-                                });
-                    }
-                    if total_found >= search::MAX_STORED_HITS {
+                    grand_total += 1;
+                    if total_found < search::effective_max_hits() {
+                        pending.push(hit);
+                        total_found += 1;
+                        if pending.len() >= search::SEARCH_BATCH {
+                            let b = std::mem::take(&mut pending);
+                            let _ = tx.send(SearchBatchMsg {
+                                gen,
+                                batch: b,
+                                done: false,
+                                truncated: false,
+                                error: None,
+                                scanned: global_offset,
+                                total: total_size,
+                                grand_total,
+                            });
+                        }
+                    } else if !truncated {
                         truncated = true;
-                        break;
                     }
                 }
                 // Fresh bytes only (carry was counted in its own chunk).
@@ -682,10 +1206,22 @@ pub(crate) fn spawn_search(
                         error: None,
                         scanned: global_offset,
                         total: total_size,
+                        grand_total,
                     });
                 }
+                // Count-only tail: no stored hits left, but keep exact
+                // progress (one message per chunk is cheap).
                 if truncated {
-                    break;
+                    let _ = tx.send(SearchBatchMsg {
+                        gen,
+                        batch: Vec::new(),
+                        done: false,
+                        truncated: false,
+                        error: None,
+                        scanned: global_offset,
+                        total: total_size,
+                        grand_total,
+                    });
                 }
                 if is_last {
                     break;
@@ -740,28 +1276,30 @@ pub(crate) fn spawn_search(
                         .map(|k| s + k)
                         .unwrap_or(combined.len());
                     let ce = e.min(line_end).saturating_sub(ls) as u32;
-                    pending.push(Hit {
-                        line: gline,
-                        byte: combined_base + ls as u64,
-                        col_start: s.saturating_sub(ls) as u32,
-                        col_end: ce,
-                    });
-                    total_found += 1;
-                    if pending.len() >= search::SEARCH_BATCH {
-                        let b = std::mem::take(&mut pending);
-                                let _ = tx.send(SearchBatchMsg {
-                                    gen,
-                                    batch: b,
-                                    done: false,
-                                    truncated: false,
-                                    error: None,
-                                    scanned: global_offset,
-                                    total: total_size,
-                                });
-                    }
-                    if total_found >= search::MAX_STORED_HITS {
+                    grand_total += 1;
+                    if total_found < search::effective_max_hits() {
+                        pending.push(Hit {
+                            line: gline,
+                            byte: combined_base + ls as u64,
+                            col_start: s.saturating_sub(ls) as u32,
+                            col_end: ce,
+                        });
+                        total_found += 1;
+                        if pending.len() >= search::SEARCH_BATCH {
+                            let b = std::mem::take(&mut pending);
+                            let _ = tx.send(SearchBatchMsg {
+                                gen,
+                                batch: b,
+                                done: false,
+                                truncated: false,
+                                error: None,
+                                scanned: global_offset,
+                                total: total_size,
+                                grand_total,
+                            });
+                        }
+                    } else if !truncated {
                         truncated = true;
-                        break;
                     }
                 }
                 let nl_new = memchr::memchr_iter(b'\n', &tmp).count() as u64;
@@ -779,10 +1317,21 @@ pub(crate) fn spawn_search(
                         error: None,
                         scanned: global_offset,
                         total: total_size,
+                        grand_total,
                     });
                 }
+                // Count-only tail: keep exact progress (one message/chunk).
                 if truncated {
-                    break;
+                    let _ = tx.send(SearchBatchMsg {
+                        gen,
+                        batch: Vec::new(),
+                        done: false,
+                        truncated: false,
+                        error: None,
+                        scanned: global_offset,
+                        total: total_size,
+                        grand_total,
+                    });
                 }
                 if is_last {
                     break;
@@ -800,6 +1349,7 @@ pub(crate) fn spawn_search(
             error: None,
             scanned: total_size,
             total: total_size,
+            grand_total,
         });
     });
 }
@@ -808,8 +1358,7 @@ pub(crate) fn spawn_search(
 /// per baris terdecode, batch 500 hit + progres byte, hormati `search_gen`
 /// seperti worker literal. Hanya untuk pola yang ditolak mesin cepat;
 /// pola biasa tetap di jalur rayon paralel (jangan perlambat fast path).
-/// Mendukung semua encoding byte-oriented; UTF-16 ditolak eksplisit
-/// (paritas dengan worker boolean) karena splitter baris byte `\n`.
+/// Mendukung semua encoding termasuk UTF-16 (decode per baris).
 pub(crate) fn spawn_fancy_search(
     params: SearchJobParams,
     query: String,
@@ -824,6 +1373,8 @@ pub(crate) fn spawn_fancy_search(
         let SearchJobParams { path, gen, gen_shared, tx, cancel } = params;
         let mut fb = fancy_regex::RegexBuilder::new(&query);
         fb.case_insensitive(!case_sensitive);
+        // Explicit default: pathological lines error instead of hanging.
+        fb.backtrack_limit(1_000_000);
         let re = match fb.build() {
             Ok(r) => r,
             Err(e) => {
@@ -835,24 +1386,11 @@ pub(crate) fn spawn_fancy_search(
                     error: Some(format!("Regex tidak valid: {}", e)),
                     scanned: 0,
                     total: 0,
+                grand_total: 0,
                 });
                 return;
             }
         };
-        if encoding.is_wide() {
-            let _ = tx.send(SearchBatchMsg {
-                gen,
-                batch: Vec::new(),
-                done: true,
-                truncated: false,
-                error: Some(String::from(
-                    "Regex kompleks belum mendukung UTF-16; gunakan literal.",
-                )),
-                scanned: 0,
-                total: 0,
-            });
-            return;
-        }
         let file = match std::fs::File::open(&path) {
             Ok(f) => f,
             Err(e) => {
@@ -864,17 +1402,26 @@ pub(crate) fn spawn_fancy_search(
                     error: Some(format!("Gagal membaca file: {}", e)),
                     scanned: 0,
                     total: 0,
+                grand_total: 0,
                 });
                 return;
             }
         };
         let total = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         let mut reader = std::io::BufReader::with_capacity(1024 * 1024, file);
+        // P0: required-literal prefilter — skip lines that cannot match
+        // before decode + backtracking. Narrow: raw bytes (lossy decode
+        // preserves ASCII). Wide: decoded text below (UTF-16 bytes can't
+        // carry ASCII literals).
+        let wide = encoding.is_wide();
+        let pre =
+            crate::engine::fancypre::FancyPrefilter::new(&query, case_sensitive);
         let mut line_no: u64 = 1;
         let mut byte_off: u64 = 0;
         let mut scanned: u64 = 0;
         let mut pending: Vec<Hit> = Vec::with_capacity(search::SEARCH_BATCH);
         let mut total_found: usize = 0;
+        let mut grand_total: u64 = 0;
         let mut truncated = false;
         let mut buf: Vec<u8> = Vec::new();
         let mut first = true;
@@ -904,6 +1451,7 @@ pub(crate) fn spawn_fancy_search(
                         error: Some(format!("Gagal membaca file: {}", e)),
                         scanned,
                         total,
+                        grand_total,
                     });
                     return;
                 }
@@ -922,12 +1470,33 @@ pub(crate) fn spawn_fancy_search(
                 }
             }
             let mut bytes = lb;
-            if !bytes.is_empty() && bytes[bytes.len() - 1] == b'\r' {
+            if !bytes.is_empty() && bytes[bytes.len() - 1] == b'\r' && !encoding.is_wide() {
                 bytes = &bytes[..bytes.len() - 1];
+            }
+            if !wide && !pre.passes(bytes) {
+                line_no += 1;
+                continue;
             }
             // Cakupan byte: samakan dengan jalur cepat (filter by match byte).
             let text = crate::engine::decode::decode_bytes(bytes, encoding);
-            let ts: &str = &text;
+            if wide && !pre.passes(text.as_bytes()) {
+                line_no += 1;
+                continue;
+            }
+            // Bound backtracking work per line (display caps far lower;
+            // copy/export stay full; misses past the cap documented).
+            let ts: &str = {
+                let cap = crate::engine::fancypre::FANCY_LINE_CAP;
+                if text.len() > cap {
+                    let mut i = cap;
+                    while !text.is_char_boundary(i) {
+                        i -= 1;
+                    }
+                    &text[..i]
+                } else {
+                    &text[..]
+                }
+            };
             let mut iter = re.find_iter(ts);
             // Backtrack meledak di baris ganas: lewati baris ini,
             // lanjutkan file (pekerja tak boleh hang).
@@ -942,32 +1511,44 @@ pub(crate) fn spawn_fancy_search(
                         continue;
                     }
                 }
-                pending.push(Hit {
-                    line: line_no,
-                    byte: line_start,
-                    col_start: s as u32,
-                    col_end: e as u32,
-                });
-                total_found += 1;
-                if pending.len() >= search::SEARCH_BATCH {
-                    let b = std::mem::take(&mut pending);
-                    let _ = tx.send(SearchBatchMsg {
-                        gen,
-                        batch: b,
-                        done: false,
-                        truncated: false,
-                        error: None,
-                        scanned,
-                        total,
+                grand_total += 1;
+                if total_found < search::effective_max_hits() {
+                    pending.push(Hit {
+                        line: line_no,
+                        byte: line_start,
+                        col_start: s as u32,
+                        col_end: e as u32,
                     });
-                }
-                if total_found >= search::MAX_STORED_HITS {
+                    total_found += 1;
+                    if pending.len() >= search::SEARCH_BATCH {
+                        let b = std::mem::take(&mut pending);
+                        let _ = tx.send(SearchBatchMsg {
+                            gen,
+                            batch: b,
+                            done: false,
+                            truncated: false,
+                            error: None,
+                            scanned,
+                            total,
+                            grand_total,
+                        });
+                    }
+                } else if !truncated {
                     truncated = true;
-                    break;
                 }
             }
-            if truncated {
-                break;
+            // Count-only tail: exact total continues, progress stays alive.
+            if truncated && line_no % 16384 == 0 {
+                let _ = tx.send(SearchBatchMsg {
+                    gen,
+                    batch: Vec::new(),
+                    done: false,
+                    truncated: false,
+                    error: None,
+                    scanned,
+                    total,
+                    grand_total,
+                });
             }
             line_no += 1;
         }
@@ -982,11 +1563,14 @@ pub(crate) fn spawn_fancy_search(
             error: None,
             scanned: total,
             total,
+            grand_total,
         });
     });
 }
 
 /// Worker pencarian boolean: evaluasi AST per baris terdecode.
+/// UTF-16 didukung: splitter baris wide menyatukan unit 2-byte
+/// (0A 00 / 00 0A) sehingga decode per baris tetap benar.
 pub(crate) fn spawn_bool_search(
     params: SearchJobParams,
     ast: crate::engine::query::Query,
@@ -1000,20 +1584,8 @@ pub(crate) fn spawn_bool_search(
     std::thread::spawn(move || {
         use std::io::BufRead;
         let SearchJobParams { path, gen, gen_shared, tx, cancel } = params;
-        if encoding.is_wide() {
-            let _ = tx.send(SearchBatchMsg {
-                gen,
-                batch: Vec::new(),
-                done: true,
-                truncated: false,
-                error: Some(String::from(
-                    "Boolean search belum mendukung UTF-16; gunakan literal.",
-                )),
-                scanned: 0,
-                total: 0,
-            });
-            return;
-        }
+        let wide = encoding.is_wide();
+        let le = encoding == Encoding::Utf16Le;
         let file = match std::fs::File::open(&path) {
             Ok(f) => f,
             Err(e) => {
@@ -1025,12 +1597,24 @@ pub(crate) fn spawn_bool_search(
                     error: Some(format!("Gagal membaca file: {}", e)),
                     scanned: 0,
                     total: 0,
+                grand_total: 0,
                 });
                 return;
             }
         };
         let total = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        let mut reader = std::io::BufReader::with_capacity(1024 * 1024, file);
+        // Wide: pembelah baris ber-carry (tanpa byte hilang antar-baris).
+        // Narrow: BufReader biasa dengan read_until(b'\n').
+        let mut narrow_reader: Option<std::io::BufReader<std::fs::File>> = None;
+        let mut wide_reader: Option<WideLineReader<std::fs::File>> = if wide {
+            Some(WideLineReader::new(
+                std::io::BufReader::with_capacity(1024 * 1024, file),
+                le,
+            ))
+        } else {
+            narrow_reader = Some(std::io::BufReader::with_capacity(1024 * 1024, file));
+            None
+        };
         let terms: Vec<String> = ast
             .positive_terms()
             .into_iter()
@@ -1038,20 +1622,28 @@ pub(crate) fn spawn_bool_search(
             .collect();
         let term_refs: Vec<&str> = terms.iter().map(|s| s.as_str()).collect();
         // Byte prefilter plan (engine/query.rs): union automaton, required
-        // Finder, or both — chosen so every skipped line provably cannot
+        // Finder, or both â€” chosen so every skipped line provably cannot
         // match. Insensitive queries fold each line for the Finder, so the
         // union (native ASCII case-fold, zero-alloc) rejects first there.
         let plan = ast.prefilter_plan(case_sensitive);
+        // ASCII-fold prefilters are EXACT only for ASCII terms: an
+        // insensitive "éclair" must NOT be rejected by an ASCII-folded
+        // automaton (false negative!). Non-ASCII terms skip the byte
+        // prefilter and take the exact Unicode path per line.
+        let terms_ascii = terms.iter().all(|t| t.is_ascii());
         let use_union = matches!(
             plan,
             crate::engine::query::PrefilterPlan::UnionThenRequired
                 | crate::engine::query::PrefilterPlan::UnionOnly
-        );
+        ) && (case_sensitive || terms_ascii);
         let use_required = matches!(
             plan,
             crate::engine::query::PrefilterPlan::UnionThenRequired
                 | crate::engine::query::PrefilterPlan::RequiredOnly
         );
+        // Prefilter berjalan pada teks terdecode (UTF-16 included); pattern
+        // byte di-lowercase ASCII untuk Finder tetap valid pada teks UTF-8
+        // selama term-nya ASCII (dijamin filter di atas).
         let prefilter: Option<aho_corasick::AhoCorasick> = if use_union && !terms.is_empty() {
             let mut builder = aho_corasick::AhoCorasickBuilder::new();
             if !case_sensitive {
@@ -1065,9 +1657,12 @@ pub(crate) fn spawn_bool_search(
         // required term, so ONE Finder on the longest (= most selective)
         // beats the union automaton and subsumes it (its passers are a
         // subset of union passers). Sound for any shape, no safety gate.
+        // Insensitif: pilih required term ASCII terpanjang (fold ASCII
+        // eksak di sana); bila tak ada, prefilter mati — jalur eksak Unicode.
         let required_pat: Option<Vec<u8>> = if use_required {
             ast.required_terms()
                 .into_iter()
+                .filter(|t| !t.is_empty() && (case_sensitive || t.is_ascii()))
                 .max_by_key(|t| t.len())
                 .map(|t| {
                     if case_sensitive {
@@ -1089,13 +1684,21 @@ pub(crate) fn spawn_bool_search(
         let mut scanned: u64 = 0;
         let mut pending: Vec<Hit> = Vec::with_capacity(search::SEARCH_BATCH);
         let mut total_found: usize = 0;
+        let mut grand_total: u64 = 0;
         let mut truncated = false;
         let mut buf: Vec<u8> = Vec::new();
         // Lewati BOM pada baris pertama (kecuali seek melewatinya).
         let mut first = true;
         if let Some((sb, sl)) = seek_to {
             use std::io::Seek;
-            if reader.seek(std::io::SeekFrom::Start(sb)).is_ok() {
+            let seek_ok = if let Some(wr) = wide_reader.as_mut() {
+                wr.seek_start(sb).is_ok()
+            } else if let Some(nr) = narrow_reader.as_mut() {
+                nr.seek(std::io::SeekFrom::Start(sb)).is_ok()
+            } else {
+                false
+            };
+            if seek_ok {
                 byte_off = sb;
                 scanned = sb;
                 line_no = sl.max(1);
@@ -1107,27 +1710,44 @@ pub(crate) fn spawn_bool_search(
                 return;
             }
             buf.clear();
-            let n = match reader.read_until(b'\n', &mut buf) {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(e) => {
-                    let _ = tx.send(SearchBatchMsg {
-                        gen,
-                        batch: Vec::new(),
-                        done: true,
-                        truncated,
-                        error: Some(format!("Gagal membaca file: {}", e)),
-                        scanned,
-                        total,
-                    });
-                    return;
+            let n: u64 = if let Some(wr) = wide_reader.as_mut() {
+                wr.read_line(&mut buf)
+            } else if let Some(nr) = narrow_reader.as_mut() {
+                match nr.read_until(b'\n', &mut buf) {
+                    Ok(0) => 0,
+                    Ok(n) => n as u64,
+                    Err(_) => 0,
                 }
+            } else {
+                0
             };
+            if n == 0 && buf.is_empty() {
+                break;
+            }
+            if n == 0 {
+                // EOF on a trailing partial line: process what's in buf.
+                scanned += buf.len() as u64;
+            }
             let line_start = byte_off;
-            byte_off += n as u64;
-            scanned += n as u64;
+            byte_off += if n > 0 { n } else { buf.len() as u64 };
+            if n > 0 {
+                scanned += n;
+            }
             let mut lb = &buf[..];
-            if lb.ends_with(b"\n") {
+            if wide {
+                // strip wide newline (2 byte) + wide CR bila ada.
+                if lb.len() >= 2 {
+                    let (n1, n2) = if le { (0x0A, 0x00) } else { (0x00, 0x0A) };
+                    if lb[lb.len() - 2] == n1 && lb[lb.len() - 1] == n2 {
+                        lb = &lb[..lb.len() - 2];
+                        // CR sebelum LF: 0D 00 / 00 0D.
+                        let (c1, c2) = if le { (0x0D, 0x00) } else { (0x00, 0x0D) };
+                        if lb.len() >= 2 && lb[lb.len() - 2] == c1 && lb[lb.len() - 1] == c2 {
+                            lb = &lb[..lb.len() - 2];
+                        }
+                    }
+                }
+            } else if lb.ends_with(b"\n") {
                 lb = &lb[..lb.len() - 1];
             }
             if first {
@@ -1137,7 +1757,7 @@ pub(crate) fn spawn_bool_search(
                 }
             }
             let mut bytes = lb;
-            if !bytes.is_empty() && bytes[bytes.len() - 1] == b'\r' {
+            if !bytes.is_empty() && bytes[bytes.len() - 1] == b'\r' && !wide {
                 bytes = &bytes[..bytes.len() - 1];
             }
             // Cakupan baris: lewati decode/match di luar interval.
@@ -1150,59 +1770,83 @@ pub(crate) fn spawn_bool_search(
             // Prefilter hierarchy per plan: union rejects first when present
             // (cheap, zero-alloc), required Finder second; exact path last.
             // UnionThenRequired keeps both sound: union only runs under the
-            // safety gate, required is sound for any shape.
-            if use_union {
-                if let Some(ac) = prefilter.as_ref() {
-                    // Byte prefilter: lines without any positive term cannot match.
-                    if !ac.is_match(bytes) {
-                        line_no += 1;
-                        continue;
+            // safety gate, required is sound for any shape. All prefilters
+            // operate on the DECODED text so UTF-16 lines take the same
+            // fast path as byte-oriented ones.
+            let text;
+            let text_ref: &str = if use_union || use_required {
+                text = crate::engine::decode::decode_bytes(bytes, encoding);
+                if use_union {
+                    if let Some(ac) = prefilter.as_ref() {
+                        // Byte prefilter: lines without any positive term cannot match.
+                        if !ac.is_match(text.as_bytes()) {
+                            line_no += 1;
+                            continue;
+                        }
                     }
                 }
-            }
-            if use_required {
-                if let Some(f) = required_finder.as_ref() {
-                    let hit = if case_sensitive {
-                        f.find(bytes).is_some()
-                    } else {
-                        fold_buf.clear();
-                        fold_buf.extend_from_slice(bytes);
-                        fold_buf.make_ascii_lowercase();
-                        f.find(&fold_buf).is_some()
-                    };
-                    if !hit {
-                        line_no += 1;
-                        continue;
+                if use_required {
+                    if let Some(f) = required_finder.as_ref() {
+                        let hit = if case_sensitive {
+                            f.find(text.as_bytes()).is_some()
+                        } else {
+                            fold_buf.clear();
+                            fold_buf.extend_from_slice(text.as_bytes());
+                            fold_buf.make_ascii_lowercase();
+                            f.find(&fold_buf).is_some()
+                        };
+                        if !hit {
+                            line_no += 1;
+                            continue;
+                        }
                     }
                 }
-            }
-            let text = crate::engine::decode::decode_bytes(bytes, encoding);
-            if ast.matches(&text, case_sensitive) {
+                &text
+            } else {
+                text = crate::engine::decode::decode_bytes(bytes, encoding);
+                &text
+            };
+            if ast.matches(text_ref, case_sensitive) {
                 let (cs, ce) =
-                    crate::engine::query::first_match_span(&text, &term_refs, case_sensitive);
-                pending.push(Hit {
-                    line: line_no,
-                    byte: line_start + if bom_len > 0 && line_no == 1 { bom_len as u64 } else { 0 },
-                    col_start: cs,
-                    col_end: ce,
-                });
-                total_found += 1;
-                if pending.len() >= search::SEARCH_BATCH {
-                    let b = std::mem::take(&mut pending);
-                    let _ = tx.send(SearchBatchMsg {
-                        gen,
-                        batch: b,
-                        done: false,
-                        truncated: false,
-                        error: None,
-                        scanned,
-                        total,
+                    crate::engine::query::first_match_span(text_ref, &term_refs, case_sensitive);
+                grand_total += 1;
+                if total_found < search::effective_max_hits() {
+                    pending.push(Hit {
+                        line: line_no,
+                        byte: line_start + if bom_len > 0 && line_no == 1 { bom_len as u64 } else { 0 },
+                        col_start: cs,
+                        col_end: ce,
                     });
-                }
-                if total_found >= search::MAX_STORED_HITS {
+                    total_found += 1;
+                    if pending.len() >= search::SEARCH_BATCH {
+                        let b = std::mem::take(&mut pending);
+                        let _ = tx.send(SearchBatchMsg {
+                            gen,
+                            batch: b,
+                            done: false,
+                            truncated: false,
+                            error: None,
+                            scanned,
+                            total,
+                            grand_total,
+                        });
+                    }
+                } else if !truncated {
                     truncated = true;
-                    break;
                 }
+            }
+            // Count-only tail: exact total continues, progress stays alive.
+            if truncated && line_no % 16384 == 0 {
+                let _ = tx.send(SearchBatchMsg {
+                    gen,
+                    batch: Vec::new(),
+                    done: false,
+                    truncated: false,
+                    error: None,
+                    scanned,
+                    total,
+                    grand_total,
+                });
             }
             line_no += 1;
         }
@@ -1217,6 +1861,7 @@ pub(crate) fn spawn_bool_search(
             error: None,
             scanned: total,
             total,
+            grand_total,
         });
     });
 }
@@ -1233,6 +1878,17 @@ mod tests {
         case_sensitive: bool,
         scope: Option<(u64, u64)>,
     ) -> Vec<Hit> {
+        run_worker_full(data, query, regex_on, case_sensitive, scope).0
+    }
+
+    /// Full worker result: (stored hits, truncated, exact grand total).
+    fn run_worker_full(
+        data: &[u8],
+        query: &str,
+        regex_on: bool,
+        case_sensitive: bool,
+        scope: Option<(u64, u64)>,
+    ) -> (Vec<Hit>, bool, u64) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("w.log");
         std::fs::write(&path, data).unwrap();
@@ -1254,14 +1910,18 @@ mod tests {
               0,
           );
           let mut out = Vec::new();
+        let mut truncated = false;
+        let mut grand_total = 0u64;
         for msg in rx {
             assert!(msg.error.is_none(), "worker error: {:?}", msg.error);
             out.extend(msg.batch);
+            grand_total = msg.grand_total;
             if msg.done {
+                truncated = msg.truncated;
                 break;
             }
         }
-        out
+        (out, truncated, grand_total)
     }
 
     /// Independent oracle: literal occurrences with (line, byte, col).
@@ -1302,7 +1962,7 @@ mod tests {
             };
             v.extend_from_slice(line.as_bytes());
         }
-        assert!(v.len() > 2 * search::SEARCH_CHUNK);
+        assert!(v.len() > 2 * search::effective_chunk_bytes());
         v
     }
 
@@ -1383,7 +2043,7 @@ mod tests {
 
     #[test]
     fn worker_chunk_boundary_no_dup_no_miss() {
-        let c = search::SEARCH_CHUNK;
+        let c = search::effective_chunk_bytes();
         let mut v = vec![b'A'; c - 7];
         v.extend_from_slice(b"ERROR"); // [c-7, c-2): tail, partial in carry
         v.extend_from_slice(b"ER"); // [c-2, c)
@@ -1422,9 +2082,48 @@ mod tests {
         }
     }
 
+    /// RAII guard: shrink the global max-hits cap for a truncation test,
+    /// restore defaults on drop (even on assert panic). Chunk/cache args
+    /// stay default (0) so concurrent chunk-size-dependent tests are
+    /// unaffected; only sub-10k-match tests run alongside, which never
+    /// truncate under either cap.
+    struct CapGuard;
+    impl CapGuard {
+        fn capped() -> Self {
+            search::set_search_limits(10_000, 0, 0);
+            CapGuard
+        }
+    }
+    impl Drop for CapGuard {
+        fn drop(&mut self) {
+            search::set_search_limits(0, 0, 0);
+        }
+    }
+
+    #[test]
+    fn worker_grand_total_exact_when_truncated() {
+        let _guard = CapGuard::capped();
+        assert_eq!(search::effective_max_hits(), 10_000);
+        // 30k matches: stored set capped at 10k, grand total exact, one pass.
+        let mut data = Vec::new();
+        for i in 0..30_000u32 {
+            data.extend_from_slice(format!("2026-09-04 ERROR id={:05}\n", i).as_bytes());
+        }
+        let (hits, truncated, grand) = run_worker_full(&data, "ERROR", false, true, None);
+        assert!(truncated, "30k matches must truncate at the 10k cap");
+        assert_eq!(hits.len(), 10_000);
+        assert_eq!(grand, 30_000, "grand total must be exact, got {}", grand);
+        // First-N order preserved (earliest lines stored).
+        assert_eq!(hits[0].line, 1);
+        assert_eq!(hits[9999].line, 10_000);
+        // Regex path agrees on the same exact total.
+        let (_, t2, g2) = run_worker_full(&data, "ERROR", true, true, None);
+        assert!(t2);
+        assert_eq!(g2, 30_000);
+    }
+
     /// Drive the boolean worker to completion.
-    fn run_bool_worker(data: &[u8], query: &str, case_sensitive: bool) -> Vec<Hit> {
-        let dir = tempfile::tempdir().unwrap();
+    fn run_bool_worker(data: &[u8], query: &str, case_sensitive: bool) -> Vec<Hit> {        let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("b.log");
         std::fs::write(&path, data).unwrap();
         run_bool_file(&path, query, case_sensitive)
@@ -1615,5 +2314,239 @@ mod tests {
         assert_eq!(extract_literal_alternations("ERROR"), None);
         assert_eq!(extract_literal_alternations(""), None);
     }
-}
 
+    /// UTF-16LE fixture: manual encode (BOM + interleaved LE units).
+    /// encoding_rs's `encode` shape differs; manual is unambiguous.
+    fn utf16le_bytes(lines: &[&str]) -> Vec<u8> {
+        let mut out = vec![0xFF, 0xFE]; // BOM
+        for l in lines {
+            for unit in format!("{}\n", l).encode_utf16() {
+                out.extend_from_slice(&unit.to_le_bytes());
+            }
+        }
+        out
+    }
+
+    /// Drive a worker with explicit encoding; returns hits.
+    fn run_worker_enc(
+        data: &[u8],
+        query: &str,
+        regex_on: bool,
+        case_sensitive: bool,
+        encoding: Encoding,
+        bom_len: usize,
+    ) -> Vec<Hit> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.log");
+        std::fs::write(&path, data).unwrap();
+        let (tx, rx) = mpsc::channel();
+        spawn_search(
+            SearchJobParams {
+                path,
+                gen: 1,
+                gen_shared: Arc::new(AtomicU64::new(1)),
+                tx,
+                cancel: Arc::new(AtomicBool::new(false)),
+            },
+            query.to_string(),
+            regex_on,
+            case_sensitive,
+            None,
+            None,
+            encoding,
+            bom_len,
+        );
+        let mut out = Vec::new();
+        for msg in rx {
+            assert!(msg.error.is_none(), "worker error: {:?}", msg.error);
+            out.extend(msg.batch);
+            if msg.done {
+                break;
+            }
+        }
+        out
+    }
+
+    /// P0-4: literal search over UTF-16LE files (mmap path).
+    #[test]
+    fn worker_utf16_literal_lines_and_cols() {
+        let lines = [
+            "INFO start",
+            "ERROR boom one",
+            "INFO mid",
+            "ERROR boom two",
+            "INFO end",
+        ];
+        let data = utf16le_bytes(&lines);
+        let hits = run_worker_enc(&data, "ERROR", false, true, Encoding::Utf16Le, 2);
+        let got: Vec<(u64, u32)> = hits.iter().map(|h| (h.line, h.col_start)).collect();
+        assert_eq!(got, vec![(2, 0), (4, 0)], "UTF-16LE literal must find both");
+        // Case-insensitive (full Unicode fold).
+        let hits = run_worker_enc(&data, "error", false, false, Encoding::Utf16Le, 2);
+        assert_eq!(hits.len(), 2);
+    }
+
+    /// P0-4: regex + boolean over UTF-16LE.
+    #[test]
+    fn worker_utf16_regex_and_boolean() {
+        let lines = ["WARN one", "ERROR two", "INFO three"];
+        let data = utf16le_bytes(&lines);
+        let hits = run_worker_enc(&data, "WARN|ERROR", true, true, Encoding::Utf16Le, 2);
+        let got: Vec<u64> = hits.iter().map(|h| h.line).collect();
+        assert_eq!(got, vec![1, 2]);
+        // Boolean via the bool worker.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b16.log");
+        std::fs::write(&path, &data).unwrap();
+        let ast = crate::engine::query::parse_query("ERROR OR WARN").unwrap();
+        let (tx, rx) = mpsc::channel();
+        spawn_bool_search(
+            SearchJobParams {
+                path,
+                gen: 1,
+                gen_shared: Arc::new(AtomicU64::new(1)),
+                tx,
+                cancel: Arc::new(AtomicBool::new(false)),
+            },
+            ast,
+            Encoding::Utf16Le,
+            2,
+            false,
+            None,
+            None,
+        );
+        let mut out = Vec::new();
+        for msg in rx {
+            assert!(msg.error.is_none(), "bool worker error: {:?}", msg.error);
+            out.extend(msg.batch);
+            if msg.done {
+                break;
+            }
+        }
+        assert_eq!(out.len(), 2, "boolean search must work on UTF-16");
+    }
+
+    /// P0-3: streaming emission â€” progress messages arrive before done.
+    #[test]
+    fn worker_streaming_progress_before_done() {
+        // Big-ish data across many chunks: batches + progress must flow
+        // while done=false at least once (mmap path, rayon streaming).
+        let data = worker_data();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.log");
+        std::fs::write(&path, &data).unwrap();
+        let (tx, rx) = mpsc::channel();
+        spawn_search(
+            SearchJobParams {
+                path,
+                gen: 1,
+                gen_shared: Arc::new(AtomicU64::new(1)),
+                tx,
+                cancel: Arc::new(AtomicBool::new(false)),
+            },
+            "ERROR".to_string(),
+            false,
+            true,
+            None,
+            None,
+            Encoding::Utf8,
+            0,
+        );
+        let mut saw_progress_before_done = false;
+        let mut total = 0usize;
+        let mut done = false;
+        for msg in rx {
+            if msg.done {
+                done = true;
+            } else if !msg.batch.is_empty() || msg.scanned > 0 {
+                saw_progress_before_done = true;
+            }
+            total += msg.batch.len();
+            if done {
+                break;
+            }
+        }
+        assert!(done);
+        assert!(saw_progress_before_done, "streaming must emit before done");
+        assert!(total > 0);
+    }
+
+    /// Literal-insensitif Unicode end-to-end (jalur rayon mmap, tanpa
+    /// salinan lowercase): ÉCLAIR cocok dengan "éclair", tapi "eclair"
+    /// polos TIDAK dicocokkan (fold presisi, bukan aproksimasi).
+    #[test]
+    fn worker_literal_insensitive_full_unicode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("u.log");
+        std::fs::write(&path, "w1 ÉCLAIR x\nw2 éclair y\nw3 plain\n".as_bytes()).unwrap();
+        let run = |q: &str| {
+            let (tx, rx) = mpsc::channel();
+            spawn_search(
+                SearchJobParams {
+                    path: path.clone(),
+                    gen: 1,
+                    gen_shared: Arc::new(AtomicU64::new(1)),
+                    tx,
+                    cancel: Arc::new(AtomicBool::new(false)),
+                },
+                q.to_string(),
+                false,
+                false,
+                None,
+                None,
+                Encoding::Utf8,
+                0,
+            );
+            let mut out = Vec::new();
+            for msg in rx {
+                assert!(msg.error.is_none(), "worker error: {:?}", msg.error);
+                out.extend(msg.batch);
+                if msg.done {
+                    break;
+                }
+            }
+            out
+        };
+        let hits = run("éclair");
+        assert_eq!(hits.len(), 2, "both folded lines must match");
+        assert_eq!(hits[0].line, 1);
+        assert_eq!(hits[1].line, 2);
+        assert!(run("eclair").is_empty(), "ASCII needle must not match accented text");
+    }
+
+    /// Boolean-insensitif non-ASCII: prefilter ASCII tak boleh menggugurkan
+    /// baris yang cocok lewat fold Unicode (regresi false-negative).
+    #[test]
+    fn worker_bool_insensitive_unicode_no_false_negative() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ub.log");
+        std::fs::write(&path, "w1 ÉCLAIR x\nw2 plain\n".as_bytes()).unwrap();
+        let ast = crate::engine::query::parse_query("éclair").unwrap();
+        let (tx, rx) = mpsc::channel();
+        spawn_bool_search(
+            SearchJobParams {
+                path,
+                gen: 1,
+                gen_shared: Arc::new(AtomicU64::new(1)),
+                tx,
+                cancel: Arc::new(AtomicBool::new(false)),
+            },
+            ast,
+            Encoding::Utf8,
+            0,
+            false,
+            None,
+            None,
+        );
+        let mut out = Vec::new();
+        for msg in rx {
+            assert!(msg.error.is_none(), "bool worker error: {:?}", msg.error);
+            out.extend(msg.batch);
+            if msg.done {
+                break;
+            }
+        }
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].line, 1);
+    }
+}

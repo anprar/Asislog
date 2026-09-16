@@ -1,7 +1,9 @@
 // English comments: tiny boolean query parser -> AST, evaluated per line.
-// Syntax: terms, "quoted phrases", -exclude / NOT x, AND (or whitespace),
-// OR / |, parentheses. AND binds tighter than OR. Usable in literal mode;
-// regex mode keeps the whole query as one pattern.
+// Syntax: terms, "quoted phrases", -exclude / NOT x, AND (or whitespace, or &),
+// OR / |, XOR, NAND, NOR, parentheses. Precedence (klogg/exprtk parity):
+// NOT > AND/NAND > OR/NOR/XOR. AND binds tighter than OR. NAND(a,b) is
+// NOT(AND(a,b)), NOR(a,b) is NOT(OR(a,b)), XOR is odd parity. Usable in
+// literal mode; regex mode keeps the whole query as one pattern.
 
 /// Boolean query AST. Matching is substring-based (see `matches`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -10,6 +12,8 @@ pub enum Query {
     Not(Box<Query>),
     And(Vec<Query>),
     Or(Vec<Query>),
+    /// Odd parity over branches (true when an odd number matches).
+    Xor(Vec<Query>),
 }
 
 impl Query {
@@ -21,6 +25,9 @@ impl Query {
             Query::Not(q) => !q.matches(line, case_sensitive),
             Query::And(qs) => qs.iter().all(|q| q.matches(line, case_sensitive)),
             Query::Or(qs) => qs.iter().any(|q| q.matches(line, case_sensitive)),
+            Query::Xor(qs) => {
+                qs.iter().filter(|q| q.matches(line, case_sensitive)).count() % 2 == 1
+            }
         }
     }
 
@@ -39,7 +46,7 @@ impl Query {
                 }
             }
             Query::Not(q) => q.collect_positive(!neg, out),
-            Query::And(qs) | Query::Or(qs) => {
+            Query::And(qs) | Query::Or(qs) | Query::Xor(qs) => {
                 for q in qs {
                     q.collect_positive(neg, out);
                 }
@@ -51,22 +58,26 @@ impl Query {
     /// every full match must contain at least one positive term, so lines
     /// without any of them can skip decode + AST eval without false negatives.
     /// Holds for negation-free ASTs with non-empty leaves and non-empty
-    /// And/Or lists. Counter-example otherwise: `a OR -b` matches lines
+    /// And/Or/Xor lists. Counter-example otherwise: `a OR -b` matches lines
     /// containing neither (via `-b`), so a union prefilter would drop them.
+    /// XOR is OR-like here (a match always contains a branch match).
     pub fn is_prefilter_safe(&self) -> bool {
         match self {
             Query::Term(t) => !t.is_empty(),
             Query::Not(_) => false,
-            Query::And(qs) | Query::Or(qs) => !qs.is_empty() && qs.iter().all(|q| q.is_prefilter_safe()),
+            Query::And(qs) | Query::Or(qs) | Query::Xor(qs) => {
+                !qs.is_empty() && qs.iter().all(|q| q.is_prefilter_safe())
+            }
         }
     }
 
     /// Terms that EVERY full match must contain (conjunction core).
     /// Term(t) non-empty at positive polarity -> {t}; And (positive) ->
-    /// union of children's; Or/Not-anything-negative -> {}.
+    /// union of children's; Or/Xor/Not-anything-negative -> {}.
     /// Sound by induction on polarity: an And-match implies every conjunct
-    /// matches, and a positive Term-match implies containment; Or branches
-    /// and anything under Not promise nothing, so they contribute nothing.
+    /// matches, and a positive Term-match implies containment; Or/Xor
+    /// branches and anything under Not promise nothing, so they contribute
+    /// nothing. (NAND/NOR desugar to Not(And)/Not(Or): also nothing.)
     /// The worker prefilters on the longest one (most selective single
     /// literal, plain SIMD memchr).
     pub fn required_terms(&self) -> Vec<&str> {
@@ -90,7 +101,7 @@ impl Query {
                     }
                 }
             }
-            Query::Or(_) => {}
+            Query::Or(_) | Query::Xor(_) => {}
         }
     }
 
@@ -140,11 +151,9 @@ fn contains(hay: &str, needle: &str, case_sensitive: bool) -> bool {
     if case_sensitive {
         hay.contains(needle)
     } else {
-        // ASCII fold both sides without allocating the whole haystack twice:
-        // memchr-style scan over lowercased needle against folded windows.
-        // Simpler correct version: fold hay once per call (lines are short).
-        hay.to_ascii_lowercase()
-            .contains(&needle.to_ascii_lowercase())
+        // Full Unicode case fold (é/É, Cyrillic, CJK-safe): lowercasing both
+        // sides covers the practical log cases; ASCII fold is a subset.
+        hay.to_lowercase().contains(&needle.to_lowercase())
     }
 }
 
@@ -160,9 +169,10 @@ pub fn first_match_span(line: &str, terms: &[&str], case_sensitive: bool) -> (u3
             memchr::memmem::Finder::new(t.as_bytes())
                 .find(line.as_bytes())
         } else {
-            let h = line.as_bytes().to_ascii_lowercase();
-            let n = t.as_bytes().to_ascii_lowercase();
-            memchr::memmem::Finder::new(&n).find(&h)
+            // Full Unicode fold (matches `contains` semantics above).
+            let h = line.to_lowercase();
+            let n = t.to_lowercase();
+            memchr::memmem::Finder::new(n.as_bytes()).find(h.as_bytes())
         };
         if let Some(m) = pos {
             let span = (m, m + t.len());
@@ -179,6 +189,9 @@ enum Tok {
     Term(String),
     And,
     Or,
+    Xor,
+    Nand,
+    Nor,
     Not,
     LParen,
     RParen,
@@ -192,11 +205,14 @@ pub fn is_boolean_query(q: &str) -> bool {
         return false;
     }
     // Any operator syntax forces boolean evaluation.
-    if t.contains('|') || t.contains('(') || t.contains(')') || t.contains('"') {
+    if t.contains('|') || t.contains('&') || t.contains('(') || t.contains(')') || t.contains('"') {
         return true;
     }
     let up = t.to_ascii_uppercase();
-    if up.split_whitespace().any(|w| w == "OR" || w == "AND" || w == "NOT") {
+    if up
+        .split_whitespace()
+        .any(|w| w == "OR" || w == "AND" || w == "NOT" || w == "XOR" || w == "NAND" || w == "NOR")
+    {
         return true;
     }
     if t.split_whitespace().any(|w| w.starts_with('-') && w.len() > 1) {
@@ -228,6 +244,14 @@ fn tokenize(q: &str) -> Result<Vec<Tok>, String> {
                 chars.next();
                 // "||" is also OR.
                 if chars.peek() == Some(&'|') {
+                    chars.next();
+                }
+            }
+            '&' => {
+                toks.push(Tok::And);
+                chars.next();
+                // "&&" is also AND (exprtk parity with `|`).
+                if chars.peek() == Some(&'&') {
                     chars.next();
                 }
             }
@@ -269,6 +293,12 @@ fn tokenize(q: &str) -> Result<Vec<Tok>, String> {
                     toks.push(Tok::Or);
                 } else if up == "AND" {
                     toks.push(Tok::And);
+                } else if up == "XOR" {
+                    toks.push(Tok::Xor);
+                } else if up == "NAND" {
+                    toks.push(Tok::Nand);
+                } else if up == "NOR" {
+                    toks.push(Tok::Nor);
                 } else if up == "NOT" {
                     toks.push(Tok::Not);
                 } else {
@@ -283,7 +313,7 @@ fn tokenize(q: &str) -> Result<Vec<Tok>, String> {
 fn collect_bare(chars: &mut std::iter::Peekable<std::str::Chars>) -> String {
     let mut s = String::new();
     while let Some(&c) = chars.peek() {
-        if c.is_whitespace() || c == '(' || c == ')' || c == '|' || c == '"' {
+        if c.is_whitespace() || c == '(' || c == ')' || c == '|' || c == '&' || c == '"' {
             break;
         }
         s.push(c);
@@ -316,41 +346,83 @@ impl Parser {
         self.toks.get(self.pos)
     }
 
-    // OR level: and (OR and)*
+    // OR level: and ((OR | NOR | XOR) and)* — left-associative so mixed
+    // operators nest honestly; pure OR chains flatten in `simplify`.
+    // NOR(a,b) = NOT(OR(a,b)); XOR folds with odd parity.
     fn parse_or(&mut self) -> Result<Query, String> {
-        let mut nodes = vec![self.parse_and()?];
-        while self.peek() == Some(&Tok::Or) {
-            self.pos += 1;
-            nodes.push(self.parse_and()?);
-        }
-        Ok(if nodes.len() == 1 {
-            nodes.pop().unwrap()
-        } else {
-            Query::Or(nodes)
-        })
-    }
-
-    // AND level: unary ((AND | implicit) unary)*
-    fn parse_and(&mut self) -> Result<Query, String> {
-        let mut nodes = vec![self.parse_unary()?];
+        let mut acc = self.parse_and()?;
         loop {
             match self.peek() {
-                Some(Tok::And) => {
+                Some(Tok::Or) => {
                     self.pos += 1;
-                    nodes.push(self.parse_unary()?);
+                    let rhs = self.parse_and()?;
+                    acc = match acc {
+                        Query::Or(mut v) => {
+                            v.push(rhs);
+                            Query::Or(v)
+                        }
+                        other => Query::Or(vec![other, rhs]),
+                    };
                 }
-                Some(Tok::Term(_)) | Some(Tok::Not) | Some(Tok::LParen) => {
-                    // Implicit AND by juxtaposition.
-                    nodes.push(self.parse_unary()?);
+                Some(Tok::Nor) => {
+                    self.pos += 1;
+                    let rhs = self.parse_and()?;
+                    acc = Query::Not(Box::new(Query::Or(vec![acc, rhs])));
+                }
+                Some(Tok::Xor) => {
+                    self.pos += 1;
+                    let rhs = self.parse_and()?;
+                    acc = match acc {
+                        Query::Xor(mut v) => {
+                            v.push(rhs);
+                            Query::Xor(v)
+                        }
+                        other => Query::Xor(vec![other, rhs]),
+                    };
                 }
                 _ => break,
             }
         }
-        Ok(if nodes.len() == 1 {
-            nodes.pop().unwrap()
-        } else {
-            Query::And(nodes)
-        })
+        Ok(acc)
+    }
+
+    // AND level: unary ((AND | NAND | implicit) unary)* — left-associative;
+    // pure AND chains flatten in `simplify`. NAND(a,b) = NOT(AND(a,b)).
+    fn parse_and(&mut self) -> Result<Query, String> {
+        let mut acc = self.parse_unary()?;
+        loop {
+            match self.peek() {
+                Some(Tok::And) => {
+                    self.pos += 1;
+                    let rhs = self.parse_unary()?;
+                    acc = match acc {
+                        Query::And(mut v) => {
+                            v.push(rhs);
+                            Query::And(v)
+                        }
+                        other => Query::And(vec![other, rhs]),
+                    };
+                }
+                Some(Tok::Nand) => {
+                    self.pos += 1;
+                    let rhs = self.parse_unary()?;
+                    acc = Query::Not(Box::new(Query::And(vec![acc, rhs])));
+                }
+                Some(Tok::Term(_)) | Some(Tok::Not) | Some(Tok::LParen) => {
+                    // Implicit AND by juxtaposition.
+                    let rhs = self.parse_unary()?;
+                    acc = match acc {
+                        Query::And(mut v) => {
+                            v.push(rhs);
+                            Query::And(v)
+                        }
+                        other => Query::And(vec![other, rhs]),
+                    };
+                }
+                _ => break,
+            }
+        }
+        Ok(acc)
     }
 
     fn parse_unary(&mut self) -> Result<Query, String> {
@@ -415,6 +487,21 @@ impl Query {
                     Query::Or(flat)
                 }
             }
+            Query::Xor(mut qs) => {
+                let mut flat = Vec::new();
+                for q in qs.drain(..) {
+                    match q.simplify() {
+                        Query::Xor(inner) => flat.extend(inner),
+                        Query::Term(t) if t.is_empty() => {}
+                        other => flat.push(other),
+                    }
+                }
+                if flat.len() == 1 {
+                    flat.pop().unwrap()
+                } else {
+                    Query::Xor(flat)
+                }
+            }
             Query::Not(q) => Query::Not(Box::new(q.simplify())),
             other => other,
         }
@@ -426,11 +513,11 @@ impl Query {
 /// Indonesian reason so the UI can warn instead of silently changing meaning.
 /// Mapping (polarity-aware, De Morgan for negated OR):
 /// Term -> include token; Not(Term) -> `-token`; And -> space-joined;
-/// Not(Or(..)) -> AND of negations. Everything else (Or, Not(And),
-/// quoted phrases with spaces, `kunci=nilai`, lone `-`) is rejected:
-/// OR has no filter counterpart, spaces would split tokens, and `=`
-/// means a JSON field predicate in filter (different semantics from a
-/// substring on plain logs).
+/// Not(Or(..)) -> AND of negations (covers `a NOR b` = neither).
+/// Everything else (Or, Xor, Not(And) incl. `a NAND b`, quoted phrases with
+/// spaces, `kunci=nilai`, lone `-`) is rejected: OR/XOR have no filter
+/// counterpart, spaces would split tokens, and `=` means a JSON field
+/// predicate in filter (different semantics from a substring on plain logs).
 pub fn to_filter_string(q: &Query) -> Result<String, String> {
     fn token(t: &str) -> Result<String, String> {
         if t.contains(char::is_whitespace) {
@@ -487,6 +574,9 @@ pub fn to_filter_string(q: &Query) -> Result<String, String> {
                 }
                 Ok(())
             }
+            Query::Xor(_) => Err(String::from(
+                "XOR tak punya padanan di filter (filter selalu AND).",
+            )),
         }
     }
     let mut out = Vec::new();
@@ -498,13 +588,16 @@ pub fn to_filter_string(q: &Query) -> Result<String, String> {
 }
 
 /// Top-level display spans for the chip builder: (text, byte_start, byte_end).
-/// Returns None for complex expressions (OR/parens/quotes at top level);
-/// the UI then shows one summary chip instead of per-term chips.
+/// Returns None for complex expressions (OR/XOR/NAND/NOR/parens/quotes at
+/// top level); the UI then shows one summary chip instead of per-term chips.
 pub fn top_spans(q: &str) -> Option<Vec<(String, usize, usize)>> {
     let toks = tokenize(q).ok()?;
     // Complex when top-level OR/paren/quote tokens exist. Quotes already
     // merged into Term by the tokenizer, so track them separately.
-    if toks.iter().any(|t| matches!(t, Tok::Or | Tok::LParen | Tok::RParen)) {
+    if toks
+        .iter()
+        .any(|t| matches!(t, Tok::Or | Tok::Xor | Tok::Nand | Tok::Nor | Tok::LParen | Tok::RParen))
+    {
         return None;
     }
     if q.contains('"') {
@@ -527,7 +620,13 @@ pub fn top_spans(q: &str) -> Option<Vec<(String, usize, usize)>> {
             i += 1;
         }
         let word = &q[start..i];
-        if word.eq_ignore_ascii_case("AND") || word.eq_ignore_ascii_case("NOT") {
+        if word.eq_ignore_ascii_case("AND")
+            || word.eq_ignore_ascii_case("NOT")
+            || word.eq_ignore_ascii_case("OR")
+            || word.eq_ignore_ascii_case("XOR")
+            || word.eq_ignore_ascii_case("NAND")
+            || word.eq_ignore_ascii_case("NOR")
+        {
             continue;
         }
         out.push((word.to_string(), start, i));
@@ -617,6 +716,20 @@ mod tests {
         let q = parse_query("ERROR").unwrap();
         assert!(q.matches("error x", false));
         assert!(!q.matches("error x", true));
+    }
+
+    #[test]
+    fn case_insensitive_is_full_unicode() {
+        // é/É fold: ASCII-only folding would miss these (klogg parity).
+        let q = parse_query("Érror").unwrap();
+        assert!(q.matches("érror boom", false), "lowercase accent must match");
+        assert!(q.matches("Érror boom", false));
+        // Cyrillic.
+        let q = parse_query("ошибка").unwrap();
+        assert!(q.matches("ОШИБКА тест", false), "Cyrillic fold must match");
+        // first_match_span uses the same fold.
+        let (s, e) = first_match_span("boom érror here", &["érror"], false);
+        assert_eq!((s, e), (5, 11));
     }
 
     #[test]
@@ -780,7 +893,7 @@ mod tests {
             "debug only",
             "nothing",
         ];
-        for q in ["err timeout", "err -debug", "-debug", "NOT (a OR b)"] {
+        for q in ["err timeout", "err -debug", "-debug", "NOT (a OR b)", "a NOR b"] {
             let ast = parse_query(q).unwrap();
             let f = parse_filter(&conv(q).unwrap(), false);
             for ln in lines {
@@ -791,6 +904,125 @@ mod tests {
                     q,
                     ln
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn xor_nand_nor_truth_tables() {
+        // NOTE: single letters collide with line words ("has" contains 'a'),
+        // so the tables use alpha/beta.
+        let t = |q: &str, ln: &str| parse_query(q).unwrap().matches(ln, true);
+        let (a_only, b_only, both, neither) =
+            ("alpha here", "beta here", "alpha and beta", "nothing here");
+        // XOR: exactly one side.
+        assert!(t("alpha XOR beta", a_only));
+        assert!(t("alpha XOR beta", b_only));
+        assert!(!t("alpha XOR beta", both));
+        assert!(!t("alpha XOR beta", neither));
+        // NAND: everything except both.
+        assert!(t("alpha NAND beta", a_only));
+        assert!(t("alpha NAND beta", b_only));
+        assert!(!t("alpha NAND beta", both));
+        assert!(t("alpha NAND beta", neither));
+        // NOR: neither side.
+        assert!(!t("alpha NOR beta", a_only));
+        assert!(!t("alpha NOR beta", b_only));
+        assert!(!t("alpha NOR beta", both));
+        assert!(t("alpha NOR beta", neither));
+        // Case-insensitive keywords.
+        assert!(!t("alpha xor beta", both));
+        assert!(t("alpha nand beta", neither));
+        assert!(t("alpha nor beta", neither));
+    }
+
+    #[test]
+    fn xor_nand_nor_precedence_and_shapes() {
+        // NAND binds with AND (tighter than OR).
+        assert_eq!(
+            parse_query("a OR b NAND c").unwrap(),
+            Query::Or(vec![
+                Query::Term("a".into()),
+                Query::Not(Box::new(Query::And(vec![
+                    Query::Term("b".into()),
+                    Query::Term("c".into()),
+                ]))),
+            ])
+        );
+        // NOR/XOR bind at OR level; AND still tighter.
+        assert_eq!(
+            parse_query("a XOR b c").unwrap(),
+            Query::Xor(vec![
+                Query::Term("a".into()),
+                Query::And(vec![Query::Term("b".into()), Query::Term("c".into())]),
+            ])
+        );
+        assert_eq!(
+            parse_query("a NOR b").unwrap(),
+            Query::Not(Box::new(Query::Or(vec![
+                Query::Term("a".into()),
+                Query::Term("b".into()),
+            ])))
+        );
+        // & / && are AND (exprtk parity with `|`).
+        assert_eq!(
+            parse_query("a&b").unwrap(),
+            Query::And(vec![Query::Term("a".into()), Query::Term("b".into())])
+        );
+        assert_eq!(
+            parse_query("a && b").unwrap(),
+            Query::And(vec![Query::Term("a".into()), Query::Term("b".into())])
+        );
+        assert!(is_boolean_query("a&b"));
+        assert!(is_boolean_query("a XOR b"));
+        assert!(is_boolean_query("a NAND b"));
+        assert!(is_boolean_query("a NOR b"));
+        // Bare words that merely contain the letters stay terms.
+        assert!(!is_boolean_query("anomaly"));
+        assert!(!is_boolean_query("northern"));
+    }
+
+    #[test]
+    fn xor_nand_nor_prefilter_and_filter_contracts() {
+        use PrefilterPlan::*;
+        // Pure XOR: union prefilter sound, no required term.
+        let q = parse_query("a XOR b").unwrap();
+        assert!(q.is_prefilter_safe());
+        assert!(q.required_terms().is_empty());
+        assert_eq!(q.prefilter_plan(true), UnionOnly);
+        // NAND/NOR desugar under Not: no sound prefilter.
+        for qq in ["a NAND b", "a NOR b", "a XOR -b"] {
+            let ast = parse_query(qq).unwrap();
+            assert!(!ast.is_prefilter_safe(), "{}", qq);
+            assert_eq!(ast.prefilter_plan(true), None, "{}", qq);
+        }
+        // NOR converts exactly (neither); XOR/NAND are rejected honestly.
+        assert_eq!(conv("a NOR b").unwrap(), "-a -b");
+        assert!(conv("a XOR b").is_err());
+        assert!(conv("a NAND b").is_err());
+        // Complex chips collapse to summary.
+        assert!(top_spans("a XOR b").is_none());
+        assert!(top_spans("a NAND b").is_none());
+    }
+
+    #[test]
+    fn xor_prefilter_sound_differential() {
+        // Full-match lines of negation-free XOR always carry a branch term.
+        let lines = ["has a", "has b", "has a and b", "neither", "A B"];
+        for q in ["a XOR b", "a XOR b XOR c"] {
+            let ast = parse_query(q).unwrap();
+            assert!(ast.is_prefilter_safe());
+            let terms = ast.positive_terms();
+            for ln in lines {
+                if ast.matches(ln, false) {
+                    let low = ln.to_ascii_lowercase();
+                    assert!(
+                        terms.iter().any(|t| low.contains(&t.to_ascii_lowercase())),
+                        "query {:?} matched {:?} without any positive term",
+                        q,
+                        ln
+                    );
+                }
             }
         }
     }

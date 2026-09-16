@@ -174,6 +174,79 @@ pub fn detect_encoding(sample: &[u8]) -> (Encoding, usize) {
     }
 }
 
+/// Detect binary files from the head sample (before indexing/search/count).
+/// Text logs essentially never contain NUL; database blobs (e.g. Firebird
+/// `.log` lookalikes) are full of them. Empty or BOM-marked input is text,
+/// NUL-free heads are text, NULs aligned like UTF-16 text are text — only
+/// NUL density above 5% counts as binary (a stray NUL or two still opens
+/// as text; blobs sit at 50-95%).
+/// Only the head 8 KiB is scanned: O(1), safe for 12 GB files.
+pub fn is_binary_sample(sample: &[u8]) -> bool {
+    if sample.is_empty() {
+        return false;
+    }
+    if sample.starts_with(&[0xEF, 0xBB, 0xBF])
+        || sample.starts_with(&[0xFF, 0xFE])
+        || sample.starts_with(&[0xFE, 0xFF])
+    {
+        return false;
+    }
+    let n = sample.len().min(8 * 1024);
+    let buf = &sample[..n];
+    let nul = buf.iter().filter(|&&b| b == 0).count();
+    if nul == 0 {
+        return false;
+    }
+    if looks_like_utf16_text(buf) {
+        return false;
+    }
+    nul * 100 > n * 5
+}
+
+/// UTF-16 without BOM: for ASCII-range text every other byte is NUL.
+/// True when NULs align to one parity AND the sibling bytes are mostly
+/// printable ASCII / common whitespace.
+fn looks_like_utf16_text(buf: &[u8]) -> bool {
+    if buf.len() < 4 {
+        return false;
+    }
+    let mut nul_even = 0usize;
+    let mut nul_odd = 0usize;
+    let mut sib_even_ok = 0usize;
+    let mut sib_odd_ok = 0usize;
+    let mut pairs = 0usize;
+    for pair in buf.chunks(2) {
+        if pair.len() < 2 {
+            break; // odd tail byte carries no parity signal
+        }
+        pairs += 1;
+        let (a, b) = (pair[0], pair[1]);
+        if a == 0 {
+            nul_even += 1;
+        } else if a.is_ascii_graphic() || a == b' ' || a == b'\t' || a == b'\r' || a == b'\n' {
+            sib_even_ok += 1;
+        }
+        if b == 0 {
+            nul_odd += 1;
+        } else if b.is_ascii_graphic() || b == b' ' || b == b'\t' || b == b'\r' || b == b'\n' {
+            sib_odd_ok += 1;
+        }
+    }
+    if pairs == 0 {
+        return false;
+    }
+    // LE text: odd bytes ~all NUL, even bytes ~all text (and mirrored for BE).
+    let odd_text = nul_odd * 100 >= pairs * 70 && sib_even_ok * 100 >= pairs * 70;
+    let even_text = nul_even * 100 >= pairs * 70 && sib_odd_ok * 100 >= pairs * 70;
+    odd_text || even_text
+}
+
+/// Count NUL bytes in the head sample (for honest "why binary" messages).
+pub fn count_nul_head(sample: &[u8]) -> usize {
+    let n = sample.len().min(8 * 1024);
+    sample[..n].iter().filter(|&&b| b == 0).count()
+}
+
 /// Decode a single line's raw bytes (without trailing \n / \r\n) lossily.
 /// Never panics on invalid input.
 pub fn decode_bytes(bytes: &[u8], enc: Encoding) -> String {
@@ -334,8 +407,7 @@ mod tests {
     }
 
     #[test]
-    fn encoding_keys_roundtrip() {
-        for e in Encoding::all() {
+    fn encoding_keys_roundtrip() {        for e in Encoding::all() {
             assert_eq!(Encoding::from_key(e.key()), Some(*e), "key {}", e.key());
             assert!(!e.label().is_empty());
         }
@@ -346,5 +418,40 @@ mod tests {
         assert_eq!(Encoding::from_key("bogus"), None);
         // 13 view encodings: the original 4 plus 9 new ones.
         assert_eq!(Encoding::all().len(), 13);
+    }
+
+    #[test]
+    fn binary_sample_detection() {
+        // Plain text (LF/CRLF, UTF-8, latin-1): never binary.
+        assert!(!is_binary_sample(b"2026-09-04 INFO start\nline2\r\nline3"));
+        assert!(!is_binary_sample(&[0xEF, 0xBB, 0xBF, b'a', 0x00])); // BOM wins
+        assert!(!is_binary_sample(&[]));
+        // Firebird-style blob: NUL-dense head => binary.
+        let mut blob = vec![0x41u8; 4096];
+        for i in (0..4096).step_by(3) {
+            blob[i] = 0;
+        }
+        assert!(count_nul_head(&blob) > 1000);
+        assert!(is_binary_sample(&blob));
+        // Single stray NUL in text still opens (below the 5% bar).
+        let mut stray = b"hello world, this is a log line\n".to_vec();
+        stray[5] = 0;
+        assert!(!is_binary_sample(&stray));
+        // UTF-16LE without BOM (ASCII text): NULs align to odd parity.
+        let mut u16le = Vec::new();
+        for l in ["alpha one\n", "beta two\n"] {
+            for u in l.encode_utf16() {
+                u16le.extend_from_slice(&u.to_le_bytes());
+            }
+        }
+        assert!(!is_binary_sample(&u16le));
+        // Same for BE.
+        let mut u16be = Vec::new();
+        for l in ["alpha one\n", "beta two\n"] {
+            for u in l.encode_utf16() {
+                u16be.extend_from_slice(&u.to_be_bytes());
+            }
+        }
+        assert!(!is_binary_sample(&u16be));
     }
 }

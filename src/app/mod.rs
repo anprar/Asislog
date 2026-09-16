@@ -14,6 +14,7 @@ pub(crate) mod shortcuts;
 pub(crate) mod state;
 pub(crate) mod tab;
 pub(crate) mod ui;
+pub(crate) mod ui_analyze;
 pub(crate) mod ui_chrome;
 pub(crate) mod ui_dialogs;
 pub(crate) mod ui_highlight;
@@ -25,6 +26,7 @@ pub(crate) mod ui_search;
 pub(crate) mod ui_tools;
 pub(crate) mod ui_tools_investigation;
 pub(crate) mod ui_viewport;
+pub(crate) mod update;
 
 // ---------- background messages ----------
 
@@ -44,6 +46,12 @@ pub(crate) struct SearchBatchMsg {
     scanned: u64,
     /// Total file bytes at search start.
     total: u64,
+    /// Exact in-scope matches found by THIS job so far (cumulative).
+    /// Workers keep counting past the display cap (count-only mode, no
+    /// extra Hit storage), so a truncated "15.257.710 hasil" label is
+    /// exact, not an estimate. Tail-refresh jobs count the tail only;
+    /// the tab adds its merge base (see `merge_base`).
+    grand_total: u64,
 }
 
 /// Gutter + text responses for one log row (for distinct click targets).

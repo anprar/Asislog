@@ -2,6 +2,7 @@
 
 use crate::ui::theme::Tema;
 use super::AsisLogApp;
+use super::actions::{open_in_default_app, show_in_explorer};
 
 pub struct PaletteAction {
     pub title: &'static str,
@@ -13,7 +14,7 @@ pub struct PaletteAction {
 pub const PALETTE_ACTIONS: &[PaletteAction] = &[
     PaletteAction { title: "Buka file log…", shortcut: "Ctrl+O", category: "File", id: "open_file" },
     PaletteAction { title: "Fokus pencarian", shortcut: "Ctrl+F", category: "Navigasi", id: "focus_search" },
-    PaletteAction { title: "Toggle Mode Zen (Kepadatan)", shortcut: "F11", category: "Tampilan", id: "toggle_zen" },
+    PaletteAction { title: "Toggle Layar Penuh (Kepadatan)", shortcut: "F11", category: "Tampilan", id: "toggle_zen" },
     PaletteAction { title: "Panel belah (dual-pane hasil)", shortcut: "", category: "Tampilan", id: "toggle_split" },
     PaletteAction { title: "Toggle Ikuti log (LIVE)", shortcut: "Ctrl+Shift+F", category: "Log", id: "toggle_follow" },
     PaletteAction { title: "Ke baris / cap waktu…", shortcut: "Ctrl+G", category: "Navigasi", id: "goto_line" },
@@ -29,6 +30,7 @@ pub const PALETTE_ACTIONS: &[PaletteAction] = &[
     PaletteAction { title: "Panel Histogram Waktu ERROR (Toggle)", shortcut: "", category: "Investigasi", id: "toggle_hist" },
     PaletteAction { title: "Agregasi Top-N Error / Sesi", shortcut: "", category: "Investigasi", id: "open_top_n" },
     PaletteAction { title: "Hex Peek (Mode biner aman)", shortcut: "", category: "Investigasi", id: "open_hex_peek" },
+    PaletteAction { title: "Analisis Log (Parser/SQL/Gabung)", shortcut: "", category: "Investigasi", id: "open_analyze" },
     PaletteAction { title: "Tema: Sistem (Otomatis OS)", shortcut: "", category: "Tema", id: "theme_system" },
     PaletteAction { title: "Tema: Gelap", shortcut: "", category: "Tema", id: "theme_dark" },
     PaletteAction { title: "Tema: Terang", shortcut: "", category: "Tema", id: "theme_light" },
@@ -41,7 +43,15 @@ pub const PALETTE_ACTIONS: &[PaletteAction] = &[
     PaletteAction { title: "Zoom: Perbesar (+10%)", shortcut: "Ctrl+=", category: "Tampilan", id: "zoom_in" },
     PaletteAction { title: "Zoom: Perkecil (-10%)", shortcut: "Ctrl+-", category: "Tampilan", id: "zoom_out" },
     PaletteAction { title: "Zoom: Reset (100%)", shortcut: "Ctrl+0", category: "Tampilan", id: "zoom_reset" },
+    PaletteAction { title: "Lipat Baris / Word Wrap (Toggle)", shortcut: "W", category: "Tampilan", id: "toggle_wrap" },
+    PaletteAction { title: "Cari Cepat (QuickFind)", shortcut: "/", category: "Navigasi", id: "open_quickfind" },
+    PaletteAction { title: "Pengaturan AsisLog…", shortcut: "Ctrl+,", category: "Bantuan", id: "open_options" },
+    PaletteAction { title: "Tentang AsisLog (versi + log fitur)", shortcut: "", category: "Bantuan", id: "open_about" },
+    PaletteAction { title: "Buka Folder File (Explorer)", shortcut: "", category: "Alat", id: "open_folder" },
+    PaletteAction { title: "Buka File di Aplikasi Default", shortcut: "", category: "Alat", id: "open_external" },
     PaletteAction { title: "Daftar Pintasan Keyboard", shortcut: "F1", category: "Bantuan", id: "open_shortcuts" },
+    PaletteAction { title: "Muat ulang file", shortcut: "F5", category: "File", id: "reload_file" },
+    PaletteAction { title: "Keluar aplikasi", shortcut: "Ctrl+Q", category: "File", id: "quit_app" },
 ];
 
 impl AsisLogApp {
@@ -159,9 +169,9 @@ impl AsisLogApp {
                 self.cfg_dirty = true;
                 let lang = self.lang;
                 self.global_status = if self.zen_mode {
-                    lang.tr("Mode Zen aktif (F11 untuk kembali).").to_string()
+                    lang.tr("Layar Penuh aktif (F11 untuk kembali).").to_string()
                 } else {
-                    lang.tr("Mode Zen dinonaktifkan.").to_string()
+                    lang.tr("Layar Penuh dinonaktifkan.").to_string()
                 };
             }
             "toggle_follow" => {
@@ -244,6 +254,7 @@ impl AsisLogApp {
                 }
             }
             "open_hex_peek" => self.hex_peek_open = true,
+            "open_analyze" => self.analyze_open = true,
             "theme_system" => { self.tema = Tema::Sistem; self.cfg_dirty = true; }
             "theme_dark" => { self.tema = Tema::Gelap; self.cfg_dirty = true; }
             "theme_light" => { self.tema = Tema::Terang; self.cfg_dirty = true; }
@@ -259,7 +270,43 @@ impl AsisLogApp {
             "zoom_in" => self.bump_zoom(ctx, self.zoom + 0.1),
             "zoom_out" => self.bump_zoom(ctx, self.zoom - 0.1),
             "zoom_reset" => self.bump_zoom(ctx, 1.0),
+            "toggle_wrap" => {
+                if let Some(tab) = self.current_tab_mut() {
+                    tab.word_wrap = !tab.word_wrap;
+                    tab.wrap_rows_cache.clear();
+                    self.cfg_dirty = true;
+                }
+            }
+            "open_quickfind" => {
+                if let Some(tab) = self.current_tab_mut() {
+                    tab.qf_open = true;
+                    tab.qf_match = None;
+                    tab.qf_msg = None;
+                }
+            }
+            "open_options" => self.options_open = true,
+            "open_about" => self.about_open = true,
+            "open_folder" => {
+                let lang = self.lang;
+                if let Some(tab) = self.current_tab_mut() {
+                    let p = tab.doc.path.clone();
+                    let mut st = String::new();
+                    show_in_explorer(&p, &mut st, lang);
+                    tab.doc.status = st;
+                }
+            }
+            "open_external" => {
+                let lang = self.lang;
+                if let Some(tab) = self.current_tab_mut() {
+                    let p = tab.doc.path.clone();
+                    let mut st = String::new();
+                    open_in_default_app(&p, &mut st, lang);
+                    tab.doc.status = st;
+                }
+            }
             "open_shortcuts" => self.shortcuts_open = true,
+            "reload_file" => self.reload_current_tab(),
+            "quit_app" => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             _ => {}
         }
     }

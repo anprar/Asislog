@@ -42,12 +42,116 @@ use asislog::app::AsisLogApp;
 
 /// Print CLI output infallibly: detached launches (no console, attach
 /// failed) and broken pipes must exit 0, never panic on stdout.
+/// Flushes explicitly: callers end with `process::exit`, which skips
+/// destructors (an unflushed buffer would silently drop piped output).
 fn say(line: &str) {
     use std::io::Write as _;
-    let _ = writeln!(std::io::stdout(), "{}", line);
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{}", line);
+    let _ = out.flush();
+}
+
+/// P1-14: crash log — panic hook menulis detail crash ke file lalu
+/// melanjutkan unwind default. Lokasi: %TEMP%/asislog-crash-<pid>.log
+fn install_panic_hook() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let pid = std::process::id();
+        let mut path = std::env::temp_dir();
+        path.push(format!("asislog-crash-{}.log", pid));
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|t| t.as_secs())
+            .unwrap_or(0);
+        let msg = format!(
+            "AsisLog {} crash @ unix={}\npanic: {}\nbacktrace suppressed (release build)\n",
+            env!("CARGO_PKG_VERSION"),
+            ts,
+            info,
+        );
+        let _ = std::fs::write(&path, msg);
+        // GUI-subsystem process: best-effort show via message box is
+        // unsafe cross-platform; the crash log path is printed to the
+        // console when one exists.
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), "AsisLog crash log: {}", path.display());
+        default(info);
+    }));
+}
+
+/// P1-10: single-instance IPC. Instance pertama membind port TCP acak di
+/// localhost dan menulis portnya ke file lock di temp dir. Instance kedua
+/// mengirim file path-nya lewat socket lalu keluar. Return:
+/// Some(rx) untuk instance utama; None = sudah ada instance lain (file
+/// path sudah diteruskan, pemanggil harus exit).
+fn single_instance_or_forward(
+    files: &[std::path::PathBuf],
+) -> Option<std::sync::mpsc::Receiver<std::path::PathBuf>> {
+    use std::io::{Read, Write};
+    let mut lock = std::env::temp_dir();
+    lock.push("asislog-instance.lock");
+    // Instance lain hidup? Coba connect ke port di lock file.
+    if let Ok(text) = std::fs::read_to_string(&lock) {
+        if let Ok(port) = text.trim().parse::<u16>() {
+            if let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+                // Kirim file path (UTF-8, newline-separated), lalu selesai.
+                let mut payload = String::new();
+                for f in files {
+                    payload.push_str(&f.display().to_string());
+                    payload.push('\n');
+                }
+                let _ = stream.write_all(payload.as_bytes());
+                let _ = stream.flush();
+                // Baca ACK singkat (best-effort, timeout pendek).
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+                let mut ack = [0u8; 1];
+                let _ = stream.read(&mut ack);
+                return None; // instance utama sudah ada
+            }
+        }
+    }
+    // Kita instance utama: bind port, tulis lock. Stale lock dari proses
+    // mati: bind gagal -> coba hapus lock dan lanjut multi-instance
+    // daripada deadlock (fallback aman, tak pernah panic).
+    let listener = match std::net::TcpListener::bind(("127.0.0.1", 0)) {
+        Ok(l) => l,
+        Err(_) => {
+            // Multi-instance darurat: GUI tetap jalan tanpa IPC.
+            let (_tx, rx) = std::sync::mpsc::channel();
+            return Some(rx);
+        }
+    };
+    let Ok(addr) = listener.local_addr() else {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        return Some(rx);
+    };
+    let _ = std::fs::write(&lock, addr.port().to_string());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buf = String::new();
+            if stream.read_to_string(&mut buf).is_ok() {
+                for line in buf.lines() {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let p = std::path::PathBuf::from(line);
+                    if p.exists() {
+                        let _ = tx.send(p);
+                    }
+                }
+            }
+            let _ = stream.write_all(b"1");
+            let _ = stream.flush();
+        }
+    });
+    Some(rx)
 }
 
 fn main() -> eframe::Result<()> {
+    install_panic_hook();
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
     // UI language for CLI: --lang en|id, -L en|id, or ASISLOG_LANG env.
     // GUI persists in config.json; CLI defaults to Indonesian (backward compatible).
@@ -147,6 +251,27 @@ fn main() -> eframe::Result<()> {
         } else {
             match asislog::engine::mmap::open_mmap(path) {
                 Ok(m) => {
+                    // Binary guard: refuse fake line counts for NUL-dense
+                    // blobs (e.g. Firebird .log lookalikes); Hex Peek in
+                    // the GUI is the honest viewer for those.
+                    let head_len = m.len().min(8 * 1024);
+                    if asislog::engine::decode::is_binary_sample(&m[..head_len]) {
+                        let nul = asislog::engine::decode::count_nul_head(&m[..head_len]);
+                        if is_id {
+                            say(&format!(
+                                "File biner terdeteksi ('{}'): {} NUL di 8 KB pertama. Hitungan baris tak valid — gunakan Hex Peek di GUI.",
+                                path.display(),
+                                nul
+                            ));
+                        } else {
+                            say(&format!(
+                                "Binary file detected ('{}'): {} NULs in first 8 KB. Line counts invalid — use Hex Peek in the GUI.",
+                                path.display(),
+                                nul
+                            ));
+                        }
+                        std::process::exit(2);
+                    }
                     let head_len = (m.len()).min(64 * 1024);
                     let (enc, bom_len) = asislog::engine::decode::detect_encoding(&m[..head_len]);
                     let idx = asislog::engine::index::build_full(&m, enc, bom_len);
@@ -234,39 +359,55 @@ fn main() -> eframe::Result<()> {
                 std::process::exit(2);
             }
         };
+        // Binary guard (same rule as `count`): line-oriented grep over a
+        // database blob reports nonsense line numbers — refuse honestly.
+        {
+            let head_len = m.len().min(8 * 1024);
+            if asislog::engine::decode::is_binary_sample(&m[..head_len]) {
+                let nul = asislog::engine::decode::count_nul_head(&m[..head_len]);
+                if is_id {
+                    say(&format!(
+                        "File biner terdeteksi ('{}'): {} NUL di 8 KB pertama. Pencarian baris tak valid — gunakan Hex Peek di GUI.",
+                        path.display(),
+                        nul
+                    ));
+                } else {
+                    say(&format!(
+                        "Binary file detected ('{}'): {} NULs in first 8 KB. Line search invalid — use Hex Peek in the GUI.",
+                        path.display(),
+                        nul
+                    ));
+                }
+                std::process::exit(2);
+            }
+        }
         let head_len = (m.len()).min(64 * 1024);
         let (enc, bom_len) = asislog::engine::decode::detect_encoding(&m[..head_len]);
 
-        let finder = memchr::memmem::Finder::new(pattern.as_bytes());
-        let mut match_count = 0u64;
-        let mut line_no = 1u64;
-        let mut pos = bom_len;
-        while pos < m.len() {
-            let next_nl = memchr::memchr(b'\n', &m[pos..])
-                .map(|i| pos + i)
-                .unwrap_or(m.len());
-            let mut line_bytes = &m[pos..next_nl];
-            if line_bytes.ends_with(b"\r") {
-                line_bytes = &line_bytes[..line_bytes.len() - 1];
+        // Parallel literal scan (rayon, line-aligned chunks): same match
+        // semantics as the old single-threaded loop (per-line, \r-aware).
+        // Count-only mode stores nothing (15M matches = 0 bytes, not a
+        // 350 MB side table).
+        if count_only {
+            let n = asislog::engine::search::grep_count(&m, pattern.as_bytes(), bom_len);
+            say(&format!("{}", n));
+            if n > 0 {
+                std::process::exit(0);
+            } else {
+                std::process::exit(1);
             }
-            if finder.find(line_bytes).is_some() {
-                match_count += 1;
-                if !count_only {
-                    let text = asislog::engine::decode::decode_bytes(line_bytes, enc);
-                    if show_line_num {
-                        say(&format!("{}:{}", line_no, text));
-                    } else {
-                        say(&text);
-                    }
-                }
+        }
+        let hits = asislog::engine::search::grep_collect(&m, pattern.as_bytes(), bom_len);
+        let match_count = hits.len() as u64;
+        for (line_no, s, e) in &hits {
+            let text = asislog::engine::decode::decode_bytes(&m[*s..*e], enc);
+            if show_line_num {
+                say(&format!("{}:{}", line_no, text));
+            } else {
+                say(&text);
             }
-            line_no += 1;
-            pos = next_nl + 1;
         }
 
-        if count_only {
-            say(&format!("{}", match_count));
-        }
         if match_count > 0 {
             std::process::exit(0);
         } else {
@@ -274,6 +415,14 @@ fn main() -> eframe::Result<()> {
         }
     }
     let files: Vec<std::path::PathBuf> = args.iter().map(std::path::PathBuf::from).collect();
+    // P1-10: instance kedua meneruskan file-nya ke instance utama lalu keluar.
+    let ipc_rx = match single_instance_or_forward(&files) {
+        Some(rx) => rx,
+        None => {
+            // File sudah diteruskan; instance utama akan membukanya.
+            return Ok(());
+        }
+    };
     let icon_data = image::load_from_memory(include_bytes!("../assets/asislog-256.png"))
         .ok()
         .map(|img| {
@@ -287,7 +436,10 @@ fn main() -> eframe::Result<()> {
         });
 
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([1200.0, 800.0])
+        // No inner_size: any restored/requested normal size races the
+        // maximize request on Windows (window born 1200x800, maximized
+        // only after a hide/show cycle). winit's own default applies
+        // when maximizing is unsupported.
         .with_maximized(true)
         .with_title("AsisLog");
     if let Some(icon) = icon_data {
@@ -301,11 +453,12 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "AsisLog",
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             let mut app = AsisLogApp::new(cc);
             // Native feel from the first frame: OS UI font + chosen mono.
             app.apply_fonts(&cc.egui_ctx);
             app.open_files(files);
+            app.set_ipc_rx(Some(ipc_rx));
             Ok(Box::new(app))
         }),
     )
